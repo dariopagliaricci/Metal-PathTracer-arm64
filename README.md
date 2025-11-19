@@ -59,9 +59,6 @@ It started as a *“Ray Tracing in One Weekend”* clone and evolved into a smal
 ### Developer tooling
 
 - **Headless renderer** (`PathTracerHeadless`) for batch/offline rendering
-- **Golden image testing**:
-  - Deterministic renders validated via SHA-256 + PSNR
-  - Scripts in `tests/tools`
 - ImGui-based UI overlay:
   - Real-time stats (GPU time, BVH stats, samples/min, backend mode, etc.)
   - Camera + renderer controls
@@ -117,6 +114,7 @@ Real-time statistics displayed in ImGui:
 - **Apple Silicon:**
   - M3 and later: Hardware ray tracing acceleration enabled
   - M1/M2: Software ray tracing (fallback)
+  - **Important** Apple exposes `MTLDevice.supportsRaytracing` even on M1/M2, so the renderer still launches the HWRT pipeline and Metal silently emulates it on the GPU cores. The ImGui stats therefore show “Hardware Ray Tracing” as *active* even though traversal runs in software. Toggle **Software Ray Tracing** in the Settings panel or pass `--enableSoftwareRayTracing=1` if you want to stay on the pure BVH path for debugging or parity.
 
 ### Toolchain
 
@@ -275,13 +273,6 @@ The scenes (Hygieia statue, Ajax bust, higher-res HDRIs, detailed dragon meshes)
   - Saves immediately to `./renders/render-YYYYMMDD-HHMMSS.exr`
   - Does not show a native file dialog
 
-**ImGuizmo:**
-- The UI references ImGuizmo for scene/camera gizmos
-- For v1.0 you must either:
-  - Vendor ImGuizmo into `external/ImGuizmo`, or
-  - Disable ImGuizmo usage via a compile-time flag and remove the dependency
-- This README assumes you will ship a configuration that builds from a fresh clone without additional manual setup
-
 **Platform support:**
 - Binaries and OIDN libraries in `external/oidn/lib` are built for Apple Silicon (arm64)
 - Intel macs and non-macOS platforms are not supported in this configuration
@@ -319,6 +310,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 - [Dear ImGui](https://github.com/ocornut/imgui) - Immediate mode GUI (MIT)
 - [TinyBVH](https://github.com/jacco/tinybvh) - BVH construction (MIT)
 - [TinyObjLoader](https://github.com/tinyobjloader/tinyobjloader) - OBJ parsing (MIT)
+- [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo.git) - Collection of dear imgui widgets and more advanced controls.
 
 ### Platform
 - [Metal Shading Language Specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) - Apple

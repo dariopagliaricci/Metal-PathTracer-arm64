@@ -16,6 +16,8 @@ DerivedData/
 build/
 build-*/
 cmake-build-*/
+assets/
+imgui.ini
 
 CMakeCache.txt
 CMakeFiles/
@@ -48,9 +50,9 @@ install_manifest.txt
 # Logs
 *.log
 
-# Render outputs (but track screenshots and renders folders for repository)
-# renders/
-# *.exr
+# Render outputs (but track screenshots folder for repository)
+renders/
+*.exr
 # *.pfm
 # *.ppm
 # *.png
