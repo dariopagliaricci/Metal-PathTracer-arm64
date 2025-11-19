@@ -1,0 +1,61 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+DerivedData/
+*.xccheckout
+
+# CMake build directories
+build/
+build-*/
+cmake-build-*/
+
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# Ninja
+.ninja_deps
+.ninja_log
+
+# VSCode / CLion / editors
+.vscode/
+.idea/
+*.iml
+
+# Obj-C / Metal intermediates
+*.pch
+*.dSYM/
+*.ipa
+*.xcarchive
+
+# Shader / Metal compiled outputs (if generated)
+*.metallib
+*.air
+
+# Logs
+*.log
+
+# Render outputs (but track screenshots and renders folders for repository)
+# renders/
+# *.exr
+# *.pfm
+# *.ppm
+# *.png
+# *.jpg
+# *.jpeg
+
+# External tools caches (if any)
+*.cache
