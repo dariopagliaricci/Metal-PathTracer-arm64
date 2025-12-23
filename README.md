@@ -255,6 +255,12 @@ sphere center=0,-1001,0 radius=1000 material=1
 
 OBJ files should provide vertex positions and may include normals/UVs for better shading.
 
+## Release
+
+Latest stable release:  
+**Metal Path Tracer v1.0.0 (Apple Silicon)**  
+https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases/tag/v1.0.0
+
 ## Assets Pack
 
 The scenes (Hygieia statue, Ajax bust, higher-res HDRIs, detailed dragon meshes) live in a separate asset pack to keep the repo size reasonable:
