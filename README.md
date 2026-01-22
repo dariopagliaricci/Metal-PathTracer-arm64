@@ -258,9 +258,7 @@ OBJ files should provide vertex positions and may include normals/UVs for better
 
 ## Release
 
-Latest stable release:  
-**Metal Path Tracer v1.0.0 (Apple Silicon)**  
-https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases/tag/v1.0.0
+[![Latest Release](https://img.shields.io/github/v/release/dariopagliaricci/Metal-PathTracer-arm64)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases/latest)
 
 ## Assets Pack
 
