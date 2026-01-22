@@ -268,14 +268,14 @@ The scenes (Hygieia statue, Ajax bust, higher-res HDRIs, detailed dragon meshes)
 - Copy/replace the `assets` folder in the root of the project
 
 
-## Known limitations (v1.0)
+## Known limitations
 
 **Hardware vs Software RT parity:**
 - For some thin glass / complex topology scenes, SWRT still produces slightly more "frosted" results than the HWRT reference.
 - `sss_marble_wax.scene` shows discrepancies between HWRT and SWRT in subsurface scattering rendering
 
-**Local modification (this repo):**
-- Added a working-set guard in `src/renderer/SceneAccel.mm` to refuse HWRT builds when estimated BLAS/TLAS + scratch exceeds `recommendedMaxWorkingSetSize` (prevents hard crashes on very large scenes). This is the only code modification from upstream.
+**Large-scene memory guard (v1.0.1):**
+- Added a working-set guard in `src/renderer/SceneAccel.mm` to refuse HWRT builds when estimated BLAS/TLAS + scratch exceeds `recommendedMaxWorkingSetSize` (prevents hard crashes on very large scenes).
 
 **EXR save UX:**
 - The ImGui "Save EXR…" button currently:
