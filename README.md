@@ -115,6 +115,7 @@ Real-time statistics displayed in ImGui:
   - M3 and later: Hardware ray tracing acceleration enabled
   - M1/M2: Software ray tracing (fallback)
   - **Important** Apple exposes `MTLDevice.supportsRaytracing` even on M1/M2, so the renderer still launches the HWRT pipeline and Metal silently emulates it on the GPU cores. The ImGui stats therefore show “Hardware Ray Tracing” as *active* even though traversal runs in software. Toggle **Software Ray Tracing** in the Settings panel or pass `--enableSoftwareRayTracing=1` if you want to stay on the pure BVH path for debugging or parity.
+  - **Large-scene limitation (working-set budget):** the renderer refuses HWRT builds if the estimated BLAS/TLAS size plus scratch exceeds `recommendedMaxWorkingSetSize`. This budget is device-specific and **not** equal to total unified memory, so very large mesh scenes can be blocked even on machines with plenty of RAM. Practical implication: scenes with tens of millions of triangles (e.g. `lucy-plastic.scene`) or multiple instances of heavy meshes can exceed the budget. In our testing on an M1 Pro 16 GB, two `lucy-scaled` instances render, while three can exceed the budget and be refused. Higher-end GPUs (e.g. M1/M2 Max or M3+) typically have a larger budget, but limits still apply.
 
 ### Toolchain
 
@@ -272,7 +273,11 @@ The scenes (Hygieia statue, Ajax bust, higher-res HDRIs, detailed dragon meshes)
 ## Known limitations (v1.0)
 
 **Hardware vs Software RT parity:**
-- For some thin glass / complex topology scenes, HWRT still produces slightly more "frosted" results than the SWRT reference.
+- For some thin glass / complex topology scenes, SWRT still produces slightly more "frosted" results than the HWRT reference.
+- `sss_marble_wax.scene` shows discrepancies between HWRT and SWRT in subsurface scattering rendering
+
+**Local modification (this repo):**
+- Added a working-set guard in `src/renderer/SceneAccel.mm` to refuse HWRT builds when estimated BLAS/TLAS + scratch exceeds `recommendedMaxWorkingSetSize` (prevents hard crashes on very large scenes). This is the only code modification from upstream.
 
 **EXR save UX:**
 - The ImGui "Save EXR…" button currently:
