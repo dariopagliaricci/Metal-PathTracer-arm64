@@ -358,7 +358,7 @@ OBJ files should provide vertex positions and may include normals/UVs for better
 
 The scenes (Hygieia statue, Ajax bust, higher-res HDRIs, detailed dragon meshes) live in a separate asset pack to keep the repo size reasonable:
 
-- Download `Metal-PathTracer-Assets.zip` from the [link provided in the GitHub release](https://drive.google.com/file/d/1fbB77stxZzF48T0oHLZS5FIInNqcGZT2/view?usp=share_link)
+- Download `Metal-PathTracer-Assets.zip` from the [link provided in the GitHub release](https://drive.google.com/file/d/1bn6XsKrmM4go1rTJBAFhyN0r-wA63P3b/view?usp=share_link)
 - Copy/replace the `assets` folder in the root of the project
 
 
