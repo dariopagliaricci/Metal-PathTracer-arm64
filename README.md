@@ -194,6 +194,7 @@ This will produce:
 | Option | Default | Description |
 |---|---|---|
 | `PATH_TRACER_ENABLE_EMBREE` | `OFF` | Build the Embree CPU headless backend |
+| `PATH_TRACER_ENABLE_OIDN` | `ON` | Enable Intel OIDN denoiser integration (auto-disables if OIDN dylibs are missing in `external/oidn/lib`) |
 | `PT_DEBUG_TOOLS` | `OFF` | Enable HWRT/SWRT debug tooling (path debug, parity assertions) |
 | `PT_MNEE_SWRT_RAYS` | `OFF` | Force MNEE rays to use SWRT in the HWRT path (debug) |
 | `PT_MNEE_OCCLUSION_PARITY` | `OFF` | Compare HWRT vs SWRT MNEE visibility (debug) |

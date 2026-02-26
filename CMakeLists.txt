@@ -5,6 +5,7 @@ project(PathTracerMetal LANGUAGES CXX OBJCXX)
 option(STRICT "Enable strict compiler warnings" OFF)
 option(M0_TESTS "Enable Milestone 0 golden image tests" OFF)
 option(PATH_TRACER_ENABLE_EMBREE "Enable Embree headless backend" OFF)
+option(PATH_TRACER_ENABLE_OIDN "Enable OIDN denoiser integration" ON)
 option(PT_DEBUG_TOOLS "Enable HWRT/SWRT debug tooling" OFF)
 option(PT_MNEE_SWRT_RAYS "Force MNEE rays to use SWRT in HWRT path (debug)" OFF)
 option(PT_MNEE_OCCLUSION_PARITY "Compare HWRT vs SWRT MNEE visibility (debug)" OFF)
@@ -25,6 +26,69 @@ if(PATH_TRACER_ENABLE_EMBREE)
     set(EMBREE_STATIC_LIB ON CACHE BOOL "Build Embree as a static library" FORCE)
     add_subdirectory(external/embree EXCLUDE_FROM_ALL)
     find_package(TBB REQUIRED)
+endif()
+
+set(PATH_TRACER_OIDN_LIB_DIR "${CMAKE_SOURCE_DIR}/external/oidn/lib")
+set(PATH_TRACER_OIDN_LIBRARIES
+    "${PATH_TRACER_OIDN_LIB_DIR}/libOpenImageDenoise.2.3.3.dylib"
+    "${PATH_TRACER_OIDN_LIB_DIR}/libOpenImageDenoise_core.2.3.3.dylib"
+    "${PATH_TRACER_OIDN_LIB_DIR}/libOpenImageDenoise_device_metal.2.3.3.dylib"
+    "${PATH_TRACER_OIDN_LIB_DIR}/libtbb.12.12.dylib"
+)
+
+if(PATH_TRACER_ENABLE_OIDN)
+    set(_missing_oidn_libs "")
+    foreach(_oidn_lib IN LISTS PATH_TRACER_OIDN_LIBRARIES)
+        if(NOT EXISTS "${_oidn_lib}")
+            list(APPEND _missing_oidn_libs "${_oidn_lib}")
+        endif()
+    endforeach()
+
+    if(_missing_oidn_libs)
+        string(REPLACE ";" "\n  - " _missing_oidn_text "${_missing_oidn_libs}")
+        message(WARNING
+            "OIDN requested but required libraries were not found:\n"
+            "  - ${_missing_oidn_text}\n"
+            "Building without OIDN denoiser support. To re-enable, place the arm64 OIDN dylibs in ${PATH_TRACER_OIDN_LIB_DIR} "
+            "or configure with -DPATH_TRACER_ENABLE_OIDN=OFF."
+        )
+        set(PATH_TRACER_ENABLE_OIDN OFF)
+        set(PATH_TRACER_OIDN_LIBRARIES "")
+    else()
+        function(path_tracer_ensure_oidn_abi_symlink link_name target_name)
+            set(link_path "${PATH_TRACER_OIDN_LIB_DIR}/${link_name}")
+            set(target_path "${PATH_TRACER_OIDN_LIB_DIR}/${target_name}")
+            if(NOT EXISTS "${target_path}")
+                return()
+            endif()
+            if(EXISTS "${link_path}" OR IS_SYMLINK "${link_path}")
+                return()
+            endif()
+
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -E create_symlink "${target_name}" "${link_name}"
+                WORKING_DIRECTORY "${PATH_TRACER_OIDN_LIB_DIR}"
+                RESULT_VARIABLE symlink_result
+                ERROR_VARIABLE symlink_error
+            )
+            if(NOT symlink_result EQUAL 0)
+                message(WARNING
+                    "Failed to create OIDN ABI symlink '${link_name}' -> '${target_name}': ${symlink_error}"
+                )
+            else()
+                message(STATUS "Created OIDN ABI symlink: ${link_name} -> ${target_name}")
+            endif()
+        endfunction()
+
+        # Some OIDN/TBB binaries use ABI install names (e.g. *.2.dylib, *.12.dylib).
+        # Ensure these compatibility symlinks exist next to the versioned dylibs.
+        path_tracer_ensure_oidn_abi_symlink("libOpenImageDenoise.2.dylib" "libOpenImageDenoise.2.3.3.dylib")
+        path_tracer_ensure_oidn_abi_symlink("libtbb.12.dylib" "libtbb.12.12.dylib")
+        message(STATUS "OIDN integration enabled")
+    endif()
+else()
+    message(STATUS "OIDN integration disabled by user option")
+    set(PATH_TRACER_OIDN_LIBRARIES "")
 endif()
 
 set(SHADER_SOURCES
@@ -121,13 +185,11 @@ target_link_libraries(PathTracer
         "-framework Metal"
         "-framework MetalKit"
         "-framework GameController"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libOpenImageDenoise.2.3.3.dylib"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libOpenImageDenoise_core.2.3.3.dylib"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libOpenImageDenoise_device_metal.2.3.3.dylib"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libtbb.12.12.dylib"
+        ${PATH_TRACER_OIDN_LIBRARIES}
 )
 
 target_compile_definitions(PathTracer PRIVATE
+    PT_ENABLE_OIDN=$<BOOL:${PATH_TRACER_ENABLE_OIDN}>
     PT_DEBUG_TOOLS=$<BOOL:${PT_DEBUG_TOOLS}>
     PT_MNEE_SWRT_RAYS=$<BOOL:${PT_MNEE_SWRT_RAYS}>
     PT_MNEE_OCCLUSION_PARITY=$<BOOL:${PT_MNEE_OCCLUSION_PARITY}>
@@ -278,13 +340,11 @@ target_link_libraries(PathTracerHeadless
         "-framework QuartzCore"
         "-framework AppKit"
         "-framework GameController"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libOpenImageDenoise.2.3.3.dylib"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libOpenImageDenoise_core.2.3.3.dylib"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libOpenImageDenoise_device_metal.2.3.3.dylib"
-        "${CMAKE_SOURCE_DIR}/external/oidn/lib/libtbb.12.12.dylib"
+        ${PATH_TRACER_OIDN_LIBRARIES}
 )
 
 target_compile_definitions(PathTracerHeadless PRIVATE
+    PT_ENABLE_OIDN=$<BOOL:${PATH_TRACER_ENABLE_OIDN}>
     PT_DEBUG_TOOLS=$<BOOL:${PT_DEBUG_TOOLS}>
     PT_MNEE_SWRT_RAYS=$<BOOL:${PT_MNEE_SWRT_RAYS}>
     PT_MNEE_OCCLUSION_PARITY=$<BOOL:${PT_MNEE_OCCLUSION_PARITY}>

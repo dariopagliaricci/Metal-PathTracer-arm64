@@ -1,5 +1,11 @@
 #import "renderer/DenoiserContext.h"
 
+#ifndef PT_ENABLE_OIDN
+#define PT_ENABLE_OIDN 0
+#endif
+
+#if PT_ENABLE_OIDN
+
 #include <OpenImageDenoise/oidn.h>
 #include <sstream>
 #include <cstring>
@@ -563,3 +569,69 @@ void DenoiserContext::shutdown() {
 }
 
 }  // namespace PathTracer
+
+#else
+
+#include <vector>
+
+namespace PathTracer {
+
+DenoiserContext::DenoiserContext()
+    : m_device(nullptr),
+      m_filter(nullptr),
+      m_status(DeviceStatus::Uninitialized),
+      m_lastError("OIDN support disabled at build time"),
+      m_metalDevice(nullptr),
+      m_currentFilterType(FilterType::RT),
+      m_colorBuffer(),
+      m_albedoBuffer(),
+      m_normalBuffer(),
+      m_outputBuffer() {
+}
+
+DenoiserContext::~DenoiserContext() {
+    shutdown();
+}
+
+bool DenoiserContext::initialize(MTLDeviceHandle metalDevice) {
+    (void)metalDevice;
+    m_status = DeviceStatus::Failed;
+    m_lastError = "OIDN support disabled: required OIDN dylibs were not found during configure";
+    return false;
+}
+
+bool DenoiserContext::createFilter(FilterType type) {
+    (void)type;
+    m_lastError = "OIDN support disabled at build time";
+    return false;
+}
+
+bool DenoiserContext::denoise(MTLTextureHandle colorInput,
+                              MTLTextureHandle albedoInput,
+                              MTLTextureHandle normalInput,
+                              MTLTextureHandle colorOutput,
+                              FilterType filterType) {
+    (void)colorInput;
+    (void)albedoInput;
+    (void)normalInput;
+    (void)colorOutput;
+    (void)filterType;
+    m_lastError = "OIDN support disabled at build time";
+    return false;
+}
+
+void DenoiserContext::shutdown() {
+    m_device = nullptr;
+    m_filter = nullptr;
+    m_colorBuffer.clear();
+    m_albedoBuffer.clear();
+    m_normalBuffer.clear();
+    m_outputBuffer.clear();
+    m_status = DeviceStatus::Uninitialized;
+    m_lastError = "Shut down";
+    m_metalDevice = nullptr;
+}
+
+}  // namespace PathTracer
+
+#endif
