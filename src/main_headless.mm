@@ -5,14 +5,20 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "MetalRenderer.h"
+#include "headless/EmbreeHeadlessRenderer.h"
+#include "headless/MetalHeadlessRenderer.h"
+#include "headless/IHeadlessRenderer.h"
 #include "renderer/RenderSettings.h"
 #include "renderer/ImageWriter.h"
+#include "renderer/SceneManager.h"
+#include "renderer/SceneResources.h"
 
 namespace fs = std::filesystem;
 constexpr double kPi = 3.14159265358979323846;
@@ -34,6 +40,9 @@ struct CliOptions {
     uint32_t maxDepth = 0;
     bool maxDepthSet = false;
 
+    uint32_t threads = 0;
+    bool threadsSet = false;
+
     uint32_t seed = 0;
     bool seedSet = false;
 
@@ -52,10 +61,15 @@ struct CliOptions {
     bool enableSoftwareRayTracing = false;
     bool enableSoftwareRayTracingSet = false;
 
+    bool enableMnee = false;
+    bool enableMneeSet = false;
+
     std::string formatString = "exr";
     PathTracer::ImageFileFormat format = PathTracer::ImageFileFormat::EXR;
 
     bool verbose = false;
+
+    HeadlessBackend backend = HeadlessBackend::Metal;
 };
 
 void PrintUsage(const char* exe) {
@@ -67,11 +81,16 @@ void PrintUsage(const char* exe) {
               << "  --height=<int>                Override render height (>=8)\n"
               << "  --sppTotal=<int>              Total samples to accumulate (default 1024)\n"
               << "  --maxDepth=<int>              Override max path depth\n"
+              << "  --threads=<int>               Max worker threads (Embree only)\n"
               << "  --seed=<int>                  Fixed RNG seed (0 = random)\n"
-              << "  --enableSoftwareRayTracing[=0|1]  Force software tracing kernels\n\n"
+              << "  --enableSoftwareRayTracing[=0|1]  Force software tracing kernels\n"
+              << "  --enableMnee[=0|1]             Enable MNEE caustics (default 0)\n\n"
               << "Environment overrides:\n"
               << "  --envRotation=<deg>           Environment rotation in degrees\n"
               << "  --envIntensity=<float>        Environment intensity multiplier\n\n"
+              << "Backend selection:\n"
+              << "  --backend=<metal|embree>       Headless backend (default metal)\n"
+              << "  --enableEmbree[=0|1]           Alias for --backend embree\n\n"
               << "Tonemapping overrides (for LDR outputs):\n"
               << "  --tonemap=<1|2|3|4>           1=Linear, 2=ACES, 3=Reinhard, 4=Hable\n"
               << "  --exposure=<float>            Exposure in stops\n\n"
@@ -216,6 +235,22 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                 error = "Invalid integer for --maxDepth";
                 return false;
             }
+        } else if (arg == "--threads") {
+            if (!requireValue("--threads")) {
+                return false;
+            }
+            try {
+                int parsed = std::stoi(value);
+                if (parsed < 1) {
+                    error = "--threads must be >= 1";
+                    return false;
+                }
+                options.threads = static_cast<uint32_t>(parsed);
+                options.threadsSet = true;
+            } catch (...) {
+                error = "Invalid integer for --threads";
+                return false;
+            }
         } else if (arg == "--seed") {
             if (!requireValue("--seed")) {
                 return false;
@@ -289,11 +324,51 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.enableSoftwareRayTracing = flag;
             options.enableSoftwareRayTracingSet = true;
+        } else if (arg == "--enableMnee") {
+            std::string boolValue = value;
+            if (!hasInlineValue) {
+                boolValue.clear();
+            }
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --enableMnee";
+                return false;
+            }
+            options.enableMnee = flag;
+            options.enableMneeSet = true;
         } else if (arg == "--format") {
             if (!requireValue("--format")) {
                 return false;
             }
             options.formatString = value;
+        } else if (arg == "--backend") {
+            if (!requireValue("--backend")) {
+                return false;
+            }
+            std::string lower;
+            lower.reserve(value.size());
+            for (char c : value) {
+                lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            }
+            if (lower == "metal") {
+                options.backend = HeadlessBackend::Metal;
+            } else if (lower == "embree") {
+                options.backend = HeadlessBackend::Embree;
+            } else {
+                error = "Invalid value for --backend (expected metal or embree)";
+                return false;
+            }
+        } else if (arg == "--enableEmbree") {
+            std::string boolValue = value;
+            if (!hasInlineValue) {
+                boolValue.clear();
+            }
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --enableEmbree";
+                return false;
+            }
+            options.backend = flag ? HeadlessBackend::Embree : HeadlessBackend::Metal;
         } else {
             error = "Unknown option: " + arg;
             return false;
@@ -340,6 +415,57 @@ std::string SanitizeSceneName(const std::string& input) {
     return name;
 }
 
+void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& settings) {
+    if (options.widthSet) {
+        settings.renderWidth = options.width;
+    }
+    if (options.heightSet) {
+        settings.renderHeight = options.height;
+    }
+    if (options.maxDepthSet) {
+        settings.maxDepth = options.maxDepth;
+    }
+    if (options.seedSet) {
+        settings.fixedRngSeed = options.seed;
+    }
+    if (options.tonemapSet) {
+        settings.tonemapMode = options.tonemapMode;
+    }
+    if (options.exposureSet) {
+        settings.exposure = options.exposure;
+    }
+    if (options.envRotationSet) {
+        settings.environmentRotation = options.envRotationDegrees * static_cast<float>(kPi / 180.0);
+    }
+    if (options.envIntensitySet) {
+        settings.environmentIntensity = std::max(options.envIntensity, 0.0f);
+    }
+    if (options.enableSoftwareRayTracingSet) {
+        settings.enableSoftwareRayTracing = options.enableSoftwareRayTracing;
+    }
+    if (options.enableMneeSet) {
+        settings.enableMnee = options.enableMnee;
+    }
+}
+
+HeadlessCamera BuildHeadlessCamera(const PathTracer::RenderSettings& settings) {
+    HeadlessCamera camera{};
+    camera.target = settings.cameraTarget;
+    camera.distance = settings.cameraDistance;
+    camera.yaw = settings.cameraYaw;
+    camera.pitch = settings.cameraPitch;
+    camera.verticalFov = settings.cameraVerticalFov;
+    camera.defocusAngle = settings.cameraDefocusAngle;
+    camera.focusDistance = settings.cameraFocusDistance;
+    return camera;
+}
+
+const char* WorkingColorSpaceLabel(const PathTracer::RenderSettings& settings) {
+    return (settings.workingColorSpace == PathTracer::RenderSettings::WorkingColorSpace::ACEScg)
+        ? "ACEScg"
+        : "Linear sRGB";
+}
+
 int main(int argc, const char** argv) {
     @autoreleasepool {
         CliOptions options;
@@ -352,135 +478,83 @@ int main(int argc, const char** argv) {
             return 1;
         }
 
-        MetalRendererOptions rendererOptions;
-        rendererOptions.headless = true;
-        rendererOptions.width = options.widthSet ? static_cast<int>(options.width) : 1280;
-        rendererOptions.height = options.heightSet ? static_cast<int>(options.height) : 720;
-        rendererOptions.windowTitle = "PathTracerCLI";
-        rendererOptions.fixedRngSeed = options.seedSet ? options.seed : 0;
-        rendererOptions.enableSoftwareRayTracing = options.enableSoftwareRayTracingSet ? options.enableSoftwareRayTracing : false;
-
-        MetalRenderer renderer;
-        if (!renderer.init(nullptr, rendererOptions)) {
-            std::cerr << "Failed to initialize Metal renderer" << std::endl;
-            return 1;
-        }
+        PathTracer::SceneManager sceneManager;
+        PathTracer::SceneResources sceneResources;
+        PathTracer::RenderSettings settings{};
 
         bool sceneLoaded = false;
+        std::string sceneError;
         if (options.sceneIsPath) {
-            sceneLoaded = renderer.loadSceneFromPath(options.scene.c_str());
+            sceneLoaded = sceneManager.loadSceneFromPath(options.scene, sceneResources, settings, &sceneError);
         } else {
-            sceneLoaded = renderer.setScene(options.scene.c_str());
+            sceneLoaded = sceneManager.loadScene(options.scene, sceneResources, settings, &sceneError);
         }
 
         if (!sceneLoaded) {
             std::cerr << "Failed to load scene: " << options.scene << std::endl;
-            auto ids = renderer.sceneIdentifiers();
-            if (!ids.empty()) {
+            if (!sceneError.empty()) {
+                std::cerr << sceneError << std::endl;
+            }
+            const auto& scenes = sceneManager.scenes();
+            if (!scenes.empty()) {
                 std::cerr << "Available scenes:" << std::endl;
-                for (const auto& id : ids) {
-                    std::cerr << "  " << id << std::endl;
+                for (const auto& info : scenes) {
+                    std::cerr << "  " << info.identifier << std::endl;
                 }
             }
             return 1;
         }
 
-        PathTracer::RenderSettings settings = renderer.settings();
+        ApplyCliOverrides(options, settings);
 
-        if (options.widthSet) {
-            settings.renderWidth = options.width;
-        } else if (settings.renderWidth == 0 && rendererOptions.width > 0) {
-            settings.renderWidth = static_cast<uint32_t>(rendererOptions.width);
+        if (settings.renderWidth == 0) {
+            settings.renderWidth = options.widthSet ? options.width : 1280u;
+        }
+        if (settings.renderHeight == 0) {
+            settings.renderHeight = options.heightSet ? options.height : 720u;
         }
 
-        if (options.heightSet) {
-            settings.renderHeight = options.height;
-        } else if (settings.renderHeight == 0 && rendererOptions.height > 0) {
-            settings.renderHeight = static_cast<uint32_t>(rendererOptions.height);
-        }
+        HeadlessScene headlessScene{};
+        headlessScene.source = options.scene;
+        headlessScene.isPath = options.sceneIsPath;
+        headlessScene.resources = &sceneResources;
 
-        if (options.maxDepthSet) {
-            settings.maxDepth = options.maxDepth;
-        }
-        if (options.seedSet) {
-            settings.fixedRngSeed = options.seed;
-        }
-        if (options.tonemapSet) {
-            settings.tonemapMode = options.tonemapMode;
-        }
-        if (options.exposureSet) {
-            settings.exposure = options.exposure;
-        }
-        if (options.envRotationSet) {
-            settings.environmentRotation = options.envRotationDegrees * static_cast<float>(kPi / 180.0);
-        }
-        if (options.envIntensitySet) {
-            settings.environmentIntensity = std::max(options.envIntensity, 0.0f);
-        }
-        if (options.enableSoftwareRayTracingSet) {
-            settings.enableSoftwareRayTracing = options.enableSoftwareRayTracing;
-        }
+        HeadlessCamera camera = BuildHeadlessCamera(settings);
 
-        renderer.applySettings(settings, true);
-
-        const uint32_t targetSamples = options.sppTotal;
-        uint32_t accumulatedSamples = renderer.sampleCount();
-        const uint32_t maxBatch = options.enableSoftwareRayTracingSet && options.enableSoftwareRayTracing ? 1u : 16u;
-
-        CFAbsoluteTime renderStart = CFAbsoluteTimeGetCurrent();
-        double accumulatedFrameTime = 0.0;
-        CFAbsoluteTime lastProgress = renderStart;
-
-        while (accumulatedSamples < targetSamples) {
-            uint32_t remaining = targetSamples - accumulatedSamples;
-            uint32_t request = (maxBatch == 0) ? remaining : std::min(maxBatch, remaining);
-            renderer.setSamplesPerFrame(request);
-
-            uint32_t before = renderer.sampleCount();
-            CFAbsoluteTime frameStart = CFAbsoluteTimeGetCurrent();
-            renderer.drawFrame();
-            CFAbsoluteTime frameEnd = CFAbsoluteTimeGetCurrent();
-
-            uint32_t after = renderer.sampleCount();
-            uint32_t produced = (after > before) ? (after - before) : std::min(request, remaining);
-            if (produced == 0) {
-                produced = 1;
+        std::unique_ptr<IHeadlessRenderer> renderer;
+        if (options.backend == HeadlessBackend::Metal) {
+            renderer = std::make_unique<MetalHeadlessRenderer>();
+        } else {
+#if defined(PATH_TRACER_ENABLE_EMBREE)
+            auto embreeRenderer = std::make_unique<EmbreeHeadlessRenderer>();
+            if (options.threadsSet) {
+                embreeRenderer->setMaxThreads(options.threads);
             }
-            accumulatedSamples += produced;
-            accumulatedFrameTime += (frameEnd - frameStart);
-
-            if (options.verbose) {
-                CFAbsoluteTime now = frameEnd;
-                if ((now - lastProgress) >= 0.5 || accumulatedSamples >= targetSamples) {
-                    double pct = (static_cast<double>(accumulatedSamples) / targetSamples) * 100.0;
-                    std::cout << "Progress: " << accumulatedSamples << "/" << targetSamples
-                              << " spp (" << std::fixed << std::setprecision(1) << pct << "%)\r";
-                    std::cout.flush();
-                    lastProgress = now;
-                }
-            }
+            renderer = std::move(embreeRenderer);
+#else
+            std::cerr << "Embree backend is not enabled. Rebuild with PATH_TRACER_ENABLE_EMBREE=ON." << std::endl;
+            return 1;
+#endif
         }
 
-        if (options.verbose) {
-            std::cout << std::endl;
-        }
-
-        CFAbsoluteTime renderEnd = CFAbsoluteTimeGetCurrent();
-
-        std::vector<float> linearRGB;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        if (!renderer.captureAverageImage(linearRGB, width, height, nullptr)) {
-            std::cerr << "Failed to capture rendered image" << std::endl;
+        HeadlessRenderOutput output;
+        std::string renderError;
+        if (!renderer->render(headlessScene, camera, settings, options.sppTotal, options.verbose, output, renderError)) {
+            std::cerr << "Render failed: " << renderError << std::endl;
             return 1;
         }
 
         std::string outputPath = options.outputPath;
+        PathTracer::ImageFileFormat outputFormat = options.format;
+        if (options.backend == HeadlessBackend::Embree) {
+            outputFormat = PathTracer::ImageFileFormat::EXR;
+        }
         if (outputPath.empty()) {
             fs::path defaultDir("renders");
             std::string sceneName = SanitizeSceneName(options.scene);
             std::ostringstream filename;
-            filename << sceneName << "_" << width << "x" << height << "." << PathTracer::FormatExtension(options.format);
+            filename << sceneName << "_" << output.width << "x" << output.height << "."
+                     << PathTracer::FormatExtension(outputFormat);
             outputPath = (defaultDir / filename.str()).string();
         }
 
@@ -490,29 +564,41 @@ int main(int argc, const char** argv) {
             fs::create_directories(outputFsPath.parent_path(), dirEc);
         }
 
-        PathTracer::TonemapSettings tonemapSettings{};
-        PathTracer::RenderSettings finalSettings = renderer.settings();
-        tonemapSettings.tonemapMode = finalSettings.tonemapMode;
-        tonemapSettings.acesVariant = finalSettings.acesVariant;
-        tonemapSettings.exposure = finalSettings.exposure;
-        tonemapSettings.reinhardWhitePoint = finalSettings.reinhardWhitePoint;
-
         std::string writeError;
-        if (!PathTracer::WriteImage(outputFsPath.string(), options.format,
-                                    linearRGB.data(), width, height,
-                                    tonemapSettings, &writeError)) {
-            std::cerr << "Failed to write output image: " << writeError << std::endl;
-            return 1;
+        if (options.backend == HeadlessBackend::Embree) {
+            std::vector<float> rgba(static_cast<size_t>(output.width) * output.height * 4u, 1.0f);
+            for (uint32_t i = 0; i < output.width * output.height; ++i) {
+                rgba[i * 4u + 0u] = output.linearRGB[i * 3u + 0u];
+                rgba[i * 4u + 1u] = output.linearRGB[i * 3u + 1u];
+                rgba[i * 4u + 2u] = output.linearRGB[i * 3u + 2u];
+                rgba[i * 4u + 3u] = 1.0f;
+            }
+            if (!PathTracer::ImageWriter::WriteEXR(outputFsPath.string().c_str(),
+                                                   rgba.data(),
+                                                   static_cast<int>(output.width),
+                                                   static_cast<int>(output.height),
+                                                   WorkingColorSpaceLabel(settings))) {
+                std::cerr << "Failed to write output image (EXR)" << std::endl;
+                return 1;
+            }
+        } else {
+            PathTracer::TonemapSettings tonemapSettings{};
+            tonemapSettings.tonemapMode = settings.tonemapMode;
+            tonemapSettings.acesVariant = settings.acesVariant;
+            tonemapSettings.exposure = settings.exposure;
+            tonemapSettings.reinhardWhitePoint = settings.reinhardWhitePoint;
+
+            if (!PathTracer::WriteImage(outputFsPath.string(), outputFormat,
+                                        output.linearRGB.data(), output.width, output.height,
+                                        tonemapSettings, &writeError)) {
+                std::cerr << "Failed to write output image: " << writeError << std::endl;
+                return 1;
+            }
         }
 
-        double totalSeconds = renderEnd - renderStart;
-        double avgMsPerSample = (accumulatedSamples > 0)
-                                    ? (accumulatedFrameTime * 1000.0 / accumulatedSamples)
-                                    : 0.0;
-
-        std::cout << "Rendered " << accumulatedSamples << " spp at " << width << "x" << height
-                  << " in " << std::fixed << std::setprecision(2) << totalSeconds << " s"
-                  << " (~" << std::setprecision(3) << avgMsPerSample << " ms/sample)." << std::endl;
+        std::cout << "Rendered " << output.samples << " spp at " << output.width << "x" << output.height
+                  << " in " << std::fixed << std::setprecision(2) << output.totalSeconds << " s"
+                  << " (~" << std::setprecision(3) << output.avgMsPerSample << " ms/sample)." << std::endl;
         std::cout << "Output written to: " << outputFsPath << std::endl;
 
         return 0;

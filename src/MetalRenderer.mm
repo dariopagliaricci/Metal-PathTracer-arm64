@@ -21,6 +21,7 @@
 #include "MetalShaderTypes.h"
 #include "IntersectionProvider.h"
 #include "renderer/Accumulation.h"
+#include "renderer/DenoiserContext.h"
 #include "renderer/ImageWriter.h"
 #include "renderer/MetalContext.h"
 #include "renderer/Pipelines.h"
@@ -72,6 +73,12 @@ inline float WrapRadians(float radians) {
 inline float ShortestAngleDelta(float target, float current) {
     return WrapRadians(target - current);
 }
+
+inline const char* WorkingColorSpaceLabel(const PathTracer::RenderSettings& settings) {
+    return (settings.workingColorSpace == PathTracer::RenderSettings::WorkingColorSpace::ACEScg)
+        ? "ACEScg"
+        : "Linear sRGB";
+}
 }  // namespace
 
 // DEBUG: Render path tracer at fixed internal resolution, independent of drawable size
@@ -105,6 +112,9 @@ public:
     void resize(int width, int height);
     void resetAccumulation();
     void setTonemapMode(uint32_t mode);
+    void setPresentationEnabled(bool enabled);
+    bool presentationEnabled() const { return m_presentationSettings.enabled; }
+    void togglePresentationUIPanels();
     void shutdown();
     bool exportToPPM(const char* filepath);
     bool loadScene(const std::string& identifier);
@@ -141,6 +151,8 @@ private:
     void addSphere(const simd::float3& center, float radius, uint32_t materialIndex);
     void handleSaveExrRequest(const std::string& path);
     void updateDrawableSize();
+    void applyPresentationSettings(bool force);
+    NSScreen* resolvePresentationScreen(const PathTracer::PresentationSettings& settings) const;
     void noteWindowInteraction();
     bool isMouseInsideRenderView() const;
     void applyBackgroundSettings();
@@ -157,11 +169,14 @@ private:
     PathTracer::Accumulation m_accumulation{};
     PathTracer::SceneResources m_sceneResources{};
     PathTracer::SceneManager m_sceneManager{};
+    PathTracer::DenoiserContext m_denoiser{};
     PathTracer::RenderLoop m_renderLoop{};
     PathTracer::RenderSettings m_settings{};
     PathTracer::UIOverlay m_overlay{};
+    PathTracer::PresentationSettings m_presentationSettings{};
     PathTracer::PerformanceStats m_performanceStats{};
     uint32_t m_lastDebugLogCount = 0;
+    uint32_t m_lastParityLogCount = 0;
     std::string m_activeSceneId{};
     std::vector<std::string> m_sceneLabels{};
     std::vector<const char*> m_sceneLabelPointers{};
@@ -172,6 +187,7 @@ private:
 
     float m_contentScale = 1.0f;
     id m_backingChangeObserver = nil;
+    id m_windowResizeObserver = nil;
     id m_windowMoveObserver = nil;
     id m_windowWillMoveObserver = nil;
     double m_cameraInputSuppressionDeadline = 0.0;
@@ -194,16 +210,44 @@ private:
     bool m_accumDirty = false;
     std::string m_accumDirtyReason;
     RenderSettings m_radiometricBaseline{};
+    struct PresentationRestoreState {
+        bool valid = false;
+        NSRect frame = NSZeroRect;
+        NSWindowStyleMask styleMask = 0;
+        NSInteger level = 0;
+        NSApplicationPresentationOptions appOptions = 0;
+        bool overlayMainVisible = true;
+        bool overlayMinimalVisible = false;
+        bool forcedContentScaleEnabled = false;
+        float forcedContentScale = 1.0f;
+        uint32_t renderWidth = 0;
+        uint32_t renderHeight = 0;
+        float renderScale = 1.0f;
+    };
+    PresentationRestoreState m_presentationRestore{};
+    PathTracer::PresentationSettings m_presentationAppliedSettings{};
+    bool m_presentationActive = false;
+    bool m_presentationRenderLockApplied = false;
     CGSize m_viewSizePoints = CGSizeMake(1.0, 1.0);
     CGSize m_drawablePixelSize = CGSizeMake(1.0, 1.0);
     bool m_renderClampWarningLogged = false;
     bool m_renderPixelClampLogged = false;
+    bool m_verboseTiming = false;
+    bool m_firstDispatchTimingLogged = false;
+    bool m_firstStatsTimingLogged = false;
+    bool m_mneeAccountingLogged = false;
 };
 
 bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOptions& options) {
     m_options = options;
     m_settings.fixedRngSeed = options.fixedRngSeed;
     m_settings.enableSoftwareRayTracing = options.enableSoftwareRayTracing;
+    m_verboseTiming = options.headless && options.verbose;
+    m_presentationSettings.enabled = options.presentationMode;
+
+#if PT_MNEE_SWRT_RAYS
+    NSLog(@"[Warning] PT_MNEE_SWRT_RAYS enabled: MNEE rays use SWRT (slow diagnostic mode)");
+#endif
 
     if (!options.headless && !window) {
         return false;
@@ -229,6 +273,17 @@ bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOption
                         }
                     }];
         m_context.setBackingChangeObserver(m_backingChangeObserver);
+
+        // Update drawable size when the window resizes (autoResizeDrawable is disabled).
+        m_windowResizeObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSWindowDidResizeNotification
+                        object:m_context.window()
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(__unused NSNotification* note) {
+                        if (selfPtr) {
+                            selfPtr->updateDrawableSize();
+                        }
+                    }];
 
         m_windowMoveObserver = [[NSNotificationCenter defaultCenter]
             addObserverForName:NSWindowDidMoveNotification
@@ -267,10 +322,15 @@ bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOption
         return false;
     }
 
-    if (!m_renderLoop.initialize(m_context)) {
+    if (!m_denoiser.initialize(device)) {
+        NSLog(@"[Denoise] OIDN init failed: %s", m_denoiser.lastError().c_str());
+    }
+
+    if (!m_renderLoop.initialize(m_context, &m_denoiser)) {
         return false;
     }
 
+    m_pipelines.setVerboseTiming(m_verboseTiming);
     if (!m_pipelines.initialize(m_context, displayFormat)) {
         return false;
     }
@@ -285,6 +345,9 @@ bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOption
 #endif
 
     setupDefaultScene();
+    if (!m_options.headless) {
+        applyPresentationSettings(true);
+    }
     resetAccumulation();
     return true;
 }
@@ -328,6 +391,285 @@ void MetalRenderer::Impl::updateDrawableSize() {
 #if HAS_IMGUI
     m_overlay.updateDisplayMetrics(m_viewSizePoints, m_contentScale);
 #endif
+}
+
+NSScreen* MetalRenderer::Impl::resolvePresentationScreen(
+    const PathTracer::PresentationSettings& settings) const {
+    NSWindow* window = m_context.window();
+    NSScreen* current = window ? window.screen : nil;
+    NSScreen* main = [NSScreen mainScreen];
+    NSArray<NSScreen*>* screens = [NSScreen screens];
+
+    auto findExternal = ^NSScreen*() {
+        for (NSScreen* screen in screens) {
+            if (screen && screen != main) {
+                return screen;
+            }
+        }
+        return (NSScreen*)nil;
+    };
+
+    switch (settings.targetScreen) {
+        case PathTracer::PresentationSettings::TargetScreen::Primary:
+            return main ?: current;
+        case PathTracer::PresentationSettings::TargetScreen::External: {
+            NSScreen* external = findExternal();
+            return external ?: (current ?: main);
+        }
+        case PathTracer::PresentationSettings::TargetScreen::Auto:
+        default: {
+            NSScreen* external = findExternal();
+            return external ?: (current ?: main);
+        }
+    }
+}
+
+void MetalRenderer::Impl::applyPresentationSettings(bool force) {
+    if (m_options.headless) {
+        return;
+    }
+
+    NSWindow* window = m_context.window();
+    if (!window) {
+        return;
+    }
+
+    const PathTracer::PresentationSettings& settings = m_presentationSettings;
+
+    auto applyOverlayVisibility = [&]() {
+#if HAS_IMGUI
+        if (m_overlayInitialized) {
+            m_overlay.setMainPanelVisible(!settings.hideUIPanels);
+            m_overlay.setMinimalOverlayVisible(settings.minimalOverlay);
+        }
+#endif
+    };
+
+    auto applyContentScale = [&]() {
+        switch (settings.contentScale) {
+            case PathTracer::PresentationSettings::ContentScaleMode::Scale1x:
+                m_context.setForcedContentScale(1.0f, true);
+#if HAS_IMGUI
+                if (m_overlayInitialized) {
+                    m_overlay.setForcedContentScale(1.0f, true);
+                }
+#endif
+                break;
+            case PathTracer::PresentationSettings::ContentScaleMode::Scale2x:
+                m_context.setForcedContentScale(2.0f, true);
+#if HAS_IMGUI
+                if (m_overlayInitialized) {
+                    m_overlay.setForcedContentScale(2.0f, true);
+                }
+#endif
+                break;
+            case PathTracer::PresentationSettings::ContentScaleMode::Auto:
+            default:
+                m_context.setForcedContentScale(1.0f, false);
+#if HAS_IMGUI
+                if (m_overlayInitialized) {
+                    m_overlay.setForcedContentScale(1.0f, false);
+                }
+#endif
+                break;
+        }
+    };
+
+    auto applyWindowPresentation = [&]() {
+        NSScreen* target = resolvePresentationScreen(settings);
+        if (!target) {
+            target = window.screen ?: [NSScreen mainScreen];
+        }
+        if (!target) {
+            return;
+        }
+
+        bool borderless =
+            settings.windowMode == PathTracer::PresentationSettings::WindowMode::BorderlessFullscreen;
+        NSRect targetFrame = borderless ? target.frame : target.visibleFrame;
+        if (targetFrame.size.width < 1.0 || targetFrame.size.height < 1.0) {
+            borderless = false;
+            targetFrame = target.visibleFrame;
+        }
+
+        if (borderless) {
+            [window setStyleMask:NSWindowStyleMaskBorderless];
+            [window setLevel:NSMainMenuWindowLevel + 1];
+            const NSApplicationPresentationOptions options =
+                m_presentationRestore.appOptions |
+                NSApplicationPresentationHideDock |
+                NSApplicationPresentationHideMenuBar;
+            [NSApp setPresentationOptions:options];
+        } else {
+            NSWindowStyleMask restoredMask = m_presentationRestore.styleMask;
+            if ((restoredMask & NSWindowStyleMaskTitled) == 0) {
+                restoredMask = NSWindowStyleMaskTitled |
+                               NSWindowStyleMaskClosable |
+                               NSWindowStyleMaskMiniaturizable |
+                               NSWindowStyleMaskResizable;
+            }
+            [window setStyleMask:restoredMask];
+            [window setLevel:m_presentationRestore.level];
+            [NSApp setPresentationOptions:m_presentationRestore.appOptions];
+        }
+
+        [window setFrame:targetFrame display:YES];
+        updateDrawableSize();
+    };
+
+    auto applyResolutionLock = [&](PathTracer::PresentationSettings::RenderResolutionLock lockMode) {
+        switch (lockMode) {
+            case PathTracer::PresentationSettings::RenderResolutionLock::Lock1280x720:
+                m_settings.renderWidth = 1280u;
+                m_settings.renderHeight = 720u;
+                m_settings.renderScale = 1.0f;
+                break;
+            case PathTracer::PresentationSettings::RenderResolutionLock::Lock1920x1080:
+                m_settings.renderWidth = 1920u;
+                m_settings.renderHeight = 1080u;
+                m_settings.renderScale = 1.0f;
+                break;
+            case PathTracer::PresentationSettings::RenderResolutionLock::Off:
+            default:
+                break;
+        }
+    };
+
+    if (!m_presentationActive && !settings.enabled) {
+        m_presentationAppliedSettings = settings;
+        return;
+    }
+
+    if (!m_presentationActive && settings.enabled) {
+        m_presentationRestore.valid = true;
+        m_presentationRestore.frame = window.frame;
+        m_presentationRestore.styleMask = window.styleMask;
+        m_presentationRestore.level = window.level;
+        m_presentationRestore.appOptions = [NSApp presentationOptions];
+        m_presentationRestore.forcedContentScaleEnabled = m_context.hasForcedContentScale();
+        m_presentationRestore.forcedContentScale = m_context.forcedContentScale();
+        m_presentationRestore.renderWidth = m_settings.renderWidth;
+        m_presentationRestore.renderHeight = m_settings.renderHeight;
+        m_presentationRestore.renderScale = m_settings.renderScale;
+#if HAS_IMGUI
+        if (m_overlayInitialized) {
+            m_presentationRestore.overlayMainVisible = m_overlay.isMainPanelVisible();
+            m_presentationRestore.overlayMinimalVisible = m_overlay.isMinimalOverlayVisible();
+        }
+#endif
+
+        m_presentationActive = true;
+        m_presentationRenderLockApplied = false;
+        applyOverlayVisibility();
+        applyContentScale();
+        applyWindowPresentation();
+
+        bool resetIssued = false;
+        if (settings.resolutionLock !=
+            PathTracer::PresentationSettings::RenderResolutionLock::Off) {
+            applyResolutionLock(settings.resolutionLock);
+            m_presentationRenderLockApplied = true;
+            resetAccumulation();
+            resetIssued = true;
+        }
+
+        if (settings.resetAccumulationOnToggle && !resetIssued) {
+            resetAccumulation();
+        }
+
+        m_presentationAppliedSettings = settings;
+        return;
+    }
+
+    if (m_presentationActive && !settings.enabled) {
+        if (m_presentationRestore.valid) {
+            [window setStyleMask:m_presentationRestore.styleMask];
+            [window setLevel:m_presentationRestore.level];
+            [NSApp setPresentationOptions:m_presentationRestore.appOptions];
+            [window setFrame:m_presentationRestore.frame display:YES];
+        }
+
+#if HAS_IMGUI
+        if (m_overlayInitialized) {
+            m_overlay.setMainPanelVisible(m_presentationRestore.overlayMainVisible);
+            m_overlay.setMinimalOverlayVisible(m_presentationRestore.overlayMinimalVisible);
+        }
+#endif
+
+        if (m_presentationRestore.forcedContentScaleEnabled) {
+            m_context.setForcedContentScale(m_presentationRestore.forcedContentScale, true);
+#if HAS_IMGUI
+            if (m_overlayInitialized) {
+                m_overlay.setForcedContentScale(m_presentationRestore.forcedContentScale, true);
+            }
+#endif
+        } else {
+            m_context.setForcedContentScale(1.0f, false);
+#if HAS_IMGUI
+            if (m_overlayInitialized) {
+                m_overlay.setForcedContentScale(1.0f, false);
+            }
+#endif
+        }
+
+        if (m_presentationRenderLockApplied && m_presentationRestore.valid) {
+            m_settings.renderWidth = m_presentationRestore.renderWidth;
+            m_settings.renderHeight = m_presentationRestore.renderHeight;
+            m_settings.renderScale = m_presentationRestore.renderScale;
+            m_presentationRenderLockApplied = false;
+        }
+
+        updateDrawableSize();
+
+        if (settings.resetAccumulationOnToggle) {
+            resetAccumulation();
+        }
+
+        m_presentationActive = false;
+        m_presentationAppliedSettings = settings;
+        return;
+    }
+
+    bool needsWindowUpdate =
+        force ||
+        settings.windowMode != m_presentationAppliedSettings.windowMode ||
+        settings.targetScreen != m_presentationAppliedSettings.targetScreen;
+    if (needsWindowUpdate) {
+        applyWindowPresentation();
+    }
+
+    if (force ||
+        settings.hideUIPanels != m_presentationAppliedSettings.hideUIPanels ||
+        settings.minimalOverlay != m_presentationAppliedSettings.minimalOverlay) {
+        applyOverlayVisibility();
+    }
+
+    if (force || settings.contentScale != m_presentationAppliedSettings.contentScale) {
+        applyContentScale();
+    }
+
+    if (force || settings.resolutionLock != m_presentationAppliedSettings.resolutionLock) {
+        if (settings.resolutionLock ==
+            PathTracer::PresentationSettings::RenderResolutionLock::Off) {
+            if (m_presentationRenderLockApplied && m_presentationRestore.valid) {
+                m_settings.renderWidth = m_presentationRestore.renderWidth;
+                m_settings.renderHeight = m_presentationRestore.renderHeight;
+                m_settings.renderScale = m_presentationRestore.renderScale;
+                m_presentationRenderLockApplied = false;
+            }
+        } else {
+            if (!m_presentationRenderLockApplied) {
+                m_presentationRestore.renderWidth = m_settings.renderWidth;
+                m_presentationRestore.renderHeight = m_settings.renderHeight;
+                m_presentationRestore.renderScale = m_settings.renderScale;
+            }
+            applyResolutionLock(settings.resolutionLock);
+            m_presentationRenderLockApplied = true;
+        }
+        resetAccumulation();
+    }
+
+    m_presentationAppliedSettings = settings;
 }
 
 void MetalRenderer::Impl::noteWindowInteraction() {
@@ -382,6 +724,7 @@ void MetalRenderer::Impl::drawFrame() {
     MTLRenderPassDescriptor* renderPassDescriptor = nil;
     id<CAMetalDrawable> drawable = nil;
     CGSize renderSize = CGSizeZero;
+    std::string pendingSavePath;
 
     if (!m_options.headless) {
         MTKView* view = m_context.view();
@@ -390,16 +733,23 @@ void MetalRenderer::Impl::drawFrame() {
         }
 
         CFAbsoluteTime drawableWaitStart = CFAbsoluteTimeGetCurrent();
-        [view setNeedsDisplay:YES];
-        [view displayIfNeeded];
-
-        renderPassDescriptor = view.currentRenderPassDescriptor;
-        drawable = view.currentDrawable;
-        CFAbsoluteTime drawableWaitEnd = CFAbsoluteTimeGetCurrent();
-        m_lastDrawableWaitMs = (drawableWaitEnd - drawableWaitStart) * 1000.0;
-        if (!renderPassDescriptor || !drawable) {
+        CAMetalLayer* metalLayer = (CAMetalLayer*)view.layer;
+        if (!metalLayer || ![metalLayer isKindOfClass:[CAMetalLayer class]]) {
             return;
         }
+
+        drawable = [metalLayer nextDrawable];
+        CFAbsoluteTime drawableWaitEnd = CFAbsoluteTimeGetCurrent();
+        m_lastDrawableWaitMs = (drawableWaitEnd - drawableWaitStart) * 1000.0;
+        if (!drawable) {
+            return;
+        }
+
+        renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+        renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
+        renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
+        renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+        renderPassDescriptor.colorAttachments[0].clearColor = view.clearColor;
 
 #if HAS_IMGUI
         if (!m_overlayInitialized) {
@@ -511,7 +861,8 @@ void MetalRenderer::Impl::drawFrame() {
                               m_settings,
                               uiRequestedReset,
                               m_sceneLabelPointers,
-                              selectedSceneIndex);
+                              selectedSceneIndex,
+                              m_presentationSettings);
 
             if (selectedSceneIndex != currentSceneIndex) {
                 if (selectedSceneIndex <= 0 ||
@@ -543,12 +894,14 @@ void MetalRenderer::Impl::drawFrame() {
                 resetAccumulation();
             }
 
-            std::string pendingSavePath;
             if (m_overlay.consumeSaveExrRequest(pendingSavePath)) {
-                handleSaveExrRequest(pendingSavePath);
+                // Defer save until after this frame is committed so capture includes
+                // the latest presentation/denoise results.
             }
         }
 #endif
+
+        applyPresentationSettings(false);
 
         handleCameraInput();
 
@@ -583,6 +936,12 @@ void MetalRenderer::Impl::drawFrame() {
     m_performanceStats.renderWidth = static_cast<uint32_t>(std::max<CGFloat>(renderSize.width, 0.0f));
     m_performanceStats.renderHeight = static_cast<uint32_t>(std::max<CGFloat>(renderSize.height, 0.0f));
     m_performanceStats.frameTimeMs = m_lastFrameTimeMs;
+    if (auto envTex = m_sceneResources.environmentTexture()) {
+        m_performanceStats.envRadianceMipCount =
+            static_cast<uint32_t>(envTex.mipmapLevelCount);
+    } else {
+        m_performanceStats.envRadianceMipCount = 0;
+    }
 
     const float deltaSeconds =
         (m_lastFrameTimeMs > 0.0) ? static_cast<float>(m_lastFrameTimeMs * 0.001) : (1.0f / 60.0f);
@@ -612,6 +971,9 @@ void MetalRenderer::Impl::drawFrame() {
         frameSettings);
 
     m_lastCpuEncodeMs = (CFAbsoluteTimeGetCurrent() - encodeCpuStart) * 1000.0;
+    if (m_verboseTiming && !m_firstDispatchTimingLogged) {
+        NSLog(@"[Timing] FirstDispatchEncodeMs=%.2f", m_lastCpuEncodeMs);
+    }
     if (frameResult.samplesDispatched > 0) {
         m_activeSamplesPerFrame = frameResult.samplesDispatched;
     } else {
@@ -619,7 +981,10 @@ void MetalRenderer::Impl::drawFrame() {
     }
 
     MTLBufferHandle statsBuffer = m_renderLoop.statsBuffer();
-    MTLBufferHandle debugBuffer = m_renderLoop.debugBuffer();
+    MTLBufferHandle debugBuffer = nullptr;
+#if PT_DEBUG_TOOLS
+    debugBuffer = m_renderLoop.debugBuffer();
+#endif
     const uint32_t finalSampleCount = m_accumulation.sampleCount();
 
     std::weak_ptr<Impl> weakSelf = shared_from_this();
@@ -637,10 +1002,27 @@ void MetalRenderer::Impl::drawFrame() {
         [commandBuffer presentDrawable:drawable];
     }
 
+    CFAbsoluteTime commitStart = CFAbsoluteTimeGetCurrent();
     [commandBuffer commit];
+    CFAbsoluteTime commitEnd = CFAbsoluteTimeGetCurrent();
+    if (m_verboseTiming && !m_firstDispatchTimingLogged) {
+        double commitMs = (commitEnd - commitStart) * 1000.0;
+        NSLog(@"[Timing] CommandBufferCommitMs=%.2f", commitMs);
+    }
 
     if (m_options.headless) {
+        CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
         [commandBuffer waitUntilCompleted];
+        CFAbsoluteTime waitEnd = CFAbsoluteTimeGetCurrent();
+        if (m_verboseTiming && !m_firstDispatchTimingLogged) {
+            double waitMs = (waitEnd - waitStart) * 1000.0;
+            NSLog(@"[Timing] FirstDispatchToCompletionMs=%.2f", waitMs);
+            m_firstDispatchTimingLogged = true;
+        }
+    }
+
+    if (!pendingSavePath.empty()) {
+        handleSaveExrRequest(pendingSavePath);
     }
 }
 
@@ -767,6 +1149,7 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
     if (!commandBuffer) {
         return;
     }
+    CFAbsoluteTime statsStart = CFAbsoluteTimeGetCurrent();
 
     if (commandBuffer.GPUStartTime != 0 && commandBuffer.GPUEndTime != 0 &&
         commandBuffer.GPUEndTime > commandBuffer.GPUStartTime) {
@@ -815,11 +1198,63 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->hardwareUnavailableCount);
             m_performanceStats.specularNeeOcclusionHitCount =
                 static_cast<uint64_t>(stats->specularNeeOcclusionHitCount);
+            m_performanceStats.specNeeEnvAddedCount =
+                static_cast<uint64_t>(stats->specNeeEnvAddedCount);
+            m_performanceStats.specNeeRectAddedCount =
+                static_cast<uint64_t>(stats->specNeeRectAddedCount);
+            m_performanceStats.mneeEnvHwOccludedCount =
+                static_cast<uint64_t>(stats->mneeEnvHwOccludedCount);
+            m_performanceStats.mneeEnvSwOccludedCount =
+                static_cast<uint64_t>(stats->mneeEnvSwOccludedCount);
+            m_performanceStats.mneeEnvHwSwMismatchCount =
+                static_cast<uint64_t>(stats->mneeEnvHwSwMismatchCount);
+            m_performanceStats.mneeRectHwOccludedCount =
+                static_cast<uint64_t>(stats->mneeRectHwOccludedCount);
+            m_performanceStats.mneeRectSwOccludedCount =
+                static_cast<uint64_t>(stats->mneeRectSwOccludedCount);
+            m_performanceStats.mneeRectHwSwMismatchCount =
+                static_cast<uint64_t>(stats->mneeRectHwSwMismatchCount);
+            m_performanceStats.mneeHitHwSwHitMissCount =
+                static_cast<uint64_t>(stats->mneeHitHwSwHitMissCount);
+            m_performanceStats.mneeHitHwSwNormalMismatchCount =
+                static_cast<uint64_t>(stats->mneeHitHwSwNormalMismatchCount);
+            m_performanceStats.mneeHitHwSwIdMismatchCount =
+                static_cast<uint64_t>(stats->mneeHitHwSwIdMismatchCount);
+            m_performanceStats.mneeHitHwSwTDiffCount =
+                static_cast<uint64_t>(stats->mneeHitHwSwTDiffCount);
+            m_performanceStats.mneeChainHwSwHitMissCount =
+                static_cast<uint64_t>(stats->mneeChainHwSwHitMissCount);
+            m_performanceStats.mneeChainHwSwNormalMismatchCount =
+                static_cast<uint64_t>(stats->mneeChainHwSwNormalMismatchCount);
+            m_performanceStats.mneeChainHwSwIdMismatchCount =
+                static_cast<uint64_t>(stats->mneeChainHwSwIdMismatchCount);
+            m_performanceStats.mneeChainHwSwTDiffCount =
+                static_cast<uint64_t>(stats->mneeChainHwSwTDiffCount);
+            m_performanceStats.mneeEligibleCount =
+                static_cast<uint64_t>(stats->mneeEligibleCount);
+            m_performanceStats.mneeEnvAttemptCount =
+                static_cast<uint64_t>(stats->mneeEnvAttemptCount);
+            m_performanceStats.mneeEnvAddedCount =
+                static_cast<uint64_t>(stats->mneeEnvAddedCount);
+            m_performanceStats.mneeRectAttemptCount =
+                static_cast<uint64_t>(stats->mneeRectAttemptCount);
+            m_performanceStats.mneeRectAddedCount =
+                static_cast<uint64_t>(stats->mneeRectAddedCount);
+            m_performanceStats.mneeContributionCount =
+                static_cast<uint64_t>(stats->mneeContributionCount);
+            const uint64_t mneeLumaSumFixed =
+                (static_cast<uint64_t>(stats->mneeContributionLumaSumHi) << 32) |
+                static_cast<uint64_t>(stats->mneeContributionLumaSumLo);
+            m_performanceStats.mneeContributionLumaSumFixed = mneeLumaSumFixed;
             m_performanceStats.hardwareSelfHitRejectedCount =
                 static_cast<uint64_t>(stats->hardwareSelfHitRejectedCount);
             for (int i = 0; i < 32; ++i) {
                 m_performanceStats.hardwareMissDistanceBins[i] =
                     static_cast<uint64_t>(stats->hardwareMissDistanceBins[i]);
+            }
+            for (int i = 0; i < 4; ++i) {
+                m_performanceStats.hardwareExcludeRetryHistogram[i] =
+                    static_cast<uint64_t>(stats->hardwareExcludeRetryHistogram[i]);
             }
             float missDist = 0.0f;
             std::memcpy(&missDist, &stats->hardwareMissLastDistanceBits, sizeof(float));
@@ -827,6 +1262,12 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
             float selfHitDist = 0.0f;
             std::memcpy(&selfHitDist, &stats->hardwareSelfHitLastDistanceBits, sizeof(float));
             m_performanceStats.hardwareSelfHitLastDistance = selfHitDist;
+            m_performanceStats.hardwareMissLastInstanceId = stats->hardwareMissLastInstanceId;
+            m_performanceStats.hardwareMissLastPrimitiveId = stats->hardwareMissLastPrimitiveId;
+            m_performanceStats.hardwareFallbackHitCount =
+                static_cast<uint64_t>(stats->hardwareFallbackHitCount);
+            m_performanceStats.hardwareFirstHitFallbackCount =
+                static_cast<uint64_t>(stats->hardwareFirstHitFallbackCount);
             m_performanceStats.hardwareLastResultType = stats->hardwareLastResultType;
             m_performanceStats.hardwareLastInstanceId = stats->hardwareLastInstanceId;
             m_performanceStats.hardwareLastPrimitiveId = stats->hardwareLastPrimitiveId;
@@ -860,7 +1301,49 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                           stats->hardwareHitCount,
                           stats->hardwareMissCount,
                           stats->hardwareResultNoneCount);
+#if PT_MNEE_OCCLUSION_PARITY
+                    static bool loggedMneeParity = false;
+                    if (!loggedMneeParity) {
+                        loggedMneeParity = true;
+                        NSLog(@"MNEE HW/SW visibility: env(hw=%u sw=%u mismatch=%u) rect(hw=%u sw=%u mismatch=%u)",
+                              stats->mneeEnvHwOccludedCount,
+                              stats->mneeEnvSwOccludedCount,
+                              stats->mneeEnvHwSwMismatchCount,
+                              stats->mneeRectHwOccludedCount,
+                              stats->mneeRectSwOccludedCount,
+                              stats->mneeRectHwSwMismatchCount);
+                        NSLog(@"MNEE HW/SW hit parity: hitMiss=%u normal=%u id=%u tdiff=%u",
+                              stats->mneeHitHwSwHitMissCount,
+                              stats->mneeHitHwSwNormalMismatchCount,
+                              stats->mneeHitHwSwIdMismatchCount,
+                              stats->mneeHitHwSwTDiffCount);
+                    }
+#endif
                 }
+            }
+            if (m_verboseTiming && !m_mneeAccountingLogged) {
+                m_mneeAccountingLogged = true;
+                constexpr double kMneeLumaScale = 1024.0;
+                const uint64_t lumaFixed =
+                    (static_cast<uint64_t>(stats->mneeContributionLumaSumHi) << 32) |
+                    static_cast<uint64_t>(stats->mneeContributionLumaSumLo);
+                const double lumaSum = static_cast<double>(lumaFixed) / kMneeLumaScale;
+                const double lumaAvg = (stats->mneeContributionCount > 0)
+                                           ? (lumaSum / static_cast<double>(stats->mneeContributionCount))
+                                           : 0.0;
+                NSLog(@"MNEE accounting: eligible=%u env(attempt=%u added=%u) rect(attempt=%u added=%u) contrib(count=%u lumaSum=%.6f avg=%.6f)",
+                      stats->mneeEligibleCount,
+                      stats->mneeEnvAttemptCount,
+                      stats->mneeEnvAddedCount,
+                      stats->mneeRectAttemptCount,
+                      stats->mneeRectAddedCount,
+                      stats->mneeContributionCount,
+                      lumaSum,
+                      lumaAvg);
+                NSLog(@"Spec-NEE accounting: env(added=%u) rect(added=%u) occlusionHits=%u",
+                      stats->specNeeEnvAddedCount,
+                      stats->specNeeRectAddedCount,
+                      stats->specularNeeOcclusionHitCount);
             }
         } else {
             m_performanceStats.avgNodesVisited = 0.0;
@@ -874,12 +1357,42 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
             m_performanceStats.hardwareRejectedCount = 0;
             m_performanceStats.hardwareUnavailableCount = 0;
             m_performanceStats.specularNeeOcclusionHitCount = 0;
+            m_performanceStats.specNeeEnvAddedCount = 0;
+            m_performanceStats.specNeeRectAddedCount = 0;
+            m_performanceStats.mneeEnvHwOccludedCount = 0;
+            m_performanceStats.mneeEnvSwOccludedCount = 0;
+            m_performanceStats.mneeEnvHwSwMismatchCount = 0;
+            m_performanceStats.mneeRectHwOccludedCount = 0;
+            m_performanceStats.mneeRectSwOccludedCount = 0;
+            m_performanceStats.mneeRectHwSwMismatchCount = 0;
+            m_performanceStats.mneeHitHwSwHitMissCount = 0;
+            m_performanceStats.mneeHitHwSwNormalMismatchCount = 0;
+            m_performanceStats.mneeHitHwSwIdMismatchCount = 0;
+            m_performanceStats.mneeHitHwSwTDiffCount = 0;
+            m_performanceStats.mneeChainHwSwHitMissCount = 0;
+            m_performanceStats.mneeChainHwSwNormalMismatchCount = 0;
+            m_performanceStats.mneeChainHwSwIdMismatchCount = 0;
+            m_performanceStats.mneeChainHwSwTDiffCount = 0;
+            m_performanceStats.mneeEligibleCount = 0;
+            m_performanceStats.mneeEnvAttemptCount = 0;
+            m_performanceStats.mneeEnvAddedCount = 0;
+            m_performanceStats.mneeRectAttemptCount = 0;
+            m_performanceStats.mneeRectAddedCount = 0;
+            m_performanceStats.mneeContributionCount = 0;
+            m_performanceStats.mneeContributionLumaSumFixed = 0;
             m_performanceStats.hardwareSelfHitRejectedCount = 0;
             std::fill(std::begin(m_performanceStats.hardwareMissDistanceBins),
                       std::end(m_performanceStats.hardwareMissDistanceBins),
                       0ull);
+            std::fill(std::begin(m_performanceStats.hardwareExcludeRetryHistogram),
+                      std::end(m_performanceStats.hardwareExcludeRetryHistogram),
+                      0ull);
             m_performanceStats.hardwareMissLastDistance = 0.0f;
             m_performanceStats.hardwareSelfHitLastDistance = 0.0f;
+            m_performanceStats.hardwareMissLastInstanceId = 0;
+            m_performanceStats.hardwareMissLastPrimitiveId = 0;
+            m_performanceStats.hardwareFallbackHitCount = 0;
+            m_performanceStats.hardwareFirstHitFallbackCount = 0;
             m_performanceStats.hardwareLastResultType = 0;
             m_performanceStats.hardwareLastInstanceId = 0;
             m_performanceStats.hardwareLastPrimitiveId = 0;
@@ -899,12 +1412,42 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
         m_performanceStats.hardwareRejectedCount = 0;
         m_performanceStats.hardwareUnavailableCount = 0;
         m_performanceStats.specularNeeOcclusionHitCount = 0;
+        m_performanceStats.specNeeEnvAddedCount = 0;
+        m_performanceStats.specNeeRectAddedCount = 0;
+        m_performanceStats.mneeEnvHwOccludedCount = 0;
+        m_performanceStats.mneeEnvSwOccludedCount = 0;
+        m_performanceStats.mneeEnvHwSwMismatchCount = 0;
+        m_performanceStats.mneeRectHwOccludedCount = 0;
+        m_performanceStats.mneeRectSwOccludedCount = 0;
+        m_performanceStats.mneeRectHwSwMismatchCount = 0;
+        m_performanceStats.mneeHitHwSwHitMissCount = 0;
+        m_performanceStats.mneeHitHwSwNormalMismatchCount = 0;
+        m_performanceStats.mneeHitHwSwIdMismatchCount = 0;
+        m_performanceStats.mneeHitHwSwTDiffCount = 0;
+        m_performanceStats.mneeChainHwSwHitMissCount = 0;
+        m_performanceStats.mneeChainHwSwNormalMismatchCount = 0;
+        m_performanceStats.mneeChainHwSwIdMismatchCount = 0;
+        m_performanceStats.mneeChainHwSwTDiffCount = 0;
+        m_performanceStats.mneeEligibleCount = 0;
+        m_performanceStats.mneeEnvAttemptCount = 0;
+        m_performanceStats.mneeEnvAddedCount = 0;
+        m_performanceStats.mneeRectAttemptCount = 0;
+        m_performanceStats.mneeRectAddedCount = 0;
+        m_performanceStats.mneeContributionCount = 0;
+        m_performanceStats.mneeContributionLumaSumFixed = 0;
         m_performanceStats.hardwareSelfHitRejectedCount = 0;
         std::fill(std::begin(m_performanceStats.hardwareMissDistanceBins),
                   std::end(m_performanceStats.hardwareMissDistanceBins),
                   0ull);
+        std::fill(std::begin(m_performanceStats.hardwareExcludeRetryHistogram),
+                  std::end(m_performanceStats.hardwareExcludeRetryHistogram),
+                  0ull);
         m_performanceStats.hardwareMissLastDistance = 0.0f;
         m_performanceStats.hardwareSelfHitLastDistance = 0.0f;
+        m_performanceStats.hardwareMissLastInstanceId = 0;
+        m_performanceStats.hardwareMissLastPrimitiveId = 0;
+        m_performanceStats.hardwareFallbackHitCount = 0;
+        m_performanceStats.hardwareFirstHitFallbackCount = 0;
         m_performanceStats.hardwareLastResultType = 0;
         m_performanceStats.hardwareLastInstanceId = 0;
         m_performanceStats.hardwareLastPrimitiveId = 0;
@@ -915,7 +1458,10 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
 
     uint32_t debugEntryCount = 0;
     uint32_t debugMaxEntries = 0;
+    uint32_t parityEntryCount = 0;
+    uint32_t parityMaxEntries = 0;
     if (debugBuffer) {
+#if PT_DEBUG_TOOLS
         const auto* debugData =
             reinterpret_cast<const PathtraceDebugBuffer*>([debugBuffer contents]);
         if (debugData) {
@@ -945,14 +1491,114 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
             } else if (debugEntryCount == 0) {
                 m_lastDebugLogCount = 0;
             }
+
+            parityMaxEntries = debugData->parityMaxEntries;
+            uint32_t parityRecorded = debugData->parityWriteIndex;
+            parityEntryCount = std::min(parityRecorded, parityMaxEntries);
+            if (parityEntryCount > 0 && m_settings.parityAssertEnabled &&
+                parityEntryCount != m_lastParityLogCount) {
+                const auto& entry = debugData->parityEntries[parityEntryCount - 1u];
+                NSLog(@"[ParityAssert] frame=%u pixel=(%u,%u) depth=%u reason=0x%02x hw(hit=%u t=%.4f mat=%u mesh=%u prim=%u front=%u) sw(hit=%u t=%.4f mat=%u mesh=%u prim=%u front=%u)",
+                      entry.frameIndex,
+                      entry.pixelX,
+                      entry.pixelY,
+                      entry.depth,
+                      entry.reasonMask,
+                      entry.hwHit,
+                      entry.hwT,
+                      entry.hwMaterialIndex,
+                      entry.hwMeshIndex,
+                      entry.hwPrimitiveIndex,
+                      entry.hwFrontFace,
+                      entry.swHit,
+                      entry.swT,
+                      entry.swMaterialIndex,
+                      entry.swMeshIndex,
+                      entry.swPrimitiveIndex,
+                      entry.swFrontFace);
+                m_lastParityLogCount = parityEntryCount;
+            } else if (parityEntryCount == 0) {
+                m_lastParityLogCount = 0;
+            }
         } else {
             m_lastDebugLogCount = 0;
+            m_lastParityLogCount = 0;
         }
+#else
+        (void)debugBuffer;
+        m_lastDebugLogCount = 0;
+        m_lastParityLogCount = 0;
+#endif
     } else {
         m_lastDebugLogCount = 0;
+        m_lastParityLogCount = 0;
     }
     m_performanceStats.debugPathEntryCount = debugEntryCount;
     m_performanceStats.debugPathMaxEntries = debugMaxEntries;
+    m_performanceStats.parityEntryCount = parityEntryCount;
+    m_performanceStats.parityMaxEntries = parityMaxEntries;
+    if (debugBuffer) {
+#if PT_DEBUG_TOOLS
+        const auto* debugData =
+            reinterpret_cast<const PathtraceDebugBuffer*>([debugBuffer contents]);
+        if (debugData) {
+            m_performanceStats.parityChecksPerformed = debugData->parityChecksPerformed;
+            m_performanceStats.parityChecksInMedium = debugData->parityChecksInMedium;
+        } else {
+            m_performanceStats.parityChecksPerformed = 0;
+            m_performanceStats.parityChecksInMedium = 0;
+        }
+#else
+        m_performanceStats.parityChecksPerformed = 0;
+        m_performanceStats.parityChecksInMedium = 0;
+#endif
+    } else {
+        m_performanceStats.parityChecksPerformed = 0;
+        m_performanceStats.parityChecksInMedium = 0;
+    }
+
+    if (parityEntryCount > 0 && debugBuffer) {
+#if PT_DEBUG_TOOLS
+        const auto* debugData =
+            reinterpret_cast<const PathtraceDebugBuffer*>([debugBuffer contents]);
+        const auto& entry = debugData->parityEntries[parityEntryCount - 1u];
+        m_performanceStats.parityLastReasonMask = entry.reasonMask;
+        m_performanceStats.parityLastPixelX = entry.pixelX;
+        m_performanceStats.parityLastPixelY = entry.pixelY;
+        m_performanceStats.parityLastDepth = entry.depth;
+        m_performanceStats.parityLastHwHit = entry.hwHit;
+        m_performanceStats.parityLastSwHit = entry.swHit;
+        m_performanceStats.parityLastHwFrontFace = entry.hwFrontFace;
+        m_performanceStats.parityLastSwFrontFace = entry.swFrontFace;
+        m_performanceStats.parityLastHwMaterialIndex = entry.hwMaterialIndex;
+        m_performanceStats.parityLastSwMaterialIndex = entry.swMaterialIndex;
+        m_performanceStats.parityLastHwMeshIndex = entry.hwMeshIndex;
+        m_performanceStats.parityLastSwMeshIndex = entry.swMeshIndex;
+        m_performanceStats.parityLastHwPrimitiveIndex = entry.hwPrimitiveIndex;
+        m_performanceStats.parityLastSwPrimitiveIndex = entry.swPrimitiveIndex;
+        m_performanceStats.parityLastHwT = entry.hwT;
+        m_performanceStats.parityLastSwT = entry.swT;
+#else
+        (void)debugBuffer;
+#endif
+    } else {
+        m_performanceStats.parityLastReasonMask = 0;
+        m_performanceStats.parityLastPixelX = 0;
+        m_performanceStats.parityLastPixelY = 0;
+        m_performanceStats.parityLastDepth = 0;
+        m_performanceStats.parityLastHwHit = 0;
+        m_performanceStats.parityLastSwHit = 0;
+        m_performanceStats.parityLastHwFrontFace = 0;
+        m_performanceStats.parityLastSwFrontFace = 0;
+        m_performanceStats.parityLastHwMaterialIndex = 0;
+        m_performanceStats.parityLastSwMaterialIndex = 0;
+        m_performanceStats.parityLastHwMeshIndex = 0;
+        m_performanceStats.parityLastSwMeshIndex = 0;
+        m_performanceStats.parityLastHwPrimitiveIndex = 0;
+        m_performanceStats.parityLastSwPrimitiveIndex = 0;
+        m_performanceStats.parityLastHwT = 0.0f;
+        m_performanceStats.parityLastSwT = 0.0f;
+    }
 
     const uint32_t previousSampleCount = m_previousSampleCount;
     m_previousSampleCount = finalSampleCount;
@@ -989,6 +1635,12 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
         static_cast<uint32_t>(std::max<CGFloat>(renderSize.width, 0.0f));
     m_performanceStats.renderHeight =
         static_cast<uint32_t>(std::max<CGFloat>(renderSize.height, 0.0f));
+
+    if (m_verboseTiming && !m_firstStatsTimingLogged) {
+        double statsMs = (CFAbsoluteTimeGetCurrent() - statsStart) * 1000.0;
+        NSLog(@"[Timing] StatsReadbackMs=%.2f", statsMs);
+        m_firstStatsTimingLogged = true;
+    }
 }
 
 void MetalRenderer::Impl::handleCameraInput() {
@@ -1499,6 +2151,28 @@ void MetalRenderer::Impl::setTonemapMode(uint32_t mode) {
     m_settings.tonemapMode = clamped;
 }
 
+void MetalRenderer::Impl::setPresentationEnabled(bool enabled) {
+    if (m_options.headless) {
+        return;
+    }
+    if (m_presentationSettings.enabled == enabled) {
+        return;
+    }
+    m_presentationSettings.enabled = enabled;
+    applyPresentationSettings(true);
+}
+
+void MetalRenderer::Impl::togglePresentationUIPanels() {
+    if (m_options.headless) {
+        return;
+    }
+    if (!m_presentationSettings.enabled) {
+        return;
+    }
+    m_presentationSettings.hideUIPanels = !m_presentationSettings.hideUIPanels;
+    applyPresentationSettings(false);
+}
+
 bool MetalRenderer::Impl::loadScene(const std::string& identifier) {
     std::string refreshError;
     if (!m_sceneManager.refresh(&refreshError) && !refreshError.empty()) {
@@ -1593,20 +2267,25 @@ bool MetalRenderer::Impl::captureAverageImage(std::vector<float>& outLinearRGB,
                                               uint32_t& width,
                                               uint32_t& height,
                                               std::vector<float>* outSampleCounts) {
-    id<MTLTexture> present = m_accumulation.present();
+    id<MTLTexture> sourceTexture = m_accumulation.present();
+    if (m_settings.denoiseEnabled && m_renderLoop.hasDenoisedOutput()) {
+        if (id<MTLTexture> denoised = m_accumulation.denoisedBuffer()) {
+            sourceTexture = denoised;
+        }
+    }
     id<MTLDevice> device = m_context.device();
     id<MTLCommandQueue> queue = m_context.commandQueue();
-    if (!present || !device || !queue) {
+    if (!sourceTexture || !device || !queue) {
         return false;
     }
 
-    width = static_cast<uint32_t>(present.width);
-    height = static_cast<uint32_t>(present.height);
+    width = static_cast<uint32_t>(sourceTexture.width);
+    height = static_cast<uint32_t>(sourceTexture.height);
 
     MTLTextureDescriptor* descriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
-                                                           width:present.width
-                                                          height:present.height
+                                                           width:sourceTexture.width
+                                                          height:sourceTexture.height
                                                        mipmapped:NO];
     descriptor.storageMode = MTLStorageModeShared;
     descriptor.usage = MTLTextureUsageShaderWrite;
@@ -1619,7 +2298,7 @@ bool MetalRenderer::Impl::captureAverageImage(std::vector<float>& outLinearRGB,
     id<MTLCommandBuffer> blitCmd = [queue commandBuffer];
     blitCmd.label = @"Capture Image Blit";
     id<MTLBlitCommandEncoder> blitEncoder = [blitCmd blitCommandEncoder];
-    [blitEncoder copyFromTexture:present toTexture:readable];
+    [blitEncoder copyFromTexture:sourceTexture toTexture:readable];
     [blitEncoder endEncoding];
     [blitCmd commit];
     [blitCmd waitUntilCompleted];
@@ -1699,12 +2378,14 @@ void MetalRenderer::Impl::handleSaveExrRequest(const std::string& path) {
                                                                rgba.data(),
                                                                static_cast<int>(width),
                                                                static_cast<int>(height),
-                                                               sampleCounts.data());
+                                                               sampleCounts.data(),
+                                                               WorkingColorSpaceLabel(m_settings));
     } else {
         success = PathTracer::ImageWriter::WriteEXR(targetPath.string().c_str(),
                                                     rgba.data(),
                                                     static_cast<int>(width),
-                                                    static_cast<int>(height));
+                                                    static_cast<int>(height),
+                                                    WorkingColorSpaceLabel(m_settings));
     }
 
     if (success) {
@@ -1769,6 +2450,10 @@ void MetalRenderer::Impl::shutdown() {
         [[NSNotificationCenter defaultCenter] removeObserver:m_backingChangeObserver];
         m_backingChangeObserver = nil;
         m_context.setBackingChangeObserver(nil);
+    }
+    if (m_windowResizeObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:m_windowResizeObserver];
+        m_windowResizeObserver = nil;
     }
     if (m_windowMoveObserver) {
         [[NSNotificationCenter defaultCenter] removeObserver:m_windowMoveObserver];
@@ -1843,6 +2528,25 @@ void MetalRenderer::resetAccumulation() {
 void MetalRenderer::setTonemapMode(uint32_t mode) {
     if (m_impl) {
         m_impl->setTonemapMode(mode);
+    }
+}
+
+void MetalRenderer::setPresentationEnabled(bool enabled) {
+    if (m_impl) {
+        m_impl->setPresentationEnabled(enabled);
+    }
+}
+
+bool MetalRenderer::isPresentationEnabled() const {
+    if (!m_impl) {
+        return false;
+    }
+    return m_impl->presentationEnabled();
+}
+
+void MetalRenderer::togglePresentationUIPanels() {
+    if (m_impl) {
+        m_impl->togglePresentationUIPanels();
     }
 }
 

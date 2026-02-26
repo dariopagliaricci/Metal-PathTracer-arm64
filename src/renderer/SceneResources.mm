@@ -2,11 +2,13 @@
 #import "renderer/MetalContext.h"
 #import "renderer/SceneAccel.h"
 #import "renderer/EnvImportanceSampler.h"
+#import "renderer/ImageWriter.h"
 
 #import <MetalKit/MetalKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -16,10 +18,13 @@
 
 using PathTracerShaderTypes::EnvironmentAliasEntry;
 using PathTracerShaderTypes::MaterialData;
+using PathTracerShaderTypes::MaterialTextureInfo;
 using PathTracerShaderTypes::MaterialType;
 using PathTracerShaderTypes::RectData;
 using PathTracerShaderTypes::SphereData;
 using PathTracerShaderTypes::kMaxMaterials;
+using PathTracerShaderTypes::kMaxMaterialSamplers;
+using PathTracerShaderTypes::kMaxMaterialTextures;
 using PathTracerShaderTypes::kMaxRectangles;
 using PathTracerShaderTypes::kMaxSpheres;
 
@@ -32,6 +37,143 @@ inline float SrgbToLinear(float value) {
         return value / 12.92f;
     }
     return powf((value + 0.055f) / 1.055f, 2.4f);
+}
+
+constexpr uint32_t kInvalidTextureIndex = 0xFFFFFFFFu;
+constexpr int32_t kGltfFilterNearest = 9728;
+constexpr int32_t kGltfFilterLinear = 9729;
+constexpr int32_t kGltfFilterNearestMipmapNearest = 9984;
+constexpr int32_t kGltfFilterLinearMipmapNearest = 9985;
+constexpr int32_t kGltfFilterNearestMipmapLinear = 9986;
+constexpr int32_t kGltfFilterLinearMipmapLinear = 9987;
+constexpr int32_t kGltfWrapClampToEdge = 33071;
+constexpr int32_t kGltfWrapMirroredRepeat = 33648;
+constexpr int32_t kGltfWrapRepeat = 10497;
+constexpr NSUInteger kDefaultMaterialAnisotropy = 8u;
+
+inline simd::float4 MakeTextureTransformRow0Identity() {
+    return simd_make_float4(1.0f, 0.0f, 0.0f, 0.0f);
+}
+
+inline simd::float4 MakeTextureTransformRow1Identity() {
+    return simd_make_float4(0.0f, 1.0f, 0.0f, 0.0f);
+}
+
+inline bool TextureTransformRowsAreUsable(const simd::float4& row0, const simd::float4& row1) {
+    if (!std::isfinite(row0.x) || !std::isfinite(row0.y) || !std::isfinite(row0.z) ||
+        !std::isfinite(row1.x) || !std::isfinite(row1.y) || !std::isfinite(row1.z)) {
+        return false;
+    }
+    const float linearSum = std::fabs(row0.x) + std::fabs(row0.y) + std::fabs(row1.x) + std::fabs(row1.y);
+    return linearSum > 1.0e-8f;
+}
+
+inline void SetMaterialTextureTransformIdentity(MaterialData& material) {
+    material.textureUvSet0 = simd_make_uint4(0u, 0u, 0u, 0u);
+    material.textureUvSet1 = simd_make_uint4(0u, 0u, 0u, 0u);
+    material.textureTransform0 = MakeTextureTransformRow0Identity();
+    material.textureTransform1 = MakeTextureTransformRow1Identity();
+    material.textureTransform2 = MakeTextureTransformRow0Identity();
+    material.textureTransform3 = MakeTextureTransformRow1Identity();
+    material.textureTransform4 = MakeTextureTransformRow0Identity();
+    material.textureTransform5 = MakeTextureTransformRow1Identity();
+    material.textureTransform6 = MakeTextureTransformRow0Identity();
+    material.textureTransform7 = MakeTextureTransformRow1Identity();
+    material.textureTransform8 = MakeTextureTransformRow0Identity();
+    material.textureTransform9 = MakeTextureTransformRow1Identity();
+    material.textureTransform10 = MakeTextureTransformRow0Identity();
+    material.textureTransform11 = MakeTextureTransformRow1Identity();
+}
+
+inline void SanitizeMaterialTextureMapping(MaterialData& material) {
+    material.textureUvSet0.x = std::min<uint32_t>(material.textureUvSet0.x, 1u);
+    material.textureUvSet0.y = std::min<uint32_t>(material.textureUvSet0.y, 1u);
+    material.textureUvSet0.z = std::min<uint32_t>(material.textureUvSet0.z, 1u);
+    material.textureUvSet0.w = std::min<uint32_t>(material.textureUvSet0.w, 1u);
+    material.textureUvSet1.x = std::min<uint32_t>(material.textureUvSet1.x, 1u);
+    material.textureUvSet1.y = std::min<uint32_t>(material.textureUvSet1.y, 1u);
+
+    if (!TextureTransformRowsAreUsable(material.textureTransform0, material.textureTransform1)) {
+        material.textureTransform0 = MakeTextureTransformRow0Identity();
+        material.textureTransform1 = MakeTextureTransformRow1Identity();
+    }
+    if (!TextureTransformRowsAreUsable(material.textureTransform2, material.textureTransform3)) {
+        material.textureTransform2 = MakeTextureTransformRow0Identity();
+        material.textureTransform3 = MakeTextureTransformRow1Identity();
+    }
+    if (!TextureTransformRowsAreUsable(material.textureTransform4, material.textureTransform5)) {
+        material.textureTransform4 = MakeTextureTransformRow0Identity();
+        material.textureTransform5 = MakeTextureTransformRow1Identity();
+    }
+    if (!TextureTransformRowsAreUsable(material.textureTransform6, material.textureTransform7)) {
+        material.textureTransform6 = MakeTextureTransformRow0Identity();
+        material.textureTransform7 = MakeTextureTransformRow1Identity();
+    }
+    if (!TextureTransformRowsAreUsable(material.textureTransform8, material.textureTransform9)) {
+        material.textureTransform8 = MakeTextureTransformRow0Identity();
+        material.textureTransform9 = MakeTextureTransformRow1Identity();
+    }
+    if (!TextureTransformRowsAreUsable(material.textureTransform10, material.textureTransform11)) {
+        material.textureTransform10 = MakeTextureTransformRow0Identity();
+        material.textureTransform11 = MakeTextureTransformRow1Identity();
+    }
+}
+
+MaterialTextureSamplerDesc EffectiveSamplerDesc(const MaterialTextureSamplerDesc* desc) {
+    MaterialTextureSamplerDesc effective{};
+    if (desc) {
+        effective = *desc;
+    }
+    if (effective.magFilter < 0) {
+        effective.magFilter = kGltfFilterLinear;
+    }
+    if (effective.minFilter < 0) {
+        effective.minFilter = kGltfFilterLinearMipmapLinear;
+    }
+    if (effective.wrapS != kGltfWrapClampToEdge &&
+        effective.wrapS != kGltfWrapMirroredRepeat &&
+        effective.wrapS != kGltfWrapRepeat) {
+        effective.wrapS = kGltfWrapRepeat;
+    }
+    if (effective.wrapT != kGltfWrapClampToEdge &&
+        effective.wrapT != kGltfWrapMirroredRepeat &&
+        effective.wrapT != kGltfWrapRepeat) {
+        effective.wrapT = kGltfWrapRepeat;
+    }
+    return effective;
+}
+
+uint64_t SamplerDescKey(const MaterialTextureSamplerDesc& desc) {
+    uint64_t key = 0u;
+    key |= static_cast<uint64_t>(static_cast<uint16_t>(desc.magFilter));
+    key |= static_cast<uint64_t>(static_cast<uint16_t>(desc.minFilter)) << 16u;
+    key |= static_cast<uint64_t>(static_cast<uint16_t>(desc.wrapS)) << 32u;
+    key |= static_cast<uint64_t>(static_cast<uint16_t>(desc.wrapT)) << 48u;
+    return key;
+}
+
+std::string SamplerKeySuffix(const MaterialTextureSamplerDesc* desc) {
+    MaterialTextureSamplerDesc effective = EffectiveSamplerDesc(desc);
+    return "|samp:" + std::to_string(effective.magFilter) + ":" +
+           std::to_string(effective.minFilter) + ":" +
+           std::to_string(effective.wrapS) + ":" +
+           std::to_string(effective.wrapT);
+}
+
+std::string TextureSemanticKeySuffix(MaterialTextureSemantic semantic) {
+    return "|sem:" + std::to_string(static_cast<uint32_t>(semantic));
+}
+
+MTLSamplerAddressMode AddressModeFromGltfWrap(int32_t wrap) {
+    switch (wrap) {
+        case kGltfWrapClampToEdge:
+            return MTLSamplerAddressModeClampToEdge;
+        case kGltfWrapMirroredRepeat:
+            return MTLSamplerAddressModeMirrorRepeat;
+        case kGltfWrapRepeat:
+        default:
+            return MTLSamplerAddressModeRepeat;
+    }
 }
 
 NSUInteger BytesPerPixel(MTLPixelFormat format) {
@@ -48,6 +190,506 @@ NSUInteger BytesPerPixel(MTLPixelFormat format) {
         default:
             return 0u;
     }
+}
+
+bool IsSrgbPixelFormat(MTLPixelFormat format) {
+    return format == MTLPixelFormatRGBA8Unorm_sRGB ||
+           format == MTLPixelFormatBGRA8Unorm_sRGB;
+}
+
+MTLPixelFormat LinearEquivalentPixelFormat(MTLPixelFormat format) {
+    switch (format) {
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+            return MTLPixelFormatRGBA8Unorm;
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+            return MTLPixelFormatRGBA8Unorm;
+        case MTLPixelFormatBGRA8Unorm:
+            return MTLPixelFormatRGBA8Unorm;
+        default:
+            return format;
+    }
+}
+
+NSUInteger MipDimension(NSUInteger base, NSUInteger level) {
+    return std::max<NSUInteger>(1u, base >> level);
+}
+
+bool CopyTextureLevelToFloat(id<MTLTexture> texture,
+                             NSUInteger level,
+                             bool decodeSrgb,
+                             std::vector<float>& outFloats) {
+    if (!texture) {
+        return false;
+    }
+
+    const NSUInteger width = MipDimension(texture.width, level);
+    const NSUInteger height = MipDimension(texture.height, level);
+    if (width == 0 || height == 0) {
+        return false;
+    }
+
+    const MTLPixelFormat format = texture.pixelFormat;
+    const NSUInteger bytesPerPixel = BytesPerPixel(format);
+    if (bytesPerPixel == 0) {
+        return false;
+    }
+
+    const NSUInteger pixelCount = width * height;
+    const NSUInteger bytesPerRow = width * bytesPerPixel;
+    std::vector<uint8_t> rawData(static_cast<size_t>(bytesPerRow) * height);
+
+    MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+    [texture getBytes:rawData.data()
+          bytesPerRow:bytesPerRow
+           fromRegion:region
+          mipmapLevel:level];
+
+    outFloats.assign(pixelCount * 4u, 0.0f);
+
+    switch (format) {
+        case MTLPixelFormatRGBA32Float: {
+            const float* src = reinterpret_cast<const float*>(rawData.data());
+            std::copy(src, src + outFloats.size(), outFloats.begin());
+            return true;
+        }
+        case MTLPixelFormatRGBA16Float: {
+            const __fp16* src = reinterpret_cast<const __fp16*>(rawData.data());
+            for (size_t i = 0; i < outFloats.size(); ++i) {
+                outFloats[i] = static_cast<float>(src[i]);
+            }
+            return true;
+        }
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGRA8Unorm_sRGB: {
+            const bool isBgra = (format == MTLPixelFormatBGRA8Unorm ||
+                                 format == MTLPixelFormatBGRA8Unorm_sRGB);
+            const bool isSrgbFormat = (format == MTLPixelFormatRGBA8Unorm_sRGB ||
+                                       format == MTLPixelFormatBGRA8Unorm_sRGB);
+            const uint8_t* src = rawData.data();
+            for (NSUInteger i = 0; i < pixelCount; ++i) {
+                uint8_t r8 = src[i * 4u + 0u];
+                uint8_t g8 = src[i * 4u + 1u];
+                uint8_t b8 = src[i * 4u + 2u];
+                uint8_t a8 = src[i * 4u + 3u];
+                if (isBgra) {
+                    std::swap(r8, b8);
+                }
+
+                float r = static_cast<float>(r8) / 255.0f;
+                float g = static_cast<float>(g8) / 255.0f;
+                float b = static_cast<float>(b8) / 255.0f;
+                if (decodeSrgb && isSrgbFormat) {
+                    r = SrgbToLinear(r);
+                    g = SrgbToLinear(g);
+                    b = SrgbToLinear(b);
+                }
+
+                outFloats[i * 4u + 0u] = r;
+                outFloats[i * 4u + 1u] = g;
+                outFloats[i * 4u + 2u] = b;
+                outFloats[i * 4u + 3u] = static_cast<float>(a8) / 255.0f;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool WriteTextureLevelFromFloat(id<MTLTexture> texture,
+                                NSUInteger level,
+                                const std::vector<float>& inFloats) {
+    if (!texture) {
+        return false;
+    }
+
+    const NSUInteger width = MipDimension(texture.width, level);
+    const NSUInteger height = MipDimension(texture.height, level);
+    if (width == 0 || height == 0) {
+        return false;
+    }
+
+    const NSUInteger pixelCount = width * height;
+    if (inFloats.size() != static_cast<size_t>(pixelCount) * 4u) {
+        return false;
+    }
+
+    const MTLPixelFormat format = texture.pixelFormat;
+    const NSUInteger bytesPerPixel = BytesPerPixel(format);
+    if (bytesPerPixel == 0) {
+        return false;
+    }
+
+    const NSUInteger bytesPerRow = width * bytesPerPixel;
+    std::vector<uint8_t> rawData(static_cast<size_t>(bytesPerRow) * height, 0u);
+
+    switch (format) {
+        case MTLPixelFormatRGBA32Float: {
+            float* dst = reinterpret_cast<float*>(rawData.data());
+            std::copy(inFloats.begin(), inFloats.end(), dst);
+            break;
+        }
+        case MTLPixelFormatRGBA16Float: {
+            __fp16* dst = reinterpret_cast<__fp16*>(rawData.data());
+            for (size_t i = 0; i < inFloats.size(); ++i) {
+                float value = std::isfinite(inFloats[i]) ? inFloats[i] : 0.0f;
+                dst[i] = static_cast<__fp16>(value);
+            }
+            break;
+        }
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGRA8Unorm_sRGB: {
+            const bool isBgra = (format == MTLPixelFormatBGRA8Unorm ||
+                                 format == MTLPixelFormatBGRA8Unorm_sRGB);
+            uint8_t* dst = rawData.data();
+            for (NSUInteger i = 0; i < pixelCount; ++i) {
+                float r = std::isfinite(inFloats[i * 4u + 0u]) ? inFloats[i * 4u + 0u] : 0.0f;
+                float g = std::isfinite(inFloats[i * 4u + 1u]) ? inFloats[i * 4u + 1u] : 0.0f;
+                float b = std::isfinite(inFloats[i * 4u + 2u]) ? inFloats[i * 4u + 2u] : 0.0f;
+                float a = std::isfinite(inFloats[i * 4u + 3u]) ? inFloats[i * 4u + 3u] : 1.0f;
+                uint8_t r8 = static_cast<uint8_t>(std::lround(std::clamp(r, 0.0f, 1.0f) * 255.0f));
+                uint8_t g8 = static_cast<uint8_t>(std::lround(std::clamp(g, 0.0f, 1.0f) * 255.0f));
+                uint8_t b8 = static_cast<uint8_t>(std::lround(std::clamp(b, 0.0f, 1.0f) * 255.0f));
+                uint8_t a8 = static_cast<uint8_t>(std::lround(std::clamp(a, 0.0f, 1.0f) * 255.0f));
+                if (isBgra) {
+                    std::swap(r8, b8);
+                }
+                dst[i * 4u + 0u] = r8;
+                dst[i * 4u + 1u] = g8;
+                dst[i * 4u + 2u] = b8;
+                dst[i * 4u + 3u] = a8;
+            }
+            break;
+        }
+        default:
+            return false;
+    }
+
+    MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+    [texture replaceRegion:region
+               mipmapLevel:level
+                 withBytes:rawData.data()
+               bytesPerRow:bytesPerRow];
+    return true;
+}
+
+void DownsampleOrmMipLevel(const std::vector<float>& src,
+                           NSUInteger srcWidth,
+                           NSUInteger srcHeight,
+                           std::vector<float>& dst,
+                           NSUInteger dstWidth,
+                           NSUInteger dstHeight,
+                           int32_t wrapS,
+                           int32_t wrapT) {
+    dst.assign(static_cast<size_t>(dstWidth * dstHeight) * 4u, 0.0f);
+    for (NSUInteger y = 0; y < dstHeight; ++y) {
+        for (NSUInteger x = 0; x < dstWidth; ++x) {
+            float sumAo = 0.0f;
+            float sumAlpha = 0.0f;
+            float sumMetal = 0.0f;
+            float sumA = 0.0f;
+            for (NSUInteger ky = 0; ky < 2; ++ky) {
+                for (NSUInteger kx = 0; kx < 2; ++kx) {
+                    auto wrap_coord = [](NSInteger coord, NSUInteger extent, int32_t mode) -> NSUInteger {
+                        if (extent == 0u) {
+                            return 0u;
+                        }
+                        const NSInteger maxIndex = static_cast<NSInteger>(extent) - 1;
+                        switch (mode) {
+                            case kGltfWrapRepeat: {
+                                const NSInteger period = static_cast<NSInteger>(extent);
+                                NSInteger wrapped = coord % period;
+                                if (wrapped < 0) {
+                                    wrapped += period;
+                                }
+                                return static_cast<NSUInteger>(wrapped);
+                            }
+                            case kGltfWrapMirroredRepeat: {
+                                const NSInteger period = static_cast<NSInteger>(extent) * 2;
+                                NSInteger wrapped = coord % period;
+                                if (wrapped < 0) {
+                                    wrapped += period;
+                                }
+                                if (wrapped >= static_cast<NSInteger>(extent)) {
+                                    wrapped = period - wrapped - 1;
+                                }
+                                return static_cast<NSUInteger>(wrapped);
+                            }
+                            case kGltfWrapClampToEdge:
+                            default:
+                                if (coord <= 0) {
+                                    return 0u;
+                                }
+                                if (coord >= maxIndex) {
+                                    return static_cast<NSUInteger>(maxIndex);
+                                }
+                                return static_cast<NSUInteger>(coord);
+                        }
+                    };
+                    NSInteger sxCoord = static_cast<NSInteger>(x * 2u + kx);
+                    NSInteger syCoord = static_cast<NSInteger>(y * 2u + ky);
+                    NSUInteger sx = wrap_coord(sxCoord, srcWidth, wrapS);
+                    NSUInteger sy = wrap_coord(syCoord, srcHeight, wrapT);
+                    size_t srcIndex = static_cast<size_t>((sy * srcWidth + sx) * 4u);
+                    float ao = std::isfinite(src[srcIndex + 0u]) ? src[srcIndex + 0u] : 1.0f;
+                    float rough = std::isfinite(src[srcIndex + 1u]) ? src[srcIndex + 1u] : 1.0f;
+                    float metal = std::isfinite(src[srcIndex + 2u]) ? src[srcIndex + 2u] : 0.0f;
+                    float alpha = std::isfinite(src[srcIndex + 3u]) ? src[srcIndex + 3u] : 1.0f;
+                    rough = std::clamp(rough, 0.0f, 1.0f);
+                    sumAo += ao;
+                    sumAlpha += rough * rough;
+                    sumMetal += metal;
+                    sumA += alpha;
+                }
+            }
+
+            const float invSampleCount = 0.25f;
+            size_t dstIndex = static_cast<size_t>((y * dstWidth + x) * 4u);
+            dst[dstIndex + 0u] = sumAo * invSampleCount;
+            dst[dstIndex + 1u] = std::sqrt(std::max(sumAlpha * invSampleCount, 0.0f));
+            dst[dstIndex + 2u] = sumMetal * invSampleCount;
+            dst[dstIndex + 3u] = sumA * invSampleCount;
+        }
+    }
+}
+
+void PrefilterOrmBaseLevel(const std::vector<float>& src,
+                           NSUInteger width,
+                           NSUInteger height,
+                           std::vector<float>& dst,
+                           int32_t wrapS,
+                           int32_t wrapT) {
+    dst.assign(src.size(), 0.0f);
+    if (width == 0 || height == 0) {
+        return;
+    }
+
+    for (NSUInteger y = 0; y < height; ++y) {
+        for (NSUInteger x = 0; x < width; ++x) {
+            float sumAo = 0.0f;
+            float sumAlpha = 0.0f;
+            float sumMetal = 0.0f;
+            float sumA = 0.0f;
+            float totalW = 0.0f;
+            for (int ky = -1; ky <= 1; ++ky) {
+                for (int kx = -1; kx <= 1; ++kx) {
+                    auto wrap_coord = [](NSInteger coord, NSUInteger extent, int32_t mode) -> NSUInteger {
+                        if (extent == 0u) {
+                            return 0u;
+                        }
+                        const NSInteger maxIndex = static_cast<NSInteger>(extent) - 1;
+                        switch (mode) {
+                            case kGltfWrapRepeat: {
+                                const NSInteger period = static_cast<NSInteger>(extent);
+                                NSInteger wrapped = coord % period;
+                                if (wrapped < 0) {
+                                    wrapped += period;
+                                }
+                                return static_cast<NSUInteger>(wrapped);
+                            }
+                            case kGltfWrapMirroredRepeat: {
+                                const NSInteger period = static_cast<NSInteger>(extent) * 2;
+                                NSInteger wrapped = coord % period;
+                                if (wrapped < 0) {
+                                    wrapped += period;
+                                }
+                                if (wrapped >= static_cast<NSInteger>(extent)) {
+                                    wrapped = period - wrapped - 1;
+                                }
+                                return static_cast<NSUInteger>(wrapped);
+                            }
+                            case kGltfWrapClampToEdge:
+                            default:
+                                if (coord <= 0) {
+                                    return 0u;
+                                }
+                                if (coord >= maxIndex) {
+                                    return static_cast<NSUInteger>(maxIndex);
+                                }
+                                return static_cast<NSUInteger>(coord);
+                        }
+                    };
+                    const NSUInteger sx = wrap_coord(static_cast<NSInteger>(x) + kx, width, wrapS);
+                    const NSUInteger sy = wrap_coord(static_cast<NSInteger>(y) + ky, height, wrapT);
+                    const float weight = (kx == 0 && ky == 0) ? 4.0f : ((kx == 0 || ky == 0) ? 2.0f : 1.0f);
+                    const size_t srcIndex = static_cast<size_t>((sy * width + sx) * 4u);
+                    const float ao = std::isfinite(src[srcIndex + 0u]) ? src[srcIndex + 0u] : 1.0f;
+                    const float rough = std::isfinite(src[srcIndex + 1u]) ? src[srcIndex + 1u] : 1.0f;
+                    const float metal = std::isfinite(src[srcIndex + 2u]) ? src[srcIndex + 2u] : 0.0f;
+                    const float alpha = std::isfinite(src[srcIndex + 3u]) ? src[srcIndex + 3u] : 1.0f;
+                    const float rClamped = std::clamp(rough, 0.0f, 1.0f);
+                    sumAo += weight * ao;
+                    sumAlpha += weight * (rClamped * rClamped);
+                    sumMetal += weight * metal;
+                    sumA += weight * alpha;
+                    totalW += weight;
+                }
+            }
+
+            const float invW = (totalW > 0.0f) ? (1.0f / totalW) : 0.0f;
+            const size_t dstIndex = static_cast<size_t>((y * width + x) * 4u);
+            dst[dstIndex + 0u] = sumAo * invW;
+            dst[dstIndex + 1u] = std::sqrt(std::max(sumAlpha * invW, 0.0f));
+            dst[dstIndex + 2u] = sumMetal * invW;
+            dst[dstIndex + 3u] = sumA * invW;
+        }
+    }
+}
+
+id<MTLTexture> BuildTextureWithBlitMips(id<MTLDevice> device,
+                                        id<MTLCommandQueue> commandQueue,
+                                        id<MTLTexture> source) {
+    if (!device || !commandQueue || !source) {
+        return nil;
+    }
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+                                                           width:source.width
+                                                          height:source.height
+                                                       mipmapped:YES];
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> mipTexture = [device newTextureWithDescriptor:desc];
+    if (!mipTexture) {
+        return nil;
+    }
+    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (!blit) {
+        return nil;
+    }
+    MTLOrigin origin = MTLOriginMake(0, 0, 0);
+    MTLSize size = MTLSizeMake(source.width, source.height, 1);
+    [blit copyFromTexture:source
+             sourceSlice:0
+             sourceLevel:0
+            sourceOrigin:origin
+              sourceSize:size
+               toTexture:mipTexture
+        destinationSlice:0
+        destinationLevel:0
+       destinationOrigin:origin];
+    [blit generateMipmapsForTexture:mipTexture];
+    [blit endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    return mipTexture;
+}
+
+id<MTLTexture> CloneTextureWithFormat(id<MTLDevice> device,
+                                      id<MTLTexture> source,
+                                      MTLPixelFormat pixelFormat) {
+    if (!device || !source) {
+        return nil;
+    }
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                           width:source.width
+                                                          height:source.height
+                                                       mipmapped:(source.mipmapLevelCount > 1u)];
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> outTexture = [device newTextureWithDescriptor:desc];
+    if (!outTexture) {
+        return nil;
+    }
+
+    for (NSUInteger level = 0u; level < source.mipmapLevelCount; ++level) {
+        std::vector<float> levelData;
+        if (!CopyTextureLevelToFloat(source, level, /*decodeSrgb=*/false, levelData)) {
+            return nil;
+        }
+        if (!WriteTextureLevelFromFloat(outTexture, level, levelData)) {
+            return nil;
+        }
+    }
+    return outTexture;
+}
+
+id<MTLTexture> BuildTextureWithOrmMips(id<MTLDevice> device,
+                                       id<MTLTexture> source,
+                                       const MaterialTextureSamplerDesc* samplerDesc) {
+    if (!device || !source || source.width == 0 || source.height == 0) {
+        return nil;
+    }
+
+    if (BytesPerPixel(source.pixelFormat) == 0) {
+        return nil;
+    }
+
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+                                                           width:source.width
+                                                          height:source.height
+                                                       mipmapped:YES];
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> mipTexture = [device newTextureWithDescriptor:desc];
+    if (!mipTexture) {
+        return nil;
+    }
+
+    MaterialTextureSamplerDesc effectiveSampler = EffectiveSamplerDesc(samplerDesc);
+    std::vector<float> prevLevel;
+    if (!CopyTextureLevelToFloat(source, 0u, /*decodeSrgb=*/false, prevLevel)) {
+        return nil;
+    }
+    if (!WriteTextureLevelFromFloat(mipTexture, 0u, prevLevel)) {
+        return nil;
+    }
+
+    NSUInteger prevWidth = source.width;
+    NSUInteger prevHeight = source.height;
+    for (NSUInteger level = 1u; level < mipTexture.mipmapLevelCount; ++level) {
+        NSUInteger dstWidth = MipDimension(source.width, level);
+        NSUInteger dstHeight = MipDimension(source.height, level);
+        std::vector<float> nextLevel;
+        DownsampleOrmMipLevel(prevLevel,
+                              prevWidth,
+                              prevHeight,
+                              nextLevel,
+                              dstWidth,
+                              dstHeight,
+                              effectiveSampler.wrapS,
+                              effectiveSampler.wrapT);
+        if (!WriteTextureLevelFromFloat(mipTexture, level, nextLevel)) {
+            return nil;
+        }
+        prevLevel.swap(nextLevel);
+        prevWidth = dstWidth;
+        prevHeight = dstHeight;
+    }
+#if !defined(NDEBUG)
+    static bool sDumpedOrmMipChain = false;
+    if (!sDumpedOrmMipChain) {
+        sDumpedOrmMipChain = true;
+        std::error_code ec;
+        namespace fs = std::filesystem;
+        fs::path dumpDir = fs::path("renders") / "debug" / "orm_mips";
+        fs::create_directories(dumpDir, ec);
+        for (NSUInteger level = 0u; level < mipTexture.mipmapLevelCount; ++level) {
+            std::vector<float> levelData;
+            if (!CopyTextureLevelToFloat(mipTexture, level, /*decodeSrgb=*/false, levelData)) {
+                continue;
+            }
+            fs::path outPath = dumpDir / ("orm_mip_" + std::to_string(level) + ".exr");
+            bool wrote = ImageWriter::WriteEXR(outPath.string().c_str(),
+                                               levelData.data(),
+                                               static_cast<int>(MipDimension(mipTexture.width, level)),
+                                               static_cast<int>(MipDimension(mipTexture.height, level)),
+                                               "Linear");
+            if (!wrote) {
+                NSLog(@"[glTF] Failed to dump ORM mip %lu", static_cast<unsigned long>(level));
+            }
+        }
+        NSLog(@"[glTF] Dumped ORM mip chain to %s", dumpDir.string().c_str());
+    }
+#endif
+    return mipTexture;
 }
 
 bool CopyTextureToFloat(id<MTLTexture> texture, std::vector<float>& outFloats) {
@@ -241,6 +883,13 @@ void SceneResources::initialize(const MetalContext& context) {
     m_environmentTexture = nil;
     m_meshInfoBuffer = nil;
     m_triangleBuffer = nil;
+    m_materialTextures.clear();
+    m_materialSamplers.clear();
+    m_materialTextureSamplerIndices.clear();
+    m_materialTextureLabels.clear();
+    m_materialTextureIndex.clear();
+    m_materialSamplerIndices.clear();
+    m_materialTextureInfoBuffer = nil;
     m_forceSoftwareOverride = false;
     clearEnvironmentDistribution();
 
@@ -284,6 +933,7 @@ uint32_t SceneResources::addMaterial(const simd::float3& baseColor,
                                      simd::float3 carpaintBaseK,
                                      bool carpaintHasBaseConductor,
                                      simd::float3 carpaintBaseTint,
+                                     bool thinDielectric,
                                      std::string name) {
     if (m_materialCount >= kMaxMaterials) {
         return static_cast<uint32_t>(kMaxMaterials - 1);
@@ -291,6 +941,7 @@ uint32_t SceneResources::addMaterial(const simd::float3& baseColor,
 
     uint32_t index = m_materialCount++;
     MaterialData material{};
+    SetMaterialTextureTransformIdentity(material);
 
     simd::float3 clampedBaseColor = ClampColor01(baseColor);
     float clampedRoughness = std::clamp(roughness, 0.0f, 1.0f);
@@ -301,7 +952,7 @@ uint32_t SceneResources::addMaterial(const simd::float3& baseColor,
     material.typeEta = simd_make_float4(static_cast<float>(type),
                                         clampedIor,
                                         clampedCoatIor,
-                                        0.0f);
+                                        thinDielectric ? 1.0f : 0.0f);
 
     material.emission = simd_make_float4(emission, emissionUsesEnvironment ? 1.0f : 0.0f);
 
@@ -371,6 +1022,12 @@ uint32_t SceneResources::addMaterial(const simd::float3& baseColor,
     material.carpaintBaseEta = simd_make_float4(baseEtaClamped, baseConductorFlag);
     material.carpaintBaseK = simd_make_float4(baseKClamped, baseConductorFlag);
     material.carpaintBaseTint = simd_make_float4(ClampColor01(carpaintBaseTint), 0.0f);
+    material.textureIndices0 =
+        simd_make_uint4(kInvalidTextureIndex, kInvalidTextureIndex, kInvalidTextureIndex, kInvalidTextureIndex);
+    material.textureIndices1 =
+        simd_make_uint4(kInvalidTextureIndex, kInvalidTextureIndex, kInvalidTextureIndex, kInvalidTextureIndex);
+    material.pbrParams = simd_make_float4(0.0f, clampedRoughness, 1.0f, 1.0f);
+    SanitizeMaterialTextureMapping(material);
 
     m_materials[index] = material;
     m_materialDefaults[index] = material;
@@ -424,7 +1081,331 @@ uint32_t SceneResources::addMaterial(const simd::float3& albedo,
                        zero,
                        false,
                        ClampColor01(simd_make_float3(1.0f, 1.0f, 1.0f)),
+                       /*thinDielectric=*/false,
                        std::move(name));
+}
+
+uint32_t SceneResources::addMaterialData(const MaterialData& material,
+                                         std::string name) {
+    if (m_materialCount >= kMaxMaterials) {
+        return static_cast<uint32_t>(kMaxMaterials - 1);
+    }
+
+    uint32_t index = m_materialCount++;
+    MaterialData sanitized = material;
+    SanitizeMaterialTextureMapping(sanitized);
+    m_materials[index] = sanitized;
+    m_materialDefaults[index] = sanitized;
+    m_materialNames[index] = name.empty() ? DefaultMaterialName(index) : std::move(name);
+    m_dirty = true;
+    return index;
+}
+
+uint32_t SceneResources::materialSamplerIndexForDesc(
+    const MaterialTextureSamplerDesc* samplerDesc) {
+    if (!m_device) {
+        return 0u;
+    }
+
+    MaterialTextureSamplerDesc effective = EffectiveSamplerDesc(samplerDesc);
+    uint64_t key = SamplerDescKey(effective);
+    auto cached = m_materialSamplerIndices.find(key);
+    if (cached != m_materialSamplerIndices.end()) {
+        return cached->second;
+    }
+
+    MTLSamplerMinMagFilter minFilter = MTLSamplerMinMagFilterLinear;
+    MTLSamplerMinMagFilter magFilter = MTLSamplerMinMagFilterLinear;
+    MTLSamplerMipFilter mipFilter = MTLSamplerMipFilterLinear;
+    switch (effective.minFilter) {
+        case kGltfFilterNearest:
+            minFilter = MTLSamplerMinMagFilterNearest;
+            mipFilter = MTLSamplerMipFilterNotMipmapped;
+            break;
+        case kGltfFilterLinear:
+            minFilter = MTLSamplerMinMagFilterLinear;
+            mipFilter = MTLSamplerMipFilterNotMipmapped;
+            break;
+        case kGltfFilterNearestMipmapNearest:
+            minFilter = MTLSamplerMinMagFilterNearest;
+            mipFilter = MTLSamplerMipFilterNearest;
+            break;
+        case kGltfFilterLinearMipmapNearest:
+            minFilter = MTLSamplerMinMagFilterLinear;
+            mipFilter = MTLSamplerMipFilterNearest;
+            break;
+        case kGltfFilterNearestMipmapLinear:
+            minFilter = MTLSamplerMinMagFilterNearest;
+            mipFilter = MTLSamplerMipFilterLinear;
+            break;
+        case kGltfFilterLinearMipmapLinear:
+        default:
+            minFilter = MTLSamplerMinMagFilterLinear;
+            mipFilter = MTLSamplerMipFilterLinear;
+            break;
+    }
+
+    switch (effective.magFilter) {
+        case kGltfFilterNearest:
+            magFilter = MTLSamplerMinMagFilterNearest;
+            break;
+        case kGltfFilterLinear:
+        default:
+            magFilter = MTLSamplerMinMagFilterLinear;
+            break;
+    }
+
+    MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
+    descriptor.minFilter = minFilter;
+    descriptor.magFilter = magFilter;
+    descriptor.mipFilter = mipFilter;
+    descriptor.sAddressMode = AddressModeFromGltfWrap(effective.wrapS);
+    descriptor.tAddressMode = AddressModeFromGltfWrap(effective.wrapT);
+    descriptor.normalizedCoordinates = YES;
+    descriptor.lodMinClamp = 0.0f;
+    descriptor.lodMaxClamp = FLT_MAX;
+    if (minFilter == MTLSamplerMinMagFilterLinear &&
+        magFilter == MTLSamplerMinMagFilterLinear &&
+        mipFilter != MTLSamplerMipFilterNotMipmapped) {
+        descriptor.maxAnisotropy = kDefaultMaterialAnisotropy;
+    } else {
+        descriptor.maxAnisotropy = 1;
+    }
+
+    MTLSamplerStateHandle sampler = [m_device newSamplerStateWithDescriptor:descriptor];
+    if (!sampler || m_materialSamplers.size() >= kMaxMaterialSamplers) {
+        MaterialTextureSamplerDesc fallback = EffectiveSamplerDesc(nullptr);
+        uint64_t fallbackKey = SamplerDescKey(fallback);
+        auto fallbackIt = m_materialSamplerIndices.find(fallbackKey);
+        if (fallbackIt != m_materialSamplerIndices.end()) {
+            return fallbackIt->second;
+        }
+        return 0u;
+    }
+    uint32_t samplerIndex = static_cast<uint32_t>(m_materialSamplers.size());
+    m_materialSamplers.push_back(sampler);
+    m_materialSamplerIndices.emplace(key, samplerIndex);
+    return samplerIndex;
+}
+
+void SceneResources::rebuildMaterialTextureInfoBuffer() {
+    if (!m_device || m_materialTextures.empty()) {
+        m_materialTextureInfoBuffer = nil;
+        return;
+    }
+    const NSUInteger infoCount = static_cast<NSUInteger>(m_materialTextures.size());
+    const NSUInteger infoBytes = infoCount * sizeof(MaterialTextureInfo);
+    if (!m_materialTextureInfoBuffer || m_materialTextureInfoBuffer.length < infoBytes) {
+        m_materialTextureInfoBuffer = [m_device newBufferWithLength:infoBytes
+                                                            options:MTLResourceStorageModeShared];
+    }
+    if (!m_materialTextureInfoBuffer) {
+        return;
+    }
+
+    auto* infos = reinterpret_cast<MaterialTextureInfo*>([m_materialTextureInfoBuffer contents]);
+    if (!infos) {
+        return;
+    }
+    for (NSUInteger i = 0; i < infoCount; ++i) {
+        MaterialTextureInfo info{};
+        id<MTLTexture> texture = m_materialTextures[i];
+        if (texture) {
+            info.width = static_cast<uint32_t>(texture.width);
+            info.height = static_cast<uint32_t>(texture.height);
+            info.mipCount = static_cast<uint32_t>(texture.mipmapLevelCount);
+            if (i < m_materialTextureSamplerIndices.size()) {
+                info.flags = m_materialTextureSamplerIndices[i];
+            }
+        }
+        infos[i] = info;
+    }
+}
+
+uint32_t SceneResources::registerMaterialTexture(MTLTextureHandle texture,
+                                                 const std::string& key,
+                                                 const std::string& label,
+                                                 const MaterialTextureSamplerDesc* samplerDesc,
+                                                 MaterialTextureSemantic semantic) {
+    if (!texture) {
+        return kInvalidTextureIndex;
+    }
+    if (m_materialTextures.size() >= kMaxMaterialTextures) {
+        return kInvalidTextureIndex;
+    }
+    auto found = m_materialTextureIndex.find(key);
+    if (found != m_materialTextureIndex.end()) {
+        return found->second;
+    }
+    if (m_device) {
+        if (semantic == MaterialTextureSemantic::Orm) {
+            id<MTLTexture> ormMipTexture = BuildTextureWithOrmMips(m_device, texture, samplerDesc);
+            if (ormMipTexture) {
+                texture = ormMipTexture;
+            } else if (texture.mipmapLevelCount <= 1 && m_commandQueue) {
+                id<MTLTexture> mipTexture = BuildTextureWithBlitMips(m_device, m_commandQueue, texture);
+                if (mipTexture) {
+                    texture = mipTexture;
+                }
+            }
+        } else if (texture.mipmapLevelCount <= 1 && m_commandQueue) {
+            id<MTLTexture> mipTexture = BuildTextureWithBlitMips(m_device, m_commandQueue, texture);
+            if (mipTexture) {
+                texture = mipTexture;
+            }
+        }
+    }
+    if (texture) {
+        texture.label = [NSString stringWithFormat:@"Material Texture (%s)", label.c_str()];
+    }
+    if (m_materialSamplers.empty()) {
+        (void)materialSamplerIndexForDesc(nullptr);
+    }
+    uint32_t samplerIndex = materialSamplerIndexForDesc(samplerDesc);
+    uint32_t index = static_cast<uint32_t>(m_materialTextures.size());
+    m_materialTextures.push_back(texture);
+    m_materialTextureSamplerIndices.push_back(samplerIndex);
+    m_materialTextureLabels.push_back(label);
+    m_materialTextureIndex.emplace(key, index);
+    rebuildMaterialTextureInfoBuffer();
+    return index;
+}
+
+uint32_t SceneResources::addMaterialTextureFromFile(const std::string& path,
+                                                    bool srgb,
+                                                    std::string* errorMessage,
+                                                    const MaterialTextureSamplerDesc* samplerDesc,
+                                                    MaterialTextureSemantic semantic) {
+    if (!m_device) {
+        if (errorMessage) {
+            *errorMessage = "Material texture load failed: Metal device not ready";
+        }
+        return kInvalidTextureIndex;
+    }
+    if (path.empty()) {
+        if (errorMessage) {
+            *errorMessage = "Material texture load failed: empty path";
+        }
+        return kInvalidTextureIndex;
+    }
+
+    const std::string canonicalPath = CanonicalizePath(path);
+    const std::string key =
+        canonicalPath + (srgb ? "|srgb" : "|linear") + SamplerKeySuffix(samplerDesc) +
+        TextureSemanticKeySuffix(semantic);
+    auto cached = m_materialTextureIndex.find(key);
+    if (cached != m_materialTextureIndex.end()) {
+        return cached->second;
+    }
+
+    NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:canonicalPath.c_str()]];
+    if (!url) {
+        if (errorMessage) {
+            *errorMessage = "Material texture load failed: invalid path";
+        }
+        return kInvalidTextureIndex;
+    }
+
+    MTKTextureLoader* loader = [[MTKTextureLoader alloc] initWithDevice:m_device];
+    NSDictionary* options = @{
+        MTKTextureLoaderOptionSRGB : @(srgb),
+        MTKTextureLoaderOptionTextureUsage : @(MTLTextureUsageShaderRead),
+        MTKTextureLoaderOptionTextureStorageMode : @(MTLStorageModeShared),
+        MTKTextureLoaderOptionGenerateMipmaps : @YES,
+        MTKTextureLoaderOptionAllocateMipmaps : @YES
+    };
+
+    NSError* error = nil;
+    id<MTLTexture> texture = [loader newTextureWithContentsOfURL:url options:options error:&error];
+    if (!texture) {
+        if (errorMessage) {
+            NSString* errStr = error ? error.localizedDescription : @"unknown error";
+            *errorMessage = std::string("Material texture load failed: ") + errStr.UTF8String;
+        }
+        return kInvalidTextureIndex;
+    }
+    if (!srgb) {
+        MTLPixelFormat linearFormat = LinearEquivalentPixelFormat(texture.pixelFormat);
+        if (linearFormat != texture.pixelFormat) {
+            id<MTLTexture> linearTexture = CloneTextureWithFormat(m_device, texture, linearFormat);
+            if (linearTexture) {
+                texture = linearTexture;
+            } else if (errorMessage) {
+                *errorMessage = "Material texture load failed: unable to canonicalize non-color texture format";
+            }
+        }
+    }
+    texture.label = [NSString stringWithFormat:@"Material Texture (%s)", canonicalPath.c_str()];
+    return registerMaterialTexture(texture, key, canonicalPath, samplerDesc, semantic);
+}
+
+uint32_t SceneResources::addMaterialTextureFromData(const uint8_t* data,
+                                                    size_t size,
+                                                    const std::string& label,
+                                                    bool srgb,
+                                                    std::string* errorMessage,
+                                                    const MaterialTextureSamplerDesc* samplerDesc,
+                                                    MaterialTextureSemantic semantic) {
+    if (!m_device) {
+        if (errorMessage) {
+            *errorMessage = "Material texture load failed: Metal device not ready";
+        }
+        return kInvalidTextureIndex;
+    }
+    if (!data || size == 0) {
+        if (errorMessage) {
+            *errorMessage = "Material texture load failed: empty data";
+        }
+        return kInvalidTextureIndex;
+    }
+
+    const std::string key =
+        label + (srgb ? "|srgb" : "|linear") + SamplerKeySuffix(samplerDesc) +
+        TextureSemanticKeySuffix(semantic);
+    auto cached = m_materialTextureIndex.find(key);
+    if (cached != m_materialTextureIndex.end()) {
+        return cached->second;
+    }
+
+    NSData* nsData = [NSData dataWithBytes:data length:size];
+    if (!nsData) {
+        if (errorMessage) {
+            *errorMessage = "Material texture load failed: NSData allocation failed";
+        }
+        return kInvalidTextureIndex;
+    }
+
+    MTKTextureLoader* loader = [[MTKTextureLoader alloc] initWithDevice:m_device];
+    NSDictionary* options = @{
+        MTKTextureLoaderOptionSRGB : @(srgb),
+        MTKTextureLoaderOptionTextureUsage : @(MTLTextureUsageShaderRead),
+        MTKTextureLoaderOptionTextureStorageMode : @(MTLStorageModeShared),
+        MTKTextureLoaderOptionGenerateMipmaps : @YES,
+        MTKTextureLoaderOptionAllocateMipmaps : @YES
+    };
+
+    NSError* error = nil;
+    id<MTLTexture> texture = [loader newTextureWithData:nsData options:options error:&error];
+    if (!texture) {
+        if (errorMessage) {
+            NSString* errStr = error ? error.localizedDescription : @"unknown error";
+            *errorMessage = std::string("Material texture load failed: ") + errStr.UTF8String;
+        }
+        return kInvalidTextureIndex;
+    }
+    if (!srgb) {
+        MTLPixelFormat linearFormat = LinearEquivalentPixelFormat(texture.pixelFormat);
+        if (linearFormat != texture.pixelFormat) {
+            id<MTLTexture> linearTexture = CloneTextureWithFormat(m_device, texture, linearFormat);
+            if (linearTexture) {
+                texture = linearTexture;
+            } else if (errorMessage) {
+                *errorMessage = "Material texture load failed: unable to canonicalize non-color texture format";
+            }
+        }
+    }
+    texture.label = [NSString stringWithFormat:@"Material Texture (%s)", label.c_str()];
+    return registerMaterialTexture(texture, key, label, samplerDesc, semantic);
 }
 
 const std::string& SceneResources::materialName(uint32_t index) const {
@@ -531,10 +1512,11 @@ bool SceneResources::reloadEnvironmentIfNeeded(const std::string& path, EnvGpuHa
     NSURL* url = [NSURL fileURLWithPath:nsPath];
     MTKTextureLoader* loader = [[MTKTextureLoader alloc] initWithDevice:m_device];
     NSDictionary* options = @{MTKTextureLoaderOptionSRGB : @NO,
-                              MTKTextureLoaderOptionTextureUsage : @(MTLTextureUsageShaderRead),
+                              MTKTextureLoaderOptionTextureUsage :
+                                  @(MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget),
                               MTKTextureLoaderOptionTextureStorageMode : @(MTLStorageModeShared),
-                              MTKTextureLoaderOptionAllocateMipmaps : @NO,
-                              MTKTextureLoaderOptionGenerateMipmaps : @NO};
+                              MTKTextureLoaderOptionAllocateMipmaps : @YES,
+                              MTKTextureLoaderOptionGenerateMipmaps : @YES};
     NSError* error = nil;
     id<MTLTexture> texture = [loader newTextureWithContentsOfURL:url options:options error:&error];
     if (!texture) {
@@ -556,6 +1538,39 @@ bool SceneResources::reloadEnvironmentIfNeeded(const std::string& path, EnvGpuHa
         return false;
     }
 
+    if (texture.mipmapLevelCount <= 1 && m_commandQueue) {
+        MTLTextureDescriptor* desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat
+                                                               width:width
+                                                              height:height
+                                                           mipmapped:YES];
+        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        desc.storageMode = MTLStorageModeShared;
+        id<MTLTexture> mipTexture = [m_device newTextureWithDescriptor:desc];
+        if (mipTexture) {
+            id<MTLCommandBuffer> commandBuffer = [m_commandQueue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+            if (blit) {
+                MTLOrigin origin = MTLOriginMake(0, 0, 0);
+                MTLSize size = MTLSizeMake(width, height, 1);
+                [blit copyFromTexture:texture
+                         sourceSlice:0
+                         sourceLevel:0
+                        sourceOrigin:origin
+                          sourceSize:size
+                           toTexture:mipTexture
+                    destinationSlice:0
+                    destinationLevel:0
+                   destinationOrigin:origin];
+                [blit generateMipmapsForTexture:mipTexture];
+                [blit endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+                texture = mipTexture;
+            }
+        }
+    }
+
     std::vector<float> rgbaFloats;
     if (!CopyTextureToFloat(texture, rgbaFloats)) {
         NSLog(@"Failed to extract texels for environment map %@", nsPath);
@@ -575,10 +1590,11 @@ bool SceneResources::reloadEnvironmentIfNeeded(const std::string& path, EnvGpuHa
 
     const double elapsedMs = (CFAbsoluteTimeGetCurrent() - rebuildStart) * 1000.0;
     std::string fileName = std::filesystem::path(path).filename().string();
-    NSLog(@"[EnvRebuild] file=\"%s\" size=%lux%lu aliasN=%u thrHead=%.5f thrSum=%.5f elapsedMs=%.2f",
+    NSLog(@"[EnvRebuild] file=\"%s\" size=%lux%lu mips=%lu aliasN=%u thrHead=%.5f thrSum=%.5f elapsedMs=%.2f",
           fileName.c_str(),
           static_cast<unsigned long>(width),
           static_cast<unsigned long>(height),
+          static_cast<unsigned long>(texture.mipmapLevelCount),
           tempHandles.aliasCount,
           tempHandles.thresholdHeadSum,
           tempHandles.thresholdTotalSum,
@@ -928,6 +1944,13 @@ void SceneResources::clear() {
         mesh.indexBuffer = nil;
     }
     m_meshes.clear();
+    m_materialTextures.clear();
+    m_materialSamplers.clear();
+    m_materialTextureSamplerIndices.clear();
+    m_materialTextureLabels.clear();
+    m_materialTextureIndex.clear();
+    m_materialSamplerIndices.clear();
+    m_materialTextureInfoBuffer = nil;
     if (m_sceneAccel) {
         m_sceneAccel->clear();
     }
@@ -1094,8 +2117,8 @@ void SceneResources::rebuildAccelerationStructures() {
             PathTracerShaderTypes::SceneVertex packed{};
             packed.position = simd_make_float4(vertex.position, 1.0f);
             packed.normal = simd_make_float4(vertex.normal, 0.0f);
-            packed.tangent = simd_make_float4(1.0f, 0.0f, 0.0f, 1.0f);
-            packed.uv = simd_make_float4(vertex.uv, 0.0f, 0.0f);
+            packed.tangent = vertex.tangent;
+            packed.uv = simd_make_float4(vertex.uv.x, vertex.uv.y, vertex.uv1.x, vertex.uv1.y);
             sceneVertices.push_back(packed);
         }
 

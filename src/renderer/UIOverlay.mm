@@ -344,7 +344,8 @@ bool UIOverlay::initialize(NSViewHandle view, MTLDeviceHandle device, float cont
 
     m_view = view;
     m_device = device;
-    m_displayScale = std::max(contentScale, 1.0f);
+    m_backingScale = std::max(contentScale, 1.0f);
+    m_displayScale = m_hasForcedContentScale ? m_forcedContentScale : m_backingScale;
     if (view) {
         m_displaySizePoints = view.bounds.size;
     } else {
@@ -409,7 +410,9 @@ void UIOverlay::updateDisplayMetrics(CGSize logicalSizePoints, float backingScal
     const CGFloat width = std::max<CGFloat>(logicalSizePoints.width, 1.0);
     const CGFloat height = std::max<CGFloat>(logicalSizePoints.height, 1.0);
     m_displaySizePoints = CGSizeMake(width, height);
-    m_displayScale = std::max(backingScale, 1.0f);
+    m_backingScale = std::max(backingScale, 1.0f);
+    const float effectiveScale = m_hasForcedContentScale ? m_forcedContentScale : m_backingScale;
+    m_displayScale = std::max(effectiveScale, 1.0f);
 
     if (!m_fontScaleInitialized) {
         m_fontScaleInitialized = true;
@@ -424,6 +427,16 @@ void UIOverlay::updateDisplayMetrics(CGSize logicalSizePoints, float backingScal
     if (delta >= 0.05f) {
         requestFontRebuild(m_displayScale);
     }
+}
+
+void UIOverlay::setForcedContentScale(float scale, bool enabled) {
+    if (enabled) {
+        m_hasForcedContentScale = true;
+        m_forcedContentScale = std::max(scale, 1.0f);
+    } else {
+        m_hasForcedContentScale = false;
+    }
+    updateDisplayMetrics(m_displaySizePoints, m_backingScale);
 }
 
 void UIOverlay::setScenePanelProvider(ScenePanelProvider provider) {
@@ -472,6 +485,9 @@ void UIOverlay::applyDisplayState() {
     if (!m_initialized) {
         return;
     }
+    if (!m_hasForcedContentScale) {
+        return;  // Trust ImGui backend display metrics unless explicitly overridden.
+    }
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(static_cast<float>(m_displaySizePoints.width),
                             static_cast<float>(m_displaySizePoints.height));
@@ -494,7 +510,8 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                         RenderSettings& settings,
                         bool& outNeedsReset,
                         const std::vector<const char*>& sceneNames,
-                        int& inOutSelectedScene) {
+                        int& inOutSelectedScene,
+                        PresentationSettings& presentation) {
     if (!m_initialized || !m_visible) {
         return;
     }
@@ -503,14 +520,15 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
 
     const float fps = (stats.frameTimeMs > 0.0) ? static_cast<float>(1000.0 / stats.frameTimeMs) : 0.0f;
 
-    ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(350.0f, 0.0f), ImGuiCond_FirstUseEver);
+    if (m_mainPanelVisible) {
+        ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(350.0f, 0.0f), ImGuiCond_FirstUseEver);
 
-    if (ImGui::Begin("Metal PathTracer")) {
-        ImGui::Text("Frame Time: %.3f ms", stats.frameTimeMs);
-        ImGui::Text("FPS: %.1f", fps);
-        ImGui::Text("Sample Count: %u", stats.sampleCount);
-        ImGui::Separator();
+        if (ImGui::Begin("Metal PathTracer")) {
+            ImGui::Text("Frame Time: %.3f ms", stats.frameTimeMs);
+            ImGui::Text("FPS: %.1f", fps);
+            ImGui::Text("Sample Count: %u", stats.sampleCount);
+            ImGui::Separator();
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Output / Export", ImGuiTreeNodeFlags_None)) {
@@ -522,10 +540,17 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Performance")) {
-            float renderScale = settings.renderScale;
-            if (ImGui::SliderFloat("Render Scale", &renderScale, 0.5f, 2.0f, "%.2fx")) {
-                settings.renderScale = std::clamp(renderScale, 0.5f, 2.0f);
-                outNeedsReset = true;
+            const bool renderScaleLocked =
+                presentation.enabled &&
+                presentation.resolutionLock != PresentationSettings::RenderResolutionLock::Off;
+            if (renderScaleLocked) {
+                ImGui::TextDisabled("Render Scale: locked by Presentation Mode");
+            } else {
+                float renderScale = settings.renderScale;
+                if (ImGui::SliderFloat("Render Scale", &renderScale, 0.5f, 2.0f, "%.2fx")) {
+                    settings.renderScale = std::clamp(renderScale, 0.5f, 2.0f);
+                    outNeedsReset = true;
+                }
             }
             ImGui::Text("Internal Resolution: %u x %u", stats.renderWidth, stats.renderHeight);
             ImGui::Text("Effective Scale: %.2fx", stats.renderScale);
@@ -577,7 +602,22 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                                     (static_cast<float>(binCount) / totalMisses) * 100.0f);
                     }
                     ImGui::Text("  Last miss distance: %.4f (m-ish units)", stats.hardwareMissLastDistance);
+                    if (stats.hardwareMissLastInstanceId != 0xffffffffu) {
+                        ImGui::Text("  Last miss source: inst=%u prim=%u",
+                                    stats.hardwareMissLastInstanceId,
+                                    stats.hardwareMissLastPrimitiveId);
+                    } else {
+                        ImGui::Text("  Last miss source: n/a");
+                    }
                 }
+                ImGui::Text("  Exclusion retries: 0=%llu 1=%llu 2=%llu 3+=%llu",
+                            static_cast<unsigned long long>(stats.hardwareExcludeRetryHistogram[0]),
+                            static_cast<unsigned long long>(stats.hardwareExcludeRetryHistogram[1]),
+                            static_cast<unsigned long long>(stats.hardwareExcludeRetryHistogram[2]),
+                            static_cast<unsigned long long>(stats.hardwareExcludeRetryHistogram[3]));
+                ImGui::Text("  SWRT fallback hits: miss=%llu firstHit=%llu",
+                            static_cast<unsigned long long>(stats.hardwareFallbackHitCount),
+                            static_cast<unsigned long long>(stats.hardwareFirstHitFallbackCount));
                 ImGui::Text("  Last self-hit distance: %.4f", stats.hardwareSelfHitLastDistance);
                 ImGui::Text("  Last: type=%u dist=%.4f inst=%u prim=%u",
                             stats.hardwareLastResultType,
@@ -631,16 +671,165 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             }
 
             bool specNee = settings.enableSpecularNee;
-            if (ImGui::Checkbox("Specular NEE (env)", &specNee)) {
+            if (ImGui::Checkbox("Specular NEE (env + rect)", &specNee)) {
                 settings.enableSpecularNee = specNee;
                 outNeedsReset = true;
             }
-            ImGui::TextDisabled("Connects perfect reflections/refractions directly to the HDR environment.");
+            ImGui::TextDisabled("Connects delta bounces directly to environment and rect lights via MIS.");
+
+            bool mneeEnabled = settings.enableMnee;
+            if (ImGui::Checkbox("MNEE Caustics", &mneeEnabled)) {
+                settings.enableMnee = mneeEnabled;
+                outNeedsReset = true;
+            }
+            bool mneeSecondary = settings.enableMneeSecondary;
+            ImGui::BeginDisabled(!settings.enableMnee);
+            if (ImGui::Checkbox("MNEE Secondary Hop", &mneeSecondary)) {
+                settings.enableMneeSecondary = mneeSecondary;
+                outNeedsReset = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Single-bounce dielectric caustic connection for sharper refraction patterns.");
+            ImGui::TextDisabled("Secondary hop adds an extra specular link for caustic refinement.");
 
             ImGui::TextWrapped("Rotate the environment map to steer its bright regions through portals or openings.");
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+#if PT_DEBUG_TOOLS
+        if (ImGui::CollapsingHeader("PBR Debug")) {
+            auto setExclusiveDebugView = [&](bool& target, bool value) {
+                if (value) {
+                    settings.debugShowBaseColor = false;
+                    settings.debugShowMetallic = false;
+                    settings.debugShowRoughness = false;
+                    settings.debugShowAO = false;
+                }
+                target = value;
+            };
+
+            bool showBase = settings.debugShowBaseColor;
+            if (ImGui::Checkbox("Show BaseColor (linear)", &showBase)) {
+                setExclusiveDebugView(settings.debugShowBaseColor, showBase);
+                outNeedsReset = true;
+            }
+            bool showMetallic = settings.debugShowMetallic;
+            if (ImGui::Checkbox("Show Metallic (from ORM)", &showMetallic)) {
+                setExclusiveDebugView(settings.debugShowMetallic, showMetallic);
+                outNeedsReset = true;
+            }
+            bool showRoughness = settings.debugShowRoughness;
+            if (ImGui::Checkbox("Show Roughness (from ORM)", &showRoughness)) {
+                setExclusiveDebugView(settings.debugShowRoughness, showRoughness);
+                outNeedsReset = true;
+            }
+            bool showAO = settings.debugShowAO;
+            if (ImGui::Checkbox("Show AO", &showAO)) {
+                setExclusiveDebugView(settings.debugShowAO, showAO);
+                outNeedsReset = true;
+            }
+
+            bool disableAO = settings.debugDisableAO;
+            if (ImGui::Checkbox("Disable AO", &disableAO)) {
+                settings.debugDisableAO = disableAO;
+                outNeedsReset = true;
+            }
+            bool aoIndirectOnly = settings.debugAoIndirectOnly;
+            if (ImGui::Checkbox("AO Indirect Only", &aoIndirectOnly)) {
+                settings.debugAoIndirectOnly = aoIndirectOnly;
+                outNeedsReset = true;
+            }
+
+            bool disableNormal = settings.debugDisableNormalMap;
+            if (ImGui::Checkbox("Disable Normal Map", &disableNormal)) {
+                settings.debugDisableNormalMap = disableNormal;
+                outNeedsReset = true;
+            }
+            bool disableOrm = settings.debugDisableOrmTexture;
+            if (ImGui::Checkbox("Disable ORM Texture", &disableOrm)) {
+                settings.debugDisableOrmTexture = disableOrm;
+                outNeedsReset = true;
+            }
+            bool flipGreen = settings.debugFlipNormalGreen;
+            if (ImGui::Checkbox("Flip Normal Green (Y)", &flipGreen)) {
+                settings.debugFlipNormalGreen = flipGreen;
+                outNeedsReset = true;
+            }
+            bool specularOnly = settings.debugSpecularOnly;
+            if (ImGui::Checkbox("Specular Only", &specularOnly)) {
+                settings.debugSpecularOnly = specularOnly;
+                outNeedsReset = true;
+            }
+            float normalStrength = settings.debugNormalStrengthScale;
+            if (ImGui::SliderFloat("Normal Strength", &normalStrength, 0.0f, 2.0f, "%.2f")) {
+                settings.debugNormalStrengthScale = std::max(normalStrength, 0.0f);
+                outNeedsReset = true;
+            }
+            float normalLodBias = settings.debugNormalLodBias;
+            if (ImGui::SliderFloat("Normal LOD Bias", &normalLodBias, 0.0f, 2.0f, "%.2f")) {
+                settings.debugNormalLodBias = std::max(normalLodBias, 0.0f);
+                outNeedsReset = true;
+            }
+            float ormLodBias = settings.debugOrmLodBias;
+            if (ImGui::SliderFloat("ORM LOD Bias", &ormLodBias, 0.0f, 4.0f, "%.2f")) {
+                settings.debugOrmLodBias = std::max(ormLodBias, 0.0f);
+                outNeedsReset = true;
+            }
+            float envMipOverride = settings.debugEnvMipOverride;
+            if (ImGui::SliderFloat("Force Env Mip", &envMipOverride, -1.0f, 16.0f, "%.2f")) {
+                settings.debugEnvMipOverride = envMipOverride;
+                outNeedsReset = true;
+            }
+            bool visorOverride = settings.debugEnableVisorOverride;
+            if (ImGui::Checkbox("Enable Visor Debug Override", &visorOverride)) {
+                settings.debugEnableVisorOverride = visorOverride;
+                outNeedsReset = true;
+            }
+            uint32_t debugMaterialCount = 0u;
+            if (m_hasScenePanelProvider && m_scenePanelProvider.materialCount) {
+                debugMaterialCount = m_scenePanelProvider.materialCount();
+            }
+            int maxMaterialId = std::max(static_cast<int>(debugMaterialCount) - 1, -1);
+            int visorMaterialId = settings.debugVisorOverrideMaterialId;
+            if (ImGui::SliderInt("Visor Override Material ID", &visorMaterialId, -1, maxMaterialId, "%d")) {
+                settings.debugVisorOverrideMaterialId = std::clamp(visorMaterialId, -1, maxMaterialId);
+                outNeedsReset = true;
+            }
+            ImGui::TextDisabled("-1 = auto visor region mask, >=0 = exact material index");
+            float visorRoughness = settings.debugVisorOverrideRoughness;
+            if (ImGui::SliderFloat("Visor Override Roughness", &visorRoughness, 0.0f, 1.0f, "%.2f")) {
+                settings.debugVisorOverrideRoughness = std::clamp(visorRoughness, 0.0f, 1.0f);
+                outNeedsReset = true;
+            }
+            float visorF0 = settings.debugVisorOverrideF0;
+            if (ImGui::SliderFloat("Visor Override F0", &visorF0, 0.0f, 0.12f, "%.3f")) {
+                settings.debugVisorOverrideF0 = std::clamp(visorF0, 0.0f, 0.12f);
+                outNeedsReset = true;
+            }
+            bool envNearest = settings.debugEnvNearest;
+            if (ImGui::Checkbox("Env Nearest Filtering", &envNearest)) {
+                settings.debugEnvNearest = envNearest;
+                outNeedsReset = true;
+            }
+            ImGui::Text("Env Mip Count: %u", stats.envRadianceMipCount);
+            if (ImGui::Button("Visor Debug Preset")) {
+                settings.debugSpecularOnly = true;
+                settings.debugDisableNormalMap = false;
+                settings.debugDisableOrmTexture = false;
+                settings.debugNormalStrengthScale = 0.0f;
+                settings.debugEnableVisorOverride = true;
+                settings.debugVisorOverrideMaterialId = -1;
+                settings.debugVisorOverrideRoughness = 0.15f;
+                settings.debugVisorOverrideF0 = 0.04f;
+                settings.debugEnvNearest = false;
+                settings.debugEnvMipOverride = 6.0f;
+                outNeedsReset = true;
+            }
+        }
+#endif
+
+        ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+#if PT_DEBUG_TOOLS
         if (ImGui::CollapsingHeader("Debug Tools")) {
             bool pathDebug = settings.enablePathDebug;
             if (ImGui::Checkbox("Enable Path Debug", &pathDebug)) {
@@ -676,7 +865,113 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                         stats.debugPathMaxEntries);
             ImGui::TextDisabled("Reset accumulation before capture; coordinates clamp to the current internal resolution.");
             ImGui::EndDisabled();
+            ImGui::Separator();
+            ImGui::Text("Parity Assert");
+            bool parityEnabled = settings.parityAssertEnabled;
+            if (ImGui::Checkbox("Enable Parity Assert", &parityEnabled)) {
+                settings.parityAssertEnabled = parityEnabled;
+                if (parityEnabled &&
+                    settings.parityAssertMode == RenderSettings::ParityAssertMode::Off) {
+                    settings.parityAssertMode = RenderSettings::ParityAssertMode::ProbePixelOnly;
+                }
+                outNeedsReset = true;
+            }
+            ImGui::BeginDisabled(!settings.parityAssertEnabled);
+            int parityMode = static_cast<int>(settings.parityAssertMode);
+            const char* parityModes[] = {"Off", "Probe Pixel", "First In-Medium"};
+            if (ImGui::Combo("Mode", &parityMode, parityModes, IM_ARRAYSIZE(parityModes))) {
+                parityMode = std::clamp(parityMode, 0, 2);
+                settings.parityAssertMode = static_cast<RenderSettings::ParityAssertMode>(parityMode);
+                outNeedsReset = true;
+            }
+            int parityX = static_cast<int>(settings.parityPixelX);
+            int parityY = static_cast<int>(settings.parityPixelY);
+            if (ImGui::InputInt("Parity Pixel X", &parityX)) {
+                settings.parityPixelX = static_cast<uint32_t>(std::max(parityX, 0));
+                outNeedsReset = true;
+            }
+            if (ImGui::InputInt("Parity Pixel Y", &parityY)) {
+                settings.parityPixelY = static_cast<uint32_t>(std::max(parityY, 0));
+                outNeedsReset = true;
+            }
+            bool parityOnce = settings.parityAssertOncePerFrame;
+            if (ImGui::Checkbox("Once Per Frame", &parityOnce)) {
+                settings.parityAssertOncePerFrame = parityOnce;
+                outNeedsReset = true;
+            }
+            ImGui::Text("Divergences: %u / %u",
+                        stats.parityEntryCount,
+                        stats.parityMaxEntries);
+            ImGui::Text("Parity checks: %u (in-medium: %u)",
+                        stats.parityChecksPerformed,
+                        stats.parityChecksInMedium);
+            if (stats.parityEntryCount > 0) {
+                ImGui::Text("Last: reason=0x%02x pixel=(%u,%u) depth=%u",
+                            stats.parityLastReasonMask,
+                            stats.parityLastPixelX,
+                            stats.parityLastPixelY,
+                            stats.parityLastDepth);
+                ImGui::Text("HW: hit=%u t=%.4f mat=%u mesh=%u prim=%u front=%u",
+                            stats.parityLastHwHit,
+                            stats.parityLastHwT,
+                            stats.parityLastHwMaterialIndex,
+                            stats.parityLastHwMeshIndex,
+                            stats.parityLastHwPrimitiveIndex,
+                            stats.parityLastHwFrontFace);
+                ImGui::Text("SW: hit=%u t=%.4f mat=%u mesh=%u prim=%u front=%u",
+                            stats.parityLastSwHit,
+                            stats.parityLastSwT,
+                            stats.parityLastSwMaterialIndex,
+                            stats.parityLastSwMeshIndex,
+                            stats.parityLastSwPrimitiveIndex,
+                            stats.parityLastSwFrontFace);
+            } else {
+                ImGui::TextDisabled("No parity divergences captured.");
+            }
+            ImGui::EndDisabled();
+            ImGui::Separator();
+            ImGui::Text("HWRT Debug");
+            if (stats.hardwareRaytracingAvailable) {
+                bool forcePure = settings.forcePureHWRTForGlass;
+                if (ImGui::Checkbox("Force Pure HWRT (Glass)", &forcePure)) {
+                    settings.forcePureHWRTForGlass = forcePure;
+                    outNeedsReset = true;
+                }
+                int retries = static_cast<int>(settings.hardwareExcludeRetries);
+                if (ImGui::SliderInt("HWRT Exclusion Retries", &retries, 0, 3)) {
+                    settings.hardwareExcludeRetries = static_cast<uint32_t>(std::max(retries, 0));
+                    outNeedsReset = true;
+                }
+                float normalBiasCm = settings.hardwareExitNormalBias * 100.0f;
+                if (ImGui::SliderFloat("HWRT Exit Bias Normal (cm)", &normalBiasCm, 0.0f, 2.0f, "%.2f")) {
+                    settings.hardwareExitNormalBias = std::max(normalBiasCm, 0.0f) * 0.01f;
+                    outNeedsReset = true;
+                }
+                float directionalBiasCm = settings.hardwareExitDirectionalBias * 100.0f;
+                if (ImGui::SliderFloat("HWRT Exit Bias Direction (cm)", &directionalBiasCm, 0.0f, 2.0f, "%.2f")) {
+                    settings.hardwareExitDirectionalBias = std::max(directionalBiasCm, 0.0f) * 0.01f;
+                    outNeedsReset = true;
+                }
+                bool missFallback = settings.enableHardwareMissFallback;
+                if (ImGui::Checkbox("HWRT Fallback on Miss (SWRT)", &missFallback)) {
+                    settings.enableHardwareMissFallback = missFallback;
+                    outNeedsReset = true;
+                }
+                bool firstHitFallback = settings.enableHardwareFirstHitFromSoftware;
+                if (ImGui::Checkbox("HWRT First Hit from SWRT", &firstHitFallback)) {
+                    settings.enableHardwareFirstHitFromSoftware = firstHitFallback;
+                    outNeedsReset = true;
+                }
+                bool forceSoftware = settings.enableHardwareForceSoftware;
+                if (ImGui::Checkbox("HWRT Force SWRT (All Hits)", &forceSoftware)) {
+                    settings.enableHardwareForceSoftware = forceSoftware;
+                    outNeedsReset = true;
+                }
+            } else {
+                ImGui::TextDisabled("HWRT debug controls require hardware ray tracing.");
+            }
         }
+#endif
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Fireflies Clamping")) {
@@ -706,6 +1001,12 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 outNeedsReset = true;
             }
 
+            float maxContribution = settings.fireflyClampMaxContribution;
+            if (ImGui::SliderFloat("Max Contribution", &maxContribution, 0.0f, 1.0e6f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
+                settings.fireflyClampMaxContribution = std::max(maxContribution, 0.0f);
+                outNeedsReset = true;
+            }
+
             float specBase = settings.specularTailClampBase;
             if (ImGui::SliderFloat("Spec Tail Base", &specBase, 0.0f, 32.0f, "%.2f")) {
                 settings.specularTailClampBase = std::max(specBase, 0.0f);
@@ -719,8 +1020,8 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             }
 
             float minSpecPdf = settings.minSpecularPdf;
-            if (ImGui::SliderFloat("Min Specular PDF", &minSpecPdf, 1.0e-7f, 1.0e-2f, "%.1e", ImGuiSliderFlags_Logarithmic)) {
-                settings.minSpecularPdf = std::clamp(minSpecPdf, 1.0e-7f, 1.0e-2f);
+            if (ImGui::SliderFloat("Min Specular PDF", &minSpecPdf, 0.0f, 1.0e-2f, "%.1e", ImGuiSliderFlags_Logarithmic)) {
+                settings.minSpecularPdf = std::clamp(minSpecPdf, 0.0f, 1.0e-2f);
                 outNeedsReset = true;
             }
 
@@ -752,6 +1053,22 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                     settings.reinhardWhitePoint = std::clamp(settings.reinhardWhitePoint, 0.1f, 10.0f);
                 }
             }
+
+            bool bloomEnabled = settings.bloomEnabled;
+            if (ImGui::Checkbox("Enable Bloom", &bloomEnabled)) {
+                settings.bloomEnabled = bloomEnabled;
+            }
+            ImGui::BeginDisabled(!settings.bloomEnabled);
+            if (ImGui::SliderFloat("Bloom Threshold", &settings.bloomThreshold, 0.1f, 8.0f, "%.2f")) {
+                settings.bloomThreshold = std::max(settings.bloomThreshold, 0.0f);
+            }
+            if (ImGui::SliderFloat("Bloom Intensity", &settings.bloomIntensity, 0.0f, 2.0f, "%.2f")) {
+                settings.bloomIntensity = std::max(settings.bloomIntensity, 0.0f);
+            }
+            if (ImGui::SliderFloat("Bloom Radius", &settings.bloomRadius, 0.0f, 8.0f, "%.2f")) {
+                settings.bloomRadius = std::max(settings.bloomRadius, 0.0f);
+            }
+            ImGui::EndDisabled();
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
@@ -1308,8 +1625,69 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+        if (ImGui::CollapsingHeader("UI")) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            if (ImGui::CollapsingHeader("Presentation")) {
+                bool presentationEnabled = presentation.enabled;
+                if (ImGui::Checkbox("Enable Presentation Mode", &presentationEnabled)) {
+                    presentation.enabled = presentationEnabled;
+                }
+
+                int targetScreen = static_cast<int>(presentation.targetScreen);
+                const char* screenOptions[] = {"Auto", "Primary", "External (if present)"};
+                if (ImGui::Combo("Target Screen", &targetScreen, screenOptions, IM_ARRAYSIZE(screenOptions))) {
+                    presentation.targetScreen =
+                        static_cast<PresentationSettings::TargetScreen>(targetScreen);
+                }
+
+                int windowMode = static_cast<int>(presentation.windowMode);
+                const char* windowOptions[] = {"Borderless Fullscreen", "Maximized Window"};
+                if (ImGui::Combo("Window Mode", &windowMode, windowOptions, IM_ARRAYSIZE(windowOptions))) {
+                    presentation.windowMode =
+                        static_cast<PresentationSettings::WindowMode>(windowMode);
+                }
+
+                bool hidePanels = presentation.hideUIPanels;
+                if (ImGui::Checkbox("Hide UI Panels", &hidePanels)) {
+                    presentation.hideUIPanels = hidePanels;
+                }
+
+                bool minimalOverlay = presentation.minimalOverlay;
+                if (ImGui::Checkbox("Minimal Overlay", &minimalOverlay)) {
+                    presentation.minimalOverlay = minimalOverlay;
+                }
+
+                int resolutionLock = static_cast<int>(presentation.resolutionLock);
+                const char* lockOptions[] = {"Off", "1280x720", "1920x1080"};
+                if (ImGui::Combo("Lock Render Resolution",
+                                 &resolutionLock,
+                                 lockOptions,
+                                 IM_ARRAYSIZE(lockOptions))) {
+                    presentation.resolutionLock =
+                        static_cast<PresentationSettings::RenderResolutionLock>(resolutionLock);
+                }
+
+                int contentScale = static_cast<int>(presentation.contentScale);
+                const char* scaleOptions[] = {"Auto", "1.0", "2.0"};
+                if (ImGui::Combo("Force Content Scale",
+                                 &contentScale,
+                                 scaleOptions,
+                                 IM_ARRAYSIZE(scaleOptions))) {
+                    presentation.contentScale =
+                        static_cast<PresentationSettings::ContentScaleMode>(contentScale);
+                }
+
+                bool resetOnToggle = presentation.resetAccumulationOnToggle;
+                if (ImGui::Checkbox("Reset accumulation on toggle", &resetOnToggle)) {
+                    presentation.resetAccumulationOnToggle = resetOnToggle;
+                }
+            }
+        }
+
+        ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Dev Tools")) {
-            ImGui::Text("Backing Scale: %.2fx", m_displayScale);
+            ImGui::Text("Backing Scale: %.2fx", m_backingScale);
+            ImGui::Text("Effective Scale: %.2fx", m_displayScale);
             ImGui::Text("Font Atlas Scale: %.2fx", m_lastFontScale);
             if (ImGui::Button("Rebuild Fonts##dev")) {
                 requestFontRebuild(m_displayScale);
@@ -1321,10 +1699,30 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
         if (ImGui::CollapsingHeader("Debug", ImGuiTreeNodeFlags_None)) {
             ImGui::Checkbox("Show Dear ImGui Demo", &m_showDemo);
         }
+        }
+        ImGui::End();
     }
-    ImGui::End();
 
-    if (m_showDemo) {
+    if (m_minimalOverlayVisible) {
+        ImGuiIO& io = ImGui::GetIO();
+        const ImGuiWindowFlags flags =
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 20.0f, 20.0f),
+                                ImGuiCond_Always,
+                                ImVec2(1.0f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.35f);
+        if (ImGui::Begin("Presentation Overlay", nullptr, flags)) {
+            const char* backendLabel = stats.hardwareRaytracingActive ? "HWRT" : "SWRT";
+            ImGui::Text("Backend: %s", backendLabel);
+            ImGui::Text("SPP: %u (spf %u)", stats.sampleCount, settings.samplesPerFrame);
+            ImGui::Text("Frame: %.2f ms (%.1f fps)", stats.frameTimeMs, fps);
+        }
+        ImGui::End();
+    }
+
+    if (m_showDemo && m_mainPanelVisible) {
         ImGui::ShowDemoWindow(&m_showDemo);
     }
 }
@@ -1360,7 +1758,12 @@ void UIOverlay::shutdown() {
     m_device = nullptr;
     m_fontScaleInitialized = false;
     m_pendingFontRebuild = false;
+    m_mainPanelVisible = true;
+    m_minimalOverlayVisible = false;
+    m_backingScale = 1.0f;
     m_displayScale = 1.0f;
+    m_hasForcedContentScale = false;
+    m_forcedContentScale = 1.0f;
     m_lastFontScale = 1.0f;
     m_displaySizePoints = CGSizeMake(1.0, 1.0);
     m_initialized = false;
@@ -1368,6 +1771,9 @@ void UIOverlay::shutdown() {
 
 bool UIOverlay::wantsInput() const {
     if (!m_initialized || !m_visible) {
+        return false;
+    }
+    if (!m_mainPanelVisible) {
         return false;
     }
 

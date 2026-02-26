@@ -53,21 +53,56 @@ inline float3 tonemapHable(float3 color) {
     return clamp(mapped / white, float3(0.0f), float3(1.0f));
 }
 
+inline float3 extractBloom(float3 hdrColor, float threshold) {
+    float luma = luminance(hdrColor);
+    if (luma <= threshold) {
+        return float3(0.0f);
+    }
+    float soft = luma - threshold;
+    return hdrColor * (soft / max(luma, 1.0e-4f));
+}
+
 fragment float4 displayFragment(DisplayVertexOut in [[stage_in]],
                                texture2d<float> accumulationTexture [[texture(0)]],
                                constant DisplayUniforms& displayUniforms [[buffer(0)]]) {
-    constexpr sampler clampSampler(filter::nearest,
+    constexpr sampler pointSampler(filter::nearest,
                                    address::clamp_to_edge);
+    constexpr sampler linearSampler(filter::linear,
+                                    address::clamp_to_edge);
     float2 flippedUv = float2(in.uv.x, 1.0 - in.uv.y);
-    float4 accum = accumulationTexture.sample(clampSampler, flippedUv);
+    float4 accum = accumulationTexture.sample(pointSampler, flippedUv);
 
     if (accum.a <= 0.0f) {
         return float4(0.0);
     }
 
-    float3 color = max(accum.rgb, float3(0.0));
     float exposureScale = pow(2.0f, displayUniforms.exposure);
-    color *= exposureScale;
+    float3 color = max(accum.rgb, float3(0.0f)) * exposureScale;
+
+    if (displayUniforms.bloomEnabled != 0u && displayUniforms.bloomIntensity > 0.0f) {
+        float radius = max(displayUniforms.bloomRadius, 0.0f);
+        if (radius > 0.0f) {
+            float2 texel = float2(1.0f / max(float(accumulationTexture.get_width()), 1.0f),
+                                  1.0f / max(float(accumulationTexture.get_height()), 1.0f));
+            float threshold = max(displayUniforms.bloomThreshold, 0.0f);
+            constexpr float2 offsets[8] = {
+                float2(-1.0f, 0.0f), float2(1.0f, 0.0f), float2(0.0f, -1.0f), float2(0.0f, 1.0f),
+                float2(-1.0f, -1.0f), float2(1.0f, -1.0f), float2(-1.0f, 1.0f), float2(1.0f, 1.0f)
+            };
+            constexpr float weights[9] = {
+                0.24f, 0.12f, 0.12f, 0.12f, 0.12f, 0.07f, 0.07f, 0.07f, 0.07f
+            };
+
+            float3 bloom = weights[0] * extractBloom(color, threshold);
+            for (uint i = 0u; i < 8u; ++i) {
+                float2 tapUv = flippedUv + offsets[i] * texel * radius;
+                float3 tapHdr = max(accumulationTexture.sample(linearSampler, tapUv).rgb, float3(0.0f));
+                tapHdr *= exposureScale;
+                bloom += weights[i + 1u] * extractBloom(tapHdr, threshold);
+            }
+            color += bloom * displayUniforms.bloomIntensity;
+        }
+    }
 
     switch (displayUniforms.tonemapMode) {
         case 2:

@@ -63,6 +63,7 @@ public:
     /// Access the statistics buffer used for GPU counters
     MTLBufferHandle statsBuffer() const { return m_statsBuffer; }
     MTLBufferHandle debugBuffer() const { return m_debugBuffer; }
+    bool hasDenoisedOutput() const { return m_hasDenoisedOutput; }
     
 private:
     MTLDeviceHandle m_device = nullptr;
@@ -76,6 +77,8 @@ private:
 
     // Frame counter for progressive denoising
     uint32_t m_frameCounter = 0;
+    uint32_t m_lastDenoisedFrame = 0;
+    bool m_hasDenoisedOutput = false;
 
     uint32_t encodeIntegration(MTLCommandBufferHandle commandBuffer,
                                Accumulation& accumulation,

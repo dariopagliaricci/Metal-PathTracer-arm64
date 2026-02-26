@@ -48,14 +48,19 @@ const char* FormatExtension(ImageFileFormat format);
 namespace ImageWriter {
 
 /// Write linear RGBA float32 buffer to EXR (scanline, uncompressed).
-bool WriteEXR(const char* path, const float* rgba, int width, int height);
+bool WriteEXR(const char* path,
+              const float* rgba,
+              int width,
+              int height,
+              const char* colorspace = nullptr);
 
 /// Write linear RGBA float32 buffer to EXR and optionally append a sample-count channel.
 bool WriteEXR_Multilayer(const char* path,
                          const float* rgba,
                          int width,
                          int height,
-                         const float* sampleCount = nullptr);
+                         const float* sampleCount = nullptr,
+                         const char* colorspace = nullptr);
 
 }  // namespace ImageWriter
 

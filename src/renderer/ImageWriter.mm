@@ -242,6 +242,7 @@ bool WriteScanlineEXR(const std::string& path,
                       uint32_t width,
                       uint32_t height,
                       const std::vector<ChannelDescriptor>& channels,
+                      const char* colorspace,
                       std::string* error) {
     if (width == 0 || height == 0 || channels.empty()) {
         if (error) {
@@ -375,6 +376,15 @@ bool WriteScanlineEXR(const std::string& path,
         return false;
     }
 
+    if (colorspace && colorspace[0] != '\0') {
+        uint32_t size = static_cast<uint32_t>(std::strlen(colorspace) + 1);
+        if (!beginAttribute("colorspace", "string", size) ||
+            !writeBytes(colorspace, size)) {
+            std::fclose(file);
+            return false;
+        }
+    }
+
     // End of header (empty attribute name)
     unsigned char headerEnd = 0;
     if (!writeBytes(&headerEnd, sizeof(unsigned char))) {
@@ -457,13 +467,14 @@ bool WriteEXR(const std::string& path,
               const float* linearRGB,
               uint32_t width,
               uint32_t height,
+              const char* colorspace,
               std::string* error) {
     std::vector<ChannelDescriptor> channels = {
         {"B", ChannelSourceType::Interleaved, 2, nullptr},
         {"G", ChannelSourceType::Interleaved, 1, nullptr},
         {"R", ChannelSourceType::Interleaved, 0, nullptr},
     };
-    return WriteScanlineEXR(path, linearRGB, 3, width, height, channels, error);
+    return WriteScanlineEXR(path, linearRGB, 3, width, height, channels, colorspace, error);
 }
 
 bool WritePNG(const std::string& path,
@@ -604,7 +615,7 @@ bool WriteImage(const std::string& path,
                 std::string* errorMessage) {
     switch (format) {
         case ImageFileFormat::EXR:
-            return WriteEXR(path, linearRGB, width, height, errorMessage);
+            return WriteEXR(path, linearRGB, width, height, nullptr, errorMessage);
         case ImageFileFormat::PFM:
             return WritePFM(path, linearRGB, width, height, errorMessage);
         case ImageFileFormat::PNG:
@@ -619,7 +630,11 @@ bool WriteImage(const std::string& path,
 
 namespace PathTracer::ImageWriter {
 
-bool WriteEXR(const char* path, const float* rgba, int width, int height) {
+bool WriteEXR(const char* path,
+              const float* rgba,
+              int width,
+              int height,
+              const char* colorspace) {
     if (!path || !rgba || width <= 0 || height <= 0) {
         return false;
     }
@@ -635,6 +650,7 @@ bool WriteEXR(const char* path, const float* rgba, int width, int height) {
                             static_cast<uint32_t>(width),
                             static_cast<uint32_t>(height),
                             channels,
+                            colorspace,
                             nullptr);
 }
 
@@ -642,9 +658,10 @@ bool WriteEXR_Multilayer(const char* path,
                          const float* rgba,
                          int width,
                          int height,
-                         const float* sampleCount) {
+                         const float* sampleCount,
+                         const char* colorspace) {
     if (!sampleCount) {
-        return WriteEXR(path, rgba, width, height);
+        return WriteEXR(path, rgba, width, height, colorspace);
     }
     if (!path || !rgba || width <= 0 || height <= 0) {
         return false;
@@ -662,6 +679,7 @@ bool WriteEXR_Multilayer(const char* path,
                             static_cast<uint32_t>(width),
                             static_cast<uint32_t>(height),
                             channels,
+                            colorspace,
                             nullptr);
 }
 

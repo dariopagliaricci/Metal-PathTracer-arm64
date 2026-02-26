@@ -23,6 +23,9 @@ public:
     /// @param displayFormat Pixel format for final display render pipeline
     /// @return true if all pipelines compiled successfully
     bool initialize(const MetalContext& context, MTLPixelFormat displayFormat);
+
+    /// Enable verbose timing logs (headless/diagnostic)
+    void setVerboseTiming(bool enabled) { m_verboseTiming = enabled; }
     
     /// Reload shaders and recompile pipelines (useful for hot-reloading)
     /// @param context Metal context
@@ -62,6 +65,7 @@ private:
     
     // Render pipeline
     MTLRenderPipelineStateHandle m_displayPipeline = nullptr;
+    bool m_verboseTiming = false;
     
     bool compileShaders(const MetalContext& context);
     bool createComputePipelines();

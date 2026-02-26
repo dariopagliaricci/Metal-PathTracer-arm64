@@ -1,6 +1,7 @@
 #import "renderer/Pipelines.h"
 #import "renderer/MetalContext.h"
 #import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
 #if __has_include(<objc/message.h>)
 #import <objc/message.h>
 #endif
@@ -79,9 +80,10 @@ std::string ReadFileToString(NSString* path) {
 std::string LoadShaderSource() {
     NSString* commonPath = FindShaderPath(@"common.metal");
     NSString* pathtracePath = FindShaderPath(@"pathtrace.metal");
+    NSString* mneePath = FindShaderPath(@"mnee.metal");
     NSString* displayPath = FindShaderPath(@"display.metal");
 
-    if (!commonPath || !pathtracePath || !displayPath) {
+    if (!commonPath || !pathtracePath || !mneePath || !displayPath) {
         NSLog(@"Unable to locate shader sources");
         return {};
     }
@@ -89,6 +91,8 @@ std::string LoadShaderSource() {
     std::string shaderSource = ReadFileToString(commonPath);
     shaderSource.append("\n");
     shaderSource.append(ReadFileToString(pathtracePath));
+    shaderSource.append("\n");
+    shaderSource.append(ReadFileToString(mneePath));
     shaderSource.append("\n");
     shaderSource.append(ReadFileToString(displayPath));
 
@@ -121,7 +125,33 @@ bool Pipelines::compileShaders(const MetalContext& context) {
                                                       encoding:NSUTF8StringEncoding];
     
     NSError* error = nil;
-    m_library = [m_device newLibraryWithSource:sourceNSString options:nil error:&error];
+    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+#if PT_DEBUG_TOOLS
+    NSNumber* debugTools = @1;
+#else
+    NSNumber* debugTools = @0;
+#endif
+#if PT_MNEE_SWRT_RAYS
+    NSNumber* mneeSwrt = @1;
+#else
+    NSNumber* mneeSwrt = @0;
+#endif
+#if PT_MNEE_OCCLUSION_PARITY
+    NSNumber* mneeParity = @1;
+#else
+    NSNumber* mneeParity = @0;
+#endif
+    options.preprocessorMacros = @{
+        @"PT_DEBUG_TOOLS": debugTools,
+        @"PT_MNEE_SWRT_RAYS": mneeSwrt,
+        @"PT_MNEE_OCCLUSION_PARITY": mneeParity
+    };
+    CFAbsoluteTime compileStart = CFAbsoluteTimeGetCurrent();
+    m_library = [m_device newLibraryWithSource:sourceNSString options:options error:&error];
+    if (m_verboseTiming) {
+        double compileMs = (CFAbsoluteTimeGetCurrent() - compileStart) * 1000.0;
+        NSLog(@"[Timing] PipelineLibraryCompileMs=%.2f", compileMs);
+    }
     if (!m_library) {
         if (error) {
             NSLog(@"Failed to compile shaders: %@", error);
@@ -151,11 +181,16 @@ bool Pipelines::createComputePipelines() {
         descriptor.label = label;
 
         NSError* localError = nil;
+        CFAbsoluteTime pipelineStart = CFAbsoluteTimeGetCurrent();
         id<MTLComputePipelineState> pipeline =
             [m_device newComputePipelineStateWithDescriptor:descriptor
                                                     options:0
                                                  reflection:nil
                                                       error:&localError];
+        if (m_verboseTiming) {
+            double pipelineMs = (CFAbsoluteTimeGetCurrent() - pipelineStart) * 1000.0;
+            NSLog(@"[Timing] ComputePipelineCompileMs %@=%.2f", label, pipelineMs);
+        }
         if (!pipeline && localError) {
             NSLog(@"Failed to create compute pipeline '%@': %@", functionName, localError);
         }
@@ -191,10 +226,15 @@ bool Pipelines::createComputePipelines() {
     presentDesc.computeFunction = presentFunction;
     presentDesc.label = @"Path Trace Present";
     NSError* presentError = nil;
+    CFAbsoluteTime presentStart = CFAbsoluteTimeGetCurrent();
     m_presentPipeline = [m_device newComputePipelineStateWithDescriptor:presentDesc
                                                                 options:0
                                                              reflection:nil
                                                                   error:&presentError];
+    if (m_verboseTiming) {
+        double presentMs = (CFAbsoluteTimeGetCurrent() - presentStart) * 1000.0;
+        NSLog(@"[Timing] ComputePipelineCompileMs Present=%.2f", presentMs);
+    }
     if (!m_presentPipeline) {
         if (presentError) {
             NSLog(@"Failed to create present pipeline: %@", presentError);
@@ -213,10 +253,15 @@ bool Pipelines::createComputePipelines() {
     clearDesc.computeFunction = clearFunction;
     clearDesc.label = @"Path Trace Clear";
     NSError* clearError = nil;
+    CFAbsoluteTime clearStart = CFAbsoluteTimeGetCurrent();
     m_clearPipeline = [m_device newComputePipelineStateWithDescriptor:clearDesc
                                                               options:0
                                                            reflection:nil
                                                                 error:&clearError];
+    if (m_verboseTiming) {
+        double clearMs = (CFAbsoluteTimeGetCurrent() - clearStart) * 1000.0;
+        NSLog(@"[Timing] ComputePipelineCompileMs Clear=%.2f", clearMs);
+    }
     if (!m_clearPipeline) {
         if (clearError) {
             NSLog(@"Failed to create clear pipeline: %@", clearError);
@@ -247,7 +292,12 @@ bool Pipelines::createDisplayPipeline(MTLPixelFormat displayFormat) {
     descriptor.colorAttachments[0].pixelFormat = displayFormat;
 
     NSError* error = nil;
+    CFAbsoluteTime displayStart = CFAbsoluteTimeGetCurrent();
     m_displayPipeline = [m_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (m_verboseTiming) {
+        double displayMs = (CFAbsoluteTimeGetCurrent() - displayStart) * 1000.0;
+        NSLog(@"[Timing] RenderPipelineCompileMs=%.2f", displayMs);
+    }
     if (!m_displayPipeline) {
         NSLog(@"Failed to create render pipeline: %@", error);
         return false;

@@ -5,9 +5,11 @@
 // Use only the public API from MetalRenderer.h
 
 #include <array>
+#include <cstdint>
 #include <vector>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <simd/simd.h>
 
 #include "renderer/MetalHandles.h"
@@ -27,6 +29,18 @@ struct EnvGpuHandles {
     uint32_t height = 0;
     double thresholdHeadSum = 0.0;
     double thresholdTotalSum = 0.0;
+};
+
+struct MaterialTextureSamplerDesc {
+    int32_t magFilter = -1;  // glTF enum (9728/9729), -1 uses default
+    int32_t minFilter = -1;  // glTF enum (9728/9729/9984..9987), -1 uses default
+    int32_t wrapS = 10497;   // glTF enum (33071/33648/10497)
+    int32_t wrapT = 10497;   // glTF enum (33071/33648/10497)
+};
+
+enum class MaterialTextureSemantic : uint32_t {
+    Generic = 0,
+    Orm = 1,  // glTF metallic-roughness (G=roughness, B=metallic; AO may share)
 };
 
 class MetalContext;
@@ -91,7 +105,12 @@ public:
                          simd::float3 carpaintBaseK = simd_make_float3(0.0f, 0.0f, 0.0f),
                          bool carpaintHasBaseConductor = false,
                          simd::float3 carpaintBaseTint = simd_make_float3(1.0f, 1.0f, 1.0f),
+                         bool thinDielectric = false,
                          std::string name = {});
+
+    /// Add a fully specified material data block (used for glTF/PBR materials).
+    uint32_t addMaterialData(const PathTracerShaderTypes::MaterialData& material,
+                             std::string name = {});
     
     /// Add a sphere to the scene
     void addSphere(const simd::float3& center, 
@@ -126,7 +145,9 @@ public:
     struct MeshVertex {
         simd::float3 position{0.0f, 0.0f, 0.0f};
         simd::float3 normal{0.0f, 1.0f, 0.0f};
-        simd::float2 uv{0.0f, 0.0f};
+        simd::float2 uv{0.0f, 0.0f};   // TEXCOORD_0
+        simd::float2 uv1{0.0f, 0.0f};  // TEXCOORD_1 (falls back to uv when absent)
+        simd::float4 tangent{1.0f, 0.0f, 0.0f, 1.0f};
     };
 
     /// Add a triangle mesh to the scene
@@ -169,6 +190,30 @@ public:
                m_environmentMarginalAliasBuffer &&
                m_environmentPdfBuffer;
     }
+
+    /// Material texture support
+    uint32_t addMaterialTextureFromFile(const std::string& path,
+                                        bool srgb,
+                                        std::string* errorMessage = nullptr,
+                                        const MaterialTextureSamplerDesc* samplerDesc = nullptr,
+                                        MaterialTextureSemantic semantic = MaterialTextureSemantic::Generic);
+    uint32_t addMaterialTextureFromData(const uint8_t* data,
+                                        size_t size,
+                                        const std::string& label,
+                                        bool srgb,
+                                        std::string* errorMessage = nullptr,
+                                        const MaterialTextureSamplerDesc* samplerDesc = nullptr,
+                                        MaterialTextureSemantic semantic = MaterialTextureSemantic::Generic);
+    uint32_t materialTextureCount() const {
+        return static_cast<uint32_t>(m_materialTextures.size());
+    }
+    const std::vector<MTLTextureHandle>& materialTextures() const {
+        return m_materialTextures;
+    }
+    const std::vector<MTLSamplerStateHandle>& materialSamplers() const {
+        return m_materialSamplers;
+    }
+    MTLBufferHandle materialTextureInfoBuffer() const { return m_materialTextureInfoBuffer; }
     
     /// Clear all scene data
     void clear();
@@ -205,6 +250,8 @@ public:
     uint32_t materialCount() const { return m_materialCount; }
     uint32_t triangleCount() const { return m_triangleCount; }
     uint32_t primitiveCount() const { return m_primitiveCount; }
+    const PathTracerShaderTypes::SphereData* spheresData() const { return m_spheres.data(); }
+    const PathTracerShaderTypes::RectData* rectanglesData() const { return m_rectangles.data(); }
 
     struct Mesh {
         std::vector<MeshVertex> vertices;
@@ -299,6 +346,22 @@ private:
                                       uint32_t width,
                                       uint32_t height,
                                       EnvGpuHandles& outHandles);
+
+    uint32_t registerMaterialTexture(MTLTextureHandle texture,
+                                     const std::string& key,
+                                     const std::string& label,
+                                     const MaterialTextureSamplerDesc* samplerDesc,
+                                     MaterialTextureSemantic semantic);
+    uint32_t materialSamplerIndexForDesc(const MaterialTextureSamplerDesc* samplerDesc);
+    void rebuildMaterialTextureInfoBuffer();
+
+    std::vector<MTLTextureHandle> m_materialTextures;
+    std::vector<MTLSamplerStateHandle> m_materialSamplers;
+    std::vector<uint32_t> m_materialTextureSamplerIndices;
+    MTLBufferHandle m_materialTextureInfoBuffer = nullptr;
+    std::vector<std::string> m_materialTextureLabels;
+    std::unordered_map<std::string, uint32_t> m_materialTextureIndex;
+    std::unordered_map<uint64_t, uint32_t> m_materialSamplerIndices;
 };
 
 }  // namespace PathTracer

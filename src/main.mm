@@ -4,6 +4,8 @@
 #include "MetalRenderer.h"
 #include "backends/imgui_impl_osx.h"
 
+#include <cstring>
+#include <string>
 
 namespace {
 constexpr int kInitialWidth = 1280;
@@ -52,8 +54,22 @@ constexpr int kInitialHeight = 720;
 @end
 
 int main(int argc, const char** argv) {
-    (void)argc;
-    (void)argv;
+    bool presentationMode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (!argv[i]) {
+            continue;
+        }
+        std::string arg(argv[i]);
+        constexpr const char* kPresentationPrefix = "--presentation=";
+        if (arg.rfind(kPresentationPrefix, 0) == 0) {
+            std::string value = arg.substr(std::strlen(kPresentationPrefix));
+            if (value == "1" || value == "true" || value == "on") {
+                presentationMode = true;
+            } else if (value == "0" || value == "false" || value == "off") {
+                presentationMode = false;
+            }
+        }
+    }
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -73,6 +89,7 @@ int main(int argc, const char** argv) {
         options.width = kInitialWidth;
         options.height = kInitialHeight;
         options.windowTitle = "Path Tracer Metal";
+        options.presentationMode = presentationMode;
         [window setTitle:[NSString stringWithUTF8String:options.windowTitle.c_str()]];
 
         __block bool shouldQuit = false;
@@ -116,14 +133,25 @@ int main(int argc, const char** argv) {
                                                       inMode:NSDefaultRunLoopMode
                                                      dequeue:YES];
                         if (event) {
-                            if (event.type == NSEventTypeKeyDown &&
-                                (event.modifierFlags & NSEventModifierFlagCommand)) {
-                                NSString* chars = event.charactersIgnoringModifiers.lowercaseString;
-                                if ([chars isEqualToString:@"q"]) {
-                                    shouldQuit = true;
-                                    terminationRequested = true;
+                            if (event.type == NSEventTypeKeyDown) {
+                                if (event.keyCode == kVK_Escape && renderer.isPresentationEnabled()) {
+                                    renderer.setPresentationEnabled(false);
                                     event = nil;
                                     continue;
+                                }
+                                if (event.keyCode == kVK_F1 && renderer.isPresentationEnabled()) {
+                                    renderer.togglePresentationUIPanels();
+                                    event = nil;
+                                    continue;
+                                }
+                                if ((event.modifierFlags & NSEventModifierFlagCommand)) {
+                                    NSString* chars = event.charactersIgnoringModifiers.lowercaseString;
+                                    if ([chars isEqualToString:@"q"]) {
+                                        shouldQuit = true;
+                                        terminationRequested = true;
+                                        event = nil;
+                                        continue;
+                                    }
                                 }
                             }
                             [NSApp sendEvent:event];

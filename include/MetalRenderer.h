@@ -36,6 +36,11 @@ public:
     void setSamplesPerFrame(uint32_t samples);
     uint32_t sampleCount() const;
 
+    // Presentation Mode controls
+    void setPresentationEnabled(bool enabled);
+    bool isPresentationEnabled() const;
+    void togglePresentationUIPanels();
+
     bool captureAverageImage(std::vector<float>& outLinearRGB,
                              uint32_t& width,
                              uint32_t& height,

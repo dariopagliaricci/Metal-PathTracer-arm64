@@ -16,7 +16,7 @@ DerivedData/
 build/
 build-*/
 cmake-build-*/
-assets/
+/assets/
 imgui.ini
 
 CMakeCache.txt

@@ -313,21 +313,6 @@ bool DenoiserContext::createFilter(FilterType type) {
             return false;
         }
 
-        // Commit filter
-        oidnCommitFilter(filter);
-
-        // Check for errors
-        const char* errorMsg = nullptr;
-        OIDNError error = oidnGetDeviceError(device, &errorMsg);
-        if (error != OIDN_ERROR_NONE) {
-            m_lastError = std::string("OIDN filter creation failed");
-            if (errorMsg) {
-                m_lastError += std::string(": ") + errorMsg;
-            }
-            oidnReleaseFilter(filter);
-            return false;
-        }
-
         // Release old filter if it exists
         if (m_filter) {
             oidnReleaseFilter((OIDNFilter)m_filter);

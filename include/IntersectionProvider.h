@@ -32,15 +32,23 @@ struct SoftwareBvhResources {
 };
 
 struct HardwareRtResources {
+#ifdef __OBJC__
+    __unsafe_unretained MTLAccelerationStructureHandle blas = nullptr;  // Optional: first BLAS handle for debugging
+    __unsafe_unretained MTLAccelerationStructureHandle tlas = nullptr;
+    __unsafe_unretained MTLBufferHandle instanceBuffer = nullptr;
+    __unsafe_unretained MTLBufferHandle instanceUserIDBuffer = nullptr;
+    __unsafe_unretained MTLBufferHandle scratchBuffer = nullptr;
+#else
     MTLAccelerationStructureHandle blas = nullptr;  // Optional: first BLAS handle for debugging
     MTLAccelerationStructureHandle tlas = nullptr;
     MTLBufferHandle instanceBuffer = nullptr;
     MTLBufferHandle instanceUserIDBuffer = nullptr;
     MTLBufferHandle scratchBuffer = nullptr;
+#endif
     uint32_t blasCount = 0;
     uint32_t instanceCount = 0;
-    // Added: all BLAS handles for scenes with multiple meshes.
-    std::vector<MTLAccelerationStructureHandle> blasHandles;
+    // Added: all BLAS handles for scenes with multiple meshes (non-owning).
+    std::vector<void*> blasHandles;
 };
 
 struct IntersectionProvider {

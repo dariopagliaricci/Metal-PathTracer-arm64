@@ -2,6 +2,7 @@
 
 #import <algorithm>
 #import <QuartzCore/CAMetalLayer.h>
+#import <dispatch/dispatch.h>
 
 namespace PathTracer {
 
@@ -12,8 +13,14 @@ bool MetalContext::initialize(NSWindowHandle window, bool headless) {
     // Create Metal device
     m_device = MTLCreateSystemDefaultDevice();
     if (!m_device) {
-        NSLog(@"Metal is not supported on this device");
-        return false;
+        NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
+        if ([devices count] > 0) {
+            m_device = devices[0];
+        }
+        if (!m_device) {
+            NSLog(@"Metal is not supported on this device");
+            return false;
+        }
     }
     
     // Check raytracing support
@@ -51,6 +58,10 @@ bool MetalContext::initialize(NSWindowHandle window, bool headless) {
         m_view.enableSetNeedsDisplay = YES;
         m_view.preferredFramesPerSecond = 60;
         m_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        if (m_view.layer && [m_view.layer isKindOfClass:[CAMetalLayer class]]) {
+            CAMetalLayer* metalLayer = (CAMetalLayer*)m_view.layer;
+            metalLayer.allowsNextDrawableTimeout = NO;
+        }
 
         [window setContentView:m_view];
         updateDrawableSize();
@@ -63,7 +74,18 @@ void MetalContext::updateDrawableSize() {
     if (m_headless || !m_view || !m_window) {
         return;
     }
-    
+    const CGSize bounds = m_view.bounds.size;
+    if (bounds.width < 1.0f || bounds.height < 1.0f) {
+        if (!m_pendingDrawableSizeUpdate) {
+            m_pendingDrawableSizeUpdate = true;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                m_pendingDrawableSizeUpdate = false;
+                updateDrawableSize();
+            });
+        }
+        return;
+    }
+
     // Get screen backing scale
     NSScreen* screen = m_window.screen ?: [NSScreen mainScreen];
     CGFloat scale = 1.0f;
@@ -82,7 +104,6 @@ void MetalContext::updateDrawableSize() {
     }
     
     // Calculate drawable size
-    CGSize bounds = m_view.bounds.size;
     CGSize drawable = CGSizeMake(std::max<CGFloat>(bounds.width * scale, 1.0f),
                                  std::max<CGFloat>(bounds.height * scale, 1.0f));
     m_view.drawableSize = drawable;
@@ -102,7 +123,6 @@ void MetalContext::shutdown() {
         if (m_view.layer && [m_view.layer isKindOfClass:[CAMetalLayer class]]) {
             CAMetalLayer* metalLayer = (CAMetalLayer*)m_view.layer;
             metalLayer.device = nil;
-            metalLayer.drawableSize = CGSizeZero;
         }
 
         m_view.device = nil;
@@ -116,6 +136,7 @@ void MetalContext::shutdown() {
     m_supportsRaytracing = false;
     m_headless = false;
     m_contentScale = 1.0f;
+    m_pendingDrawableSizeUpdate = false;
 }
 
 CGSize MetalContext::drawableSize() const {

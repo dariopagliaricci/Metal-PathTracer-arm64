@@ -20,6 +20,7 @@
 
 #include "renderer/RenderSettings.h"
 #include "renderer/SceneResources.h"
+#include "assets/GltfLoader.h"
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -795,6 +796,7 @@ bool SceneManager::parseScene(std::istream& stream,
     size_t lineNumber = 0;
     std::string pending;
     size_t pendingStartLine = 0;
+    bool sawExplicitCameraDirective = false;
     std::unordered_map<std::string, uint32_t> materialIndicesByName;
 
     auto flush = [&](const std::string& content, size_t startLine) -> bool {
@@ -814,6 +816,9 @@ bool SceneManager::parseScene(std::istream& stream,
 
         if (keyword == "camera") {
             success = parseCamera(tokens, inOutSettings, localError);
+            if (success) {
+                sawExplicitCameraDirective = true;
+            }
         } else if (keyword == "renderer") {
             success = parseRenderer(tokens, inOutSettings, localError);
         } else if (keyword == "background") {
@@ -827,7 +832,13 @@ bool SceneManager::parseScene(std::istream& stream,
         } else if (keyword == "rectangle" || keyword == "rect") {
             success = parseRectangle(tokens, resources, localError);
         } else if (keyword == "mesh") {
-            success = parseMesh(tokens, resources, localError, m_sceneDirectory, materialIndicesByName);
+            success = parseMesh(tokens,
+                                resources,
+                                localError,
+                                inOutSettings,
+                                !sawExplicitCameraDirective,
+                                m_sceneDirectory,
+                                materialIndicesByName);
         } else {
             return true;
         }
@@ -1371,7 +1382,159 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
             errorMessage = "renderer minSpecularPdf expects a float";
             return false;
         }
-        inOutSettings.minSpecularPdf = std::max(value, 1.0e-7f);
+        inOutSettings.minSpecularPdf = std::max(value, 0.0f);
+    }
+
+    if (auto it = tokens.find("fireflyClampMaxContribution"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer fireflyClampMaxContribution expects a float";
+            return false;
+        }
+        inOutSettings.fireflyClampMaxContribution = std::max(value, 0.0f);
+    }
+
+    if (auto it = tokens.find("enableSpecularNee"); it != tokens.end()) {
+        uint32_t flag = 0;
+        if (!parseUInt(it->second, flag)) {
+            errorMessage = "renderer enableSpecularNee expects 0 or 1";
+            return false;
+        }
+        inOutSettings.enableSpecularNee = (flag != 0);
+    }
+
+    if (auto it = tokens.find("enableMnee"); it != tokens.end()) {
+        uint32_t flag = 0;
+        if (!parseUInt(it->second, flag)) {
+            errorMessage = "renderer enableMnee expects 0 or 1";
+            return false;
+        }
+        inOutSettings.enableMnee = (flag != 0);
+    }
+
+    if (auto it = tokens.find("enableMneeSecondary"); it != tokens.end()) {
+        uint32_t flag = 0;
+        if (!parseUInt(it->second, flag)) {
+            errorMessage = "renderer enableMneeSecondary expects 0 or 1";
+            return false;
+        }
+        inOutSettings.enableMneeSecondary = (flag != 0);
+    }
+
+    auto parseBoolRendererToken = [&](const char* tokenName, bool& outValue) -> bool {
+        auto it = tokens.find(tokenName);
+        if (it == tokens.end()) {
+            return true;
+        }
+        uint32_t flag = 0;
+        if (!parseUInt(it->second, flag)) {
+            errorMessage = std::string("renderer ") + tokenName + " expects 0 or 1";
+            return false;
+        }
+        outValue = (flag != 0);
+        return true;
+    };
+
+    if (!parseBoolRendererToken("gltfViewerCompatibilityMode", inOutSettings.gltfViewerCompatibilityMode)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfCompat", inOutSettings.gltfViewerCompatibilityMode)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfThinWalledFallback", inOutSettings.gltfThinWalledFallback)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfThinFallback", inOutSettings.gltfThinWalledFallback)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfCompatLinearBaseColor", inOutSettings.gltfCompatForceLinearBaseColor)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfCompatLinearEmissive", inOutSettings.gltfCompatForceLinearEmissive)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugShowBaseColor", inOutSettings.debugShowBaseColor)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugShowMetallic", inOutSettings.debugShowMetallic)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugShowRoughness", inOutSettings.debugShowRoughness)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugShowAO", inOutSettings.debugShowAO)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugDisableAO", inOutSettings.debugDisableAO)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugAoIndirectOnly", inOutSettings.debugAoIndirectOnly)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugDisableNormalMap", inOutSettings.debugDisableNormalMap)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugFlipNormalGreen", inOutSettings.debugFlipNormalGreen)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("debugSpecularOnly", inOutSettings.debugSpecularOnly)) {
+        return false;
+    }
+    if (auto it = tokens.find("debugNormalStrengthScale"); it != tokens.end()) {
+        float value = 1.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer debugNormalStrengthScale expects a float";
+            return false;
+        }
+        inOutSettings.debugNormalStrengthScale = std::max(value, 0.0f);
+    }
+    if (auto it = tokens.find("debugNormalLodBias"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer debugNormalLodBias expects a float";
+            return false;
+        }
+        inOutSettings.debugNormalLodBias = std::max(value, 0.0f);
+    }
+
+    if (auto it = tokens.find("gltfEmissiveScale"); it != tokens.end()) {
+        float value = 1.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer gltfEmissiveScale expects a float";
+            return false;
+        }
+        inOutSettings.gltfEmissiveScale = std::max(value, 0.0f);
+    }
+
+    if (!parseBoolRendererToken("bloomEnabled", inOutSettings.bloomEnabled)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("bloom", inOutSettings.bloomEnabled)) {
+        return false;
+    }
+    if (auto it = tokens.find("bloomThreshold"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer bloomThreshold expects a float";
+            return false;
+        }
+        inOutSettings.bloomThreshold = std::max(value, 0.0f);
+    }
+    if (auto it = tokens.find("bloomIntensity"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer bloomIntensity expects a float";
+            return false;
+        }
+        inOutSettings.bloomIntensity = std::max(value, 0.0f);
+    }
+    if (auto it = tokens.find("bloomRadius"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer bloomRadius expects a float";
+            return false;
+        }
+        inOutSettings.bloomRadius = std::max(value, 0.0f);
     }
 
     return true;
@@ -1500,6 +1663,23 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
     }
     float coatIorValue = 1.5f;
 
+    auto parseBoolToken = [&](const std::string& value, bool& outFlag) -> bool {
+        std::string lower;
+        lower.reserve(value.size());
+        for (char ch : value) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lower == "on" || lower == "true" || lower == "1") {
+            outFlag = true;
+            return true;
+        }
+        if (lower == "off" || lower == "false" || lower == "0") {
+            outFlag = false;
+            return true;
+        }
+        return false;
+    };
+
     simd::float3 emission = simd_make_float3(0.0f, 0.0f, 0.0f);
     if (auto it = tokens.find("emit"); it != tokens.end()) {
         if (!parseFloat3(it->second, emission)) {
@@ -1538,6 +1718,24 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
     std::string materialName;
     if (auto itName = tokens.find("name"); itName != tokens.end()) {
         materialName = itName->second;
+    }
+
+    bool thinDielectric = false;
+    if (auto it = tokens.find("thin"); it != tokens.end()) {
+        if (!parseBoolToken(it->second, thinDielectric)) {
+            errorMessage = "material thin expects on/off";
+            return false;
+        }
+    } else if (auto it = tokens.find("thinWalled"); it != tokens.end()) {
+        if (!parseBoolToken(it->second, thinDielectric)) {
+            errorMessage = "material thinWalled expects on/off";
+            return false;
+        }
+    } else if (auto it = tokens.find("thinDielectric"); it != tokens.end()) {
+        if (!parseBoolToken(it->second, thinDielectric)) {
+            errorMessage = "material thinDielectric expects on/off";
+            return false;
+        }
     }
 
     const bool isPlastic = (type == PathTracerShaderTypes::MaterialType::Plastic);
@@ -1923,6 +2121,7 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
                           carpaintBaseKValue,
                           carpaintHasBaseConductorValue,
                           carpaintBaseTintValue,
+                          thinDielectric,
                           materialName);
 
     if (!materialName.empty()) {
@@ -2163,14 +2362,10 @@ bool SceneManager::parseRectangle(const std::unordered_map<std::string, std::str
 bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>& tokens,
                              SceneResources& resources,
                              std::string& errorMessage,
+                             RenderSettings& inOutSettings,
+                             bool allowEmbeddedCameraOverride,
                              const std::string& sceneDirectory,
                              const std::unordered_map<std::string, uint32_t>& materialIndicesByName) {
-    auto materialIt = tokens.find("material");
-    if (materialIt == tokens.end()) {
-        errorMessage = "mesh requires material token";
-        return false;
-    }
-
     std::string meshName;
     if (auto nameIt = tokens.find("name"); nameIt != tokens.end()) {
         meshName = nameIt->second;
@@ -2223,20 +2418,6 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
         meshPath = canonical;
     }
 
-    uint32_t materialIndex = 0;
-    if (!parseUInt(materialIt->second, materialIndex)) {
-        auto nameIt = materialIndicesByName.find(materialIt->second);
-        if (nameIt == materialIndicesByName.end()) {
-            errorMessage = "mesh material expects an index or known material name";
-            return false;
-        }
-        materialIndex = nameIt->second;
-    }
-    if (materialIndex >= resources.materialCount()) {
-        errorMessage = "mesh references material index that has not been defined yet";
-        return false;
-    }
-
     simd::float3 translation = simd_make_float3(0.0f, 0.0f, 0.0f);
     simd::float3 rotationDeg = simd_make_float3(0.0f, 0.0f, 0.0f);
     simd::float3 scale = simd_make_float3(1.0f, 1.0f, 1.0f);
@@ -2262,9 +2443,127 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
 
     if (auto scaleIt = tokens.find("scale"); scaleIt != tokens.end()) {
         if (!parseFloat3(scaleIt->second, scale)) {
-            errorMessage = "mesh scale expects three floats";
+            float uniformScale = 1.0f;
+            if (!parseFloat(scaleIt->second, uniformScale)) {
+                errorMessage = "mesh scale expects one float or three floats";
+                return false;
+            }
+            scale = simd_make_float3(uniformScale, uniformScale, uniformScale);
+        }
+    }
+
+    uint32_t materialIndex = 0;
+    auto materialIt = tokens.find("material");
+    if (!isPlane) {
+        std::string extension = meshPath.extension().string();
+        std::string extensionLower;
+        extensionLower.reserve(extension.size());
+        for (char ch : extension) {
+            extensionLower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+
+        if (extensionLower == ".gltf" || extensionLower == ".glb") {
+            std::string gltfError;
+            GltfCameraInfo gltfCamera{};
+            GltfLoadOptions gltfOptions{};
+            gltfOptions.enableViewerCompatibilityMode = inOutSettings.gltfViewerCompatibilityMode;
+            gltfOptions.thinWalledTransmissionFallback = inOutSettings.gltfThinWalledFallback;
+            gltfOptions.emissiveScale = std::max(inOutSettings.gltfEmissiveScale, 0.0f);
+            gltfOptions.forceLinearBaseColor = inOutSettings.gltfCompatForceLinearBaseColor;
+            gltfOptions.forceLinearEmissive = inOutSettings.gltfCompatForceLinearEmissive;
+            auto appendDisableOrmPatterns = [&](const std::string& value) {
+                std::string token;
+                token.reserve(value.size());
+                auto flushToken = [&]() {
+                    std::string trimmed = SceneManager::trim(token);
+                    if (!trimmed.empty()) {
+                        gltfOptions.disableOrmMaterialNameSubstrings.push_back(trimmed);
+                    }
+                    token.clear();
+                };
+                for (char c : value) {
+                    if (c == ',' || c == ';') {
+                        flushToken();
+                        continue;
+                    }
+                    token.push_back(c);
+                }
+                flushToken();
+            };
+            if (auto it = tokens.find("disableOrmMaterials"); it != tokens.end()) {
+                appendDisableOrmPatterns(it->second);
+            }
+            if (auto it = tokens.find("gltfDisableOrmMaterials"); it != tokens.end()) {
+                appendDisableOrmPatterns(it->second);
+            }
+            if (auto it = tokens.find("disableOrmRoughness"); it != tokens.end()) {
+                float value = -1.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh disableOrmRoughness expects a float";
+                    return false;
+                }
+                gltfOptions.disableOrmRoughnessOverride = std::clamp(value, 0.0f, 1.0f);
+            }
+            if (auto it = tokens.find("gltfDisableOrmRoughness"); it != tokens.end()) {
+                float value = -1.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh gltfDisableOrmRoughness expects a float";
+                    return false;
+                }
+                gltfOptions.disableOrmRoughnessOverride = std::clamp(value, 0.0f, 1.0f);
+            }
+            size_t meshStartIndex = resources.meshes().size();
+            if (!LoadGltfScene(meshPath.string(), resources, gltfError, &gltfCamera, &gltfOptions)) {
+                errorMessage = gltfError.empty() ? "Failed to load glTF scene" : gltfError;
+                return false;
+            }
+            simd::float4x4 sceneTransform = ComposeTransform(translation, rotationDeg, scale);
+            size_t meshEndIndex = resources.meshes().size();
+            for (size_t i = meshStartIndex; i < meshEndIndex; ++i) {
+                uint32_t meshIndex = static_cast<uint32_t>(i);
+                const simd::float4x4& meshLocalToWorld = resources.meshTransform(meshIndex);
+                simd::float4x4 combined = simd_mul(sceneTransform, meshLocalToWorld);
+                resources.setMeshTransform(meshIndex, combined);
+            }
+            if (allowEmbeddedCameraOverride &&
+                gltfCamera.valid && gltfCamera.hasPerspective && gltfCamera.yfov > 0.0f) {
+                constexpr float kPi = 3.14159265358979323846f;
+                float distance = gltfCamera.hasSceneBounds
+                    ? std::max(gltfCamera.sceneRadius * 2.0f, 0.1f)
+                    : 1.0f;
+                simd::float3 forward = simd_normalize(gltfCamera.forward);
+                simd::float3 target = gltfCamera.position + forward * distance;
+                simd::float3 offset = gltfCamera.position - target;
+                float yaw = std::atan2(offset.z, offset.x);
+                float pitch = std::atan2(offset.y, std::sqrt(offset.x * offset.x + offset.z * offset.z));
+                inOutSettings.cameraTarget = target;
+                inOutSettings.cameraDistance = distance;
+                inOutSettings.cameraYaw = yaw;
+                inOutSettings.cameraPitch = pitch;
+                inOutSettings.cameraVerticalFov = gltfCamera.yfov * (180.0f / kPi);
+                inOutSettings.cameraDefocusAngle = 0.0f;
+                inOutSettings.cameraFocusDistance = distance;
+            }
+            return true;
+        }
+    }
+
+    if (materialIt == tokens.end()) {
+        errorMessage = "mesh requires material token";
+        return false;
+    }
+
+    if (!parseUInt(materialIt->second, materialIndex)) {
+        auto nameIt = materialIndicesByName.find(materialIt->second);
+        if (nameIt == materialIndicesByName.end()) {
+            errorMessage = "mesh material expects an index or known material name";
             return false;
         }
+        materialIndex = nameIt->second;
+    }
+    if (materialIndex >= resources.materialCount()) {
+        errorMessage = "mesh references material index that has not been defined yet";
+        return false;
     }
 
     LoadedMeshData meshData;

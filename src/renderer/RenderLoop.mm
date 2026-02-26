@@ -15,6 +15,7 @@ using PathTracerShaderTypes::DisplayUniforms;
 using PathTracerShaderTypes::PathtraceUniforms;
 using PathTracerShaderTypes::PathtraceStats;
 using PathTracerShaderTypes::PathtraceDebugBuffer;
+using PathTracerShaderTypes::kMaxMaterialSamplers;
 
 namespace PathTracer {
 
@@ -47,12 +48,14 @@ bool RenderLoop::initialize(const MetalContext& context, DenoiserContext* denois
         return false;
     }
 
+#if PT_DEBUG_TOOLS
     m_debugBuffer = [m_device newBufferWithLength:sizeof(PathtraceDebugBuffer)
                                           options:MTLResourceStorageModeShared];
     if (!m_debugBuffer) {
         NSLog(@"Failed to create path debug buffer");
         return false;
     }
+#endif
 
     return true;
 }
@@ -104,6 +107,18 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
 
     id<MTLTexture> environmentTexture = scene.environmentTexture();
     [encoder setTexture:environmentTexture atIndex:2];
+    const auto& materialTextures = scene.materialTextures();
+    if (!materialTextures.empty()) {
+        [encoder setTextures:materialTextures.data()
+                   withRange:NSMakeRange(5, materialTextures.size())];
+    }
+    const auto& materialSamplers = scene.materialSamplers();
+    if (!materialSamplers.empty()) {
+        NSUInteger samplerCount =
+            std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+        [encoder setSamplerStates:materialSamplers.data()
+                        withRange:NSMakeRange(0, samplerCount)];
+    }
 
     if (useHardware) {
         if (encoderSupportsRt) {
@@ -208,6 +223,36 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
         } else {
             [encoder setBuffer:nil offset:0 atIndex:16];
         }
+        if (provider.software.tlasNodes) {
+            [encoder setBuffer:provider.software.tlasNodes offset:0 atIndex:17];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:17];
+        }
+        if (provider.software.tlasPrimitiveIndices) {
+            [encoder setBuffer:provider.software.tlasPrimitiveIndices offset:0 atIndex:18];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:18];
+        }
+        if (provider.software.blasNodes) {
+            [encoder setBuffer:provider.software.blasNodes offset:0 atIndex:19];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:19];
+        }
+        if (provider.software.blasPrimitiveIndices) {
+            [encoder setBuffer:provider.software.blasPrimitiveIndices offset:0 atIndex:20];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:20];
+        }
+        if (provider.software.instanceInfoBuffer) {
+            [encoder setBuffer:provider.software.instanceInfoBuffer offset:0 atIndex:21];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:21];
+        }
+        if (scene.materialTextureInfoBuffer()) {
+            [encoder setBuffer:scene.materialTextureInfoBuffer() offset:0 atIndex:22];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:22];
+        }
     } else {
         if (encoderSupportsRt) {
             [encoder setAccelerationStructure:nil atBufferIndex:1];
@@ -311,6 +356,11 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
         } else {
             [encoder setBuffer:nil offset:0 atIndex:19];
         }
+        if (scene.materialTextureInfoBuffer()) {
+            [encoder setBuffer:scene.materialTextureInfoBuffer() offset:0 atIndex:20];
+        } else {
+            [encoder setBuffer:nil offset:0 atIndex:20];
+        }
     }
 
     // Dispatch multiple samples
@@ -351,6 +401,7 @@ void RenderLoop::encodeDenoising(MTLCommandBufferHandle commandBuffer,
     // 3. Denoiser is ready for use
     // 4. Current frame index matches denoising frequency
     if (!m_denoiser || !settings.denoiseEnabled || !m_denoiser->isReady()) {
+        m_hasDenoisedOutput = false;
         return;
     }
 
@@ -375,6 +426,7 @@ void RenderLoop::encodeDenoising(MTLCommandBufferHandle commandBuffer,
     MTLTextureHandle colorOutput = accumulation.denoisedBuffer();
     if (!colorOutput) {
         NSLog(@"[Denoise] No denoised output buffer available");
+        m_hasDenoisedOutput = false;
         return;
     }
 
@@ -386,13 +438,12 @@ void RenderLoop::encodeDenoising(MTLCommandBufferHandle commandBuffer,
     // Execute denoising
     if (!m_denoiser->denoise(colorInput, albedoInput, normalInput, colorOutput, filterType)) {
         NSLog(@"[Denoise] Denoising failed: %s", m_denoiser->lastError().c_str());
+        m_hasDenoisedOutput = false;
         return;
     }
 
-    // After successful denoising, we would normally swap the buffers so that
-    // denoisedBuffer becomes the new presentation buffer. However, this requires
-    // careful synchronization and state management. For now, the denoised output
-    // is available in denoisedBuffer() for the next frame's display.
+    m_lastDenoisedFrame = frameIndex;
+    m_hasDenoisedOutput = true;
 }
 
 void RenderLoop::encodePresentation(MTLCommandBufferHandle commandBuffer,
@@ -432,7 +483,14 @@ void RenderLoop::encodeDisplay(MTLRenderCommandEncoderHandle renderEncoder,
     if (m_displayUniformBuffer) {
         [renderEncoder setFragmentBuffer:m_displayUniformBuffer offset:0 atIndex:0];
     }
-    [renderEncoder setFragmentTexture:accumulation.present() atIndex:0];
+    MTLTextureHandle displayTexture = accumulation.present();
+    if (settings.denoiseEnabled && m_hasDenoisedOutput) {
+        MTLTextureHandle denoised = accumulation.denoisedBuffer();
+        if (denoised) {
+            displayTexture = denoised;
+        }
+    }
+    [renderEncoder setFragmentTexture:displayTexture atIndex:0];
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }
 
@@ -453,6 +511,7 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
     if (m_statsBuffer) {
         memset([m_statsBuffer contents], 0, m_statsBuffer.length);
     }
+#if PT_DEBUG_TOOLS
     if (m_debugBuffer) {
         auto* debugData =
             reinterpret_cast<PathtraceDebugBuffer*>([m_debugBuffer contents]);
@@ -465,13 +524,27 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
                 allowed = std::max<uint32_t>(1u, allowed);
             }
             debugData->maxEntries = allowed;
+            debugData->parityWriteIndex = 0;
+            uint32_t parityAllowed = 0;
+            if (settings.parityAssertEnabled &&
+                settings.parityAssertMode != RenderSettings::ParityAssertMode::Off) {
+                parityAllowed = settings.parityAssertOncePerFrame
+                    ? 1u
+                    : PathTracerShaderTypes::kPathtraceParityMaxEntries;
+            }
+            debugData->parityMaxEntries =
+                std::min(parityAllowed, PathTracerShaderTypes::kPathtraceParityMaxEntries);
+            debugData->parityChecksPerformed = 0;
+            debugData->parityChecksInMedium = 0;
         }
     }
+#endif
 
     // Clear accumulation if needed
     if (accumulation.needsClear() && pipelines.clear()) {
         accumulation.clear(commandBuffer, pipelines.clear());
         m_frameCounter = 0;  // Reset frame counter on accumulation clear
+        m_hasDenoisedOutput = false;
     }
 
     // Rebuild scene if dirty

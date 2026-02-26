@@ -80,6 +80,8 @@ private:
     static bool parseMesh(const std::unordered_map<std::string, std::string>& tokens,
                           SceneResources& resources,
                           std::string& errorMessage,
+                          RenderSettings& inOutSettings,
+                          bool allowEmbeddedCameraOverride,
                           const std::string& sceneDirectory,
                           const std::unordered_map<std::string, uint32_t>& materialIndicesByName);
     static bool parseBackground(const std::unordered_map<std::string, std::string>& tokens,

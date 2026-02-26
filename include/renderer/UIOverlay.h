@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <cstdint>
 #include <CoreGraphics/CoreGraphics.h>
 #include <simd/simd.h>
 
@@ -41,6 +42,40 @@ struct ScenePanelProvider {
     std::function<void(uint32_t)> resetObjectTransform;
 };
 
+struct PresentationSettings {
+    enum class TargetScreen : uint32_t {
+        Auto = 0,
+        Primary = 1,
+        External = 2,
+    };
+
+    enum class WindowMode : uint32_t {
+        BorderlessFullscreen = 0,
+        Maximized = 1,
+    };
+
+    enum class RenderResolutionLock : uint32_t {
+        Off = 0,
+        Lock1280x720 = 1,
+        Lock1920x1080 = 2,
+    };
+
+    enum class ContentScaleMode : uint32_t {
+        Auto = 0,
+        Scale1x = 1,
+        Scale2x = 2,
+    };
+
+    bool enabled = false;
+    bool hideUIPanels = true;
+    bool minimalOverlay = true;
+    bool resetAccumulationOnToggle = true;
+    TargetScreen targetScreen = TargetScreen::Auto;
+    WindowMode windowMode = WindowMode::BorderlessFullscreen;
+    RenderResolutionLock resolutionLock = RenderResolutionLock::Lock1920x1080;
+    ContentScaleMode contentScale = ContentScaleMode::Auto;
+};
+
 /// ImGui-based performance overlay
 /// Manages ImGui initialization, frame lifecycle, and UI building
 class UIOverlay {
@@ -71,7 +106,8 @@ public:
                  RenderSettings& settings,
                  bool& outNeedsReset,
                  const std::vector<const char*>& sceneNames,
-                 int& inOutSelectedScene);
+                 int& inOutSelectedScene,
+                 PresentationSettings& presentation);
     
     /// Render ImGui to command encoder
     /// @param commandBuffer Command buffer for completed handler
@@ -97,11 +133,22 @@ public:
     /// Toggle overlay visibility
     void setVisible(bool visible) { m_visible = visible; }
 
+    /// Toggle main UI panel visibility (Presentation Mode).
+    void setMainPanelVisible(bool visible) { m_mainPanelVisible = visible; }
+    bool isMainPanelVisible() const { return m_mainPanelVisible; }
+
+    /// Toggle minimal overlay visibility (Presentation Mode).
+    void setMinimalOverlayVisible(bool visible) { m_minimalOverlayVisible = visible; }
+    bool isMinimalOverlayVisible() const { return m_minimalOverlayVisible; }
+
     /// Check initialization state
     bool isInitialized() const { return m_initialized; }
 
     /// Update ImGui display metrics (logical size in points and backing scale)
     void updateDisplayMetrics(CGSize logicalSizePoints, float backingScale);
+
+    /// Force a specific content scale (e.g., 1x or 2x). When disabled, trust backend metrics.
+    void setForcedContentScale(float scale, bool enabled);
 
     /// Provide callbacks for scene/object inspection & editing.
     void setScenePanelProvider(ScenePanelProvider provider);
@@ -133,11 +180,16 @@ private:
 
     bool m_initialized = false;
     bool m_visible = true;
+    bool m_mainPanelVisible = true;
+    bool m_minimalOverlayVisible = false;
     bool m_showDemo = false;
     NSViewHandle m_view = nullptr;
     MTLDeviceHandle m_device = nullptr;
     CGSize m_displaySizePoints = CGSizeMake(1.0, 1.0);
+    float m_backingScale = 1.0f;
     float m_displayScale = 1.0f;
+    bool m_hasForcedContentScale = false;
+    float m_forcedContentScale = 1.0f;
     float m_lastFontScale = 1.0f;
     float m_pendingFontScale = 1.0f;
     bool m_fontScaleInitialized = false;

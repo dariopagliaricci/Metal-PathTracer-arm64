@@ -44,6 +44,7 @@ public:
     /// Force a specific content scale (e.g., disable Retina scaling).
     void setForcedContentScale(float scale, bool enabled);
     bool hasForcedContentScale() const { return m_hasForcedContentScale; }
+    float forcedContentScale() const { return m_forcedContentScale; }
 
 private:
     MTLDeviceHandle m_device = nullptr;
@@ -58,6 +59,7 @@ private:
     ObjCObserverHandle m_backingChangeObserver = nullptr;
     bool m_hasForcedContentScale = false;
     float m_forcedContentScale = 1.0f;
+    bool m_pendingDrawableSizeUpdate = false;
 };
 
 }  // namespace PathTracer

@@ -494,17 +494,7 @@ private:
             return fail("No primitive descriptors created");
         }
 
-        uint64_t totalBlasBytes = static_cast<uint64_t>(maxScratch);
-        for (const auto& sizes : blasSizes) {
-            totalBlasBytes += static_cast<uint64_t>(sizes.accelerationStructureSize);
-        }
-        if (exceedsRecommendedWorkingSet(input.device, totalBlasBytes)) {
-            return fail("BLAS build exceeds recommended working set; refusing HWRT build");
-        }
-
-        if (!ensureScratchBuffer(input.device, maxScratch)) {
-            return fail("Failed to allocate BLAS scratch buffer");
-        }
+        ensureScratchBuffer(input.device, maxScratch);
 
         NSMutableArray<id<MTLAccelerationStructure>>* blasHandles =
             [NSMutableArray arrayWithCapacity:meshCount];
@@ -581,20 +571,7 @@ private:
         MTLAccelerationStructureSizes tlasSizes =
             [input.device accelerationStructureSizesWithDescriptor:tlasDesc];
         maxScratch = std::max(maxScratch, tlasSizes.buildScratchBufferSize);
-
-        uint64_t totalAccelBytes = static_cast<uint64_t>(maxScratch);
-        for (const auto& sizes : blasSizes) {
-            totalAccelBytes += static_cast<uint64_t>(sizes.accelerationStructureSize);
-        }
-        totalAccelBytes += static_cast<uint64_t>(tlasSizes.accelerationStructureSize);
-
-        if (exceedsRecommendedWorkingSet(input.device, totalAccelBytes)) {
-            return fail("Acceleration structure build exceeds recommended working set; refusing HWRT build");
-        }
-
-        if (!ensureScratchBuffer(input.device, maxScratch)) {
-            return fail("Failed to allocate TLAS scratch buffer");
-        }
+        ensureScratchBuffer(input.device, maxScratch);
 
         m_tlas = [input.device newAccelerationStructureWithSize:tlasSizes.accelerationStructureSize];
         if (!m_tlas) {
@@ -640,8 +617,19 @@ private:
         // Added: record all BLAS handles for encoder resource usage later.
         outProvider.hardware.blasHandles.clear();
         for (id<MTLAccelerationStructure> blasHandle in m_blasHandles) {
-            outProvider.hardware.blasHandles.push_back((MTLAccelerationStructureHandle)blasHandle);
+            outProvider.hardware.blasHandles.push_back((void*)blasHandle);
         }
+
+#if PT_DEBUG_TOOLS || PT_MNEE_SWRT_RAYS || PT_MNEE_OCCLUSION_PARITY
+        // Build a software BVH alongside HWRT so debug fallbacks can run without a mode switch.
+        if (m_softwareFallback) {
+            HardwareRtResources savedHardware = outProvider.hardware;
+            PathTracerShaderTypes::IntersectionMode savedMode = outProvider.mode;
+            m_softwareFallback->rebuild(input, outProvider);
+            outProvider.hardware = savedHardware;
+            outProvider.mode = savedMode;
+        }
+#endif
 
         NSLog(@"MetalRtAccel::buildHardware - TLAS ready (blasCount=%u, instanceCount=%u, primitiveCount=%u)",
               outProvider.hardware.blasCount,
@@ -663,40 +651,15 @@ private:
         m_primitiveCount = m_softwareFallback ? m_softwareFallback->primitiveCount() : 0;
     }
 
-    bool ensureScratchBuffer(MTLDeviceHandle device, NSUInteger requiredSize) {
+    void ensureScratchBuffer(MTLDeviceHandle device, NSUInteger requiredSize) {
         if (!device || requiredSize == 0) {
-            return true;
+            return;
         }
 
         if (!m_scratchBuffer || m_scratchBuffer.length < requiredSize) {
             m_scratchBuffer = [device newBufferWithLength:requiredSize
                                                   options:MTLResourceStorageModePrivate];
         }
-        return (m_scratchBuffer && m_scratchBuffer.length >= requiredSize);
-    }
-
-    bool exceedsRecommendedWorkingSet(MTLDeviceHandle device, uint64_t requiredBytes) const {
-        if (!device || requiredBytes == 0) {
-            return false;
-        }
-        if (@available(macOS 11.0, *)) {
-            const uint64_t recommended =
-                static_cast<uint64_t>(device.recommendedMaxWorkingSetSize);
-            if (recommended > 0) {
-                constexpr double kHeadroom = 0.85;
-                const uint64_t threshold = static_cast<uint64_t>(recommended * kHeadroom);
-                if (requiredBytes > threshold) {
-                    const double requiredMb = static_cast<double>(requiredBytes) / (1024.0 * 1024.0);
-                    const double recommendedMb = static_cast<double>(recommended) / (1024.0 * 1024.0);
-                    NSLog(@"MetalRtAccel::buildHardware - WARNING: device %@ requires %.2f MB (recommended max %.2f MB)",
-                          device.name ? device.name : @"(unknown)",
-                          requiredMb,
-                          recommendedMb);
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     void releaseHardwareResources() {
