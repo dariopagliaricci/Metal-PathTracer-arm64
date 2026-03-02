@@ -1,0 +1,9 @@
+camera target=0,0,-1 distance=3.5 yaw=0 pitch=0 vfov=45 defocusAngle=0.0 focusDist=3.5
+renderer samplesPerFrame=1 maxDepth=4 enableSoftwareRayTracing=1 width=64 height=64
+background solid=0.7,0.8,1.0
+
+material type=lambert albedo=0.8,0.3,0.3
+material type=lambert albedo=0.8,0.8,0.0
+
+sphere center=0,0,-1 radius=0.5 material=0
+sphere center=0,-100.5,-1 radius=100 material=1

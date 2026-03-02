@@ -23,9 +23,6 @@
 
 #if defined(PATH_TRACER_ENABLE_EMBREE)
 #include <embree4/rtcore.h>
-#include <tbb/blocked_range2d.h>
-#include <tbb/global_control.h>
-#include <tbb/parallel_for.h>
 #endif
 
 namespace {
@@ -2568,11 +2565,9 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
         }
     }
 
-    std::unique_ptr<tbb::global_control> tbbControl;
-    if (threadLimit > 0) {
-        tbbControl = std::make_unique<tbb::global_control>(
-            tbb::global_control::max_allowed_parallelism,
-            threadLimit);
+    uint32_t workerCount = threadLimit;
+    if (workerCount == 0) {
+        workerCount = 1;
     }
 
     auto renderTile = [&](uint32_t tileX, uint32_t tileY) {
@@ -3161,15 +3156,35 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
         }
     };
 
-    tbb::parallel_for(
-        tbb::blocked_range2d<uint32_t>(0, tilesY, 0, tilesX),
-        [&](const tbb::blocked_range2d<uint32_t>& range) {
-            for (uint32_t tileY = range.rows().begin(); tileY < range.rows().end(); ++tileY) {
-                for (uint32_t tileX = range.cols().begin(); tileX < range.cols().end(); ++tileX) {
-                    renderTile(tileX, tileY);
-                }
+    if (workerCount == 1) {
+        for (uint32_t tileY = 0; tileY < tilesY; ++tileY) {
+            for (uint32_t tileX = 0; tileX < tilesX; ++tileX) {
+                renderTile(tileX, tileY);
             }
-        });
+        }
+    } else {
+        std::atomic<uint32_t> nextTile{0};
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        auto runWorker = [&]() {
+            while (true) {
+                uint32_t tile = nextTile.fetch_add(1, std::memory_order_relaxed);
+                if (tile >= totalTiles) {
+                    break;
+                }
+                uint32_t tileY = tile / tilesX;
+                uint32_t tileX = tile % tilesX;
+                renderTile(tileX, tileY);
+            }
+        };
+
+        for (uint32_t i = 0; i < workerCount; ++i) {
+            workers.emplace_back(runWorker);
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    }
 
     if (verbose && lastReportedPercent.load(std::memory_order_relaxed) < 100u) {
         reportProgress(totalTiles);

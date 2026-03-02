@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-public:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (default)
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DPATH_TRACER_ENABLE_OIDN=OFF
+          -DPATH_TRACER_ASSETS_DIR=/tmp/path-tracer-assets-not-present
+
+      - name: Build (default)
+        run: cmake --build build --config Release --target PathTracerHeadless
+
+      - name: Headless CLI help smoke
+        run: ./build/PathTracerHeadless --help
+
+  build-embree:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Embree)
+        run: >-
+          cmake -S . -B build-embree
+          -DCMAKE_BUILD_TYPE=Release
+          -DPATH_TRACER_ENABLE_OIDN=OFF
+          -DPATH_TRACER_ENABLE_EMBREE=ON
+          -DPATH_TRACER_ASSETS_DIR=/tmp/path-tracer-assets-not-present
+
+      - name: Build Embree targets
+        run: cmake --build build-embree --config Release --target PathTracerHeadless EmbreeSmokeTest
+
+      - name: Run Embree smoke test
+        run: ./build-embree/EmbreeSmokeTest
+
+      - name: Run headless render smoke (Embree backend)
+        run: ./tests/public/headless_smoke_test.sh ./build-embree/PathTracerHeadless --backend=embree

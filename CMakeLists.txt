@@ -3,12 +3,14 @@ cmake_minimum_required(VERSION 3.24)
 project(PathTracerMetal LANGUAGES CXX OBJCXX)
 
 option(STRICT "Enable strict compiler warnings" OFF)
-option(M0_TESTS "Enable Milestone 0 golden image tests" OFF)
+option(M0_TESTS "Enable internal Milestone 0 golden image tests" OFF)
 option(PATH_TRACER_ENABLE_EMBREE "Enable Embree headless backend" OFF)
 option(PATH_TRACER_ENABLE_OIDN "Enable OIDN denoiser integration" ON)
 option(PT_DEBUG_TOOLS "Enable HWRT/SWRT debug tooling" OFF)
 option(PT_MNEE_SWRT_RAYS "Force MNEE rays to use SWRT in HWRT path (debug)" OFF)
 option(PT_MNEE_OCCLUSION_PARITY "Compare HWRT vs SWRT MNEE visibility (debug)" OFF)
+set(PATH_TRACER_ASSETS_DIR "${CMAKE_SOURCE_DIR}/assets" CACHE PATH
+    "Path to optional scene asset pack")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,13 +21,19 @@ set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 enable_testing()
 
 if(PATH_TRACER_ENABLE_EMBREE)
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/external/embree/CMakeLists.txt")
+        message(FATAL_ERROR
+            "PATH_TRACER_ENABLE_EMBREE=ON requires vendored Embree at external/embree. "
+            "Add Embree sources under external/embree and reconfigure."
+        )
+    endif()
     set(EMBREE_TUTORIALS OFF CACHE BOOL "Disable Embree tutorials" FORCE)
     set(EMBREE_ISPC_SUPPORT OFF CACHE BOOL "Disable Embree ISPC support" FORCE)
     set(EMBREE_SYCL_SUPPORT OFF CACHE BOOL "Disable Embree SYCL support" FORCE)
     set(EMBREE_TASKING_SYSTEM "INTERNAL" CACHE STRING "Use Embree internal tasking" FORCE)
     set(EMBREE_STATIC_LIB ON CACHE BOOL "Build Embree as a static library" FORCE)
+    set(EMBREE_INSTALL OFF CACHE BOOL "Disable Embree install target" FORCE)
     add_subdirectory(external/embree EXCLUDE_FROM_ALL)
-    find_package(TBB REQUIRED)
 endif()
 
 set(PATH_TRACER_OIDN_LIB_DIR "${CMAKE_SOURCE_DIR}/external/oidn/lib")
@@ -201,21 +209,42 @@ set_source_files_properties(${SHADER_SOURCES} PROPERTIES
 
 target_sources(PathTracer PRIVATE ${SHADER_SOURCES})
 
-set(ASSET_SOURCE_DIR "${CMAKE_SOURCE_DIR}/assets")
-file(GLOB_RECURSE ASSET_FILES CONFIGURE_DEPENDS
-    "${ASSET_SOURCE_DIR}/*"
-)
+set(ASSET_SOURCE_DIR "${PATH_TRACER_ASSETS_DIR}")
+if(EXISTS "${ASSET_SOURCE_DIR}")
+    set(PATH_TRACER_ASSETS_AVAILABLE ON)
+    file(GLOB_RECURSE ASSET_FILES CONFIGURE_DEPENDS
+        "${ASSET_SOURCE_DIR}/*"
+    )
+    message(STATUS "Using asset pack at: ${ASSET_SOURCE_DIR}")
+else()
+    set(PATH_TRACER_ASSETS_AVAILABLE OFF)
+    set(ASSET_FILES "")
+    message(STATUS
+        "Asset pack not found at '${ASSET_SOURCE_DIR}'. "
+        "Build will continue with empty asset directories."
+    )
+endif()
 
 set(ASSET_COPY_STAMP "${CMAKE_BINARY_DIR}/PathTracerAssets.stamp")
-add_custom_command(
-    OUTPUT "${ASSET_COPY_STAMP}"
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracer>/../Resources"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
-    COMMAND ${CMAKE_COMMAND} -E touch "${ASSET_COPY_STAMP}"
-    DEPENDS ${ASSET_FILES}
-    COMMENT "Copying scene assets into PathTracer.app bundle"
-)
+if(PATH_TRACER_ASSETS_AVAILABLE)
+    add_custom_command(
+        OUTPUT "${ASSET_COPY_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracer>/../Resources"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
+        COMMAND ${CMAKE_COMMAND} -E touch "${ASSET_COPY_STAMP}"
+        DEPENDS ${ASSET_FILES}
+        COMMENT "Copying scene assets into PathTracer.app bundle"
+    )
+else()
+    add_custom_command(
+        OUTPUT "${ASSET_COPY_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
+        COMMAND ${CMAKE_COMMAND} -E touch "${ASSET_COPY_STAMP}"
+        COMMENT "Asset pack missing: creating empty PathTracer.app Resources/assets directory"
+    )
+endif()
 
 add_custom_target(PathTracerAssets ALL
     DEPENDS "${ASSET_COPY_STAMP}"
@@ -223,16 +252,28 @@ add_custom_target(PathTracerAssets ALL
 add_dependencies(PathTracerAssets PathTracer)
 
 set(HEADLESS_ASSET_COPY_STAMP "${CMAKE_BINARY_DIR}/PathTracerHeadlessAssets.stamp")
-add_custom_command(
-    OUTPUT "${HEADLESS_ASSET_COPY_STAMP}"
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/assets"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/shaders" "${CMAKE_BINARY_DIR}/shaders"
-    COMMAND ${CMAKE_COMMAND} -E touch "${HEADLESS_ASSET_COPY_STAMP}"
-    DEPENDS ${ASSET_FILES} ${SHADER_SOURCES}
-    COMMENT "Copying scene assets next to PathTracerHeadless"
-)
+if(PATH_TRACER_ASSETS_AVAILABLE)
+    add_custom_command(
+        OUTPUT "${HEADLESS_ASSET_COPY_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/assets"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/shaders" "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E touch "${HEADLESS_ASSET_COPY_STAMP}"
+        DEPENDS ${ASSET_FILES} ${SHADER_SOURCES}
+        COMMENT "Copying scene assets next to PathTracerHeadless"
+    )
+else()
+    add_custom_command(
+        OUTPUT "${HEADLESS_ASSET_COPY_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/shaders" "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E touch "${HEADLESS_ASSET_COPY_STAMP}"
+        DEPENDS ${SHADER_SOURCES}
+        COMMENT "Asset pack missing: copying only shaders next to PathTracerHeadless"
+    )
+endif()
 
 add_custom_target(PathTracerHeadlessAssets ALL
     DEPENDS "${HEADLESS_ASSET_COPY_STAMP}"
@@ -353,9 +394,6 @@ target_compile_definitions(PathTracerHeadless PRIVATE
 if(PATH_TRACER_ENABLE_EMBREE)
     target_compile_definitions(PathTracerHeadless PRIVATE PATH_TRACER_ENABLE_EMBREE=1)
     target_link_libraries(PathTracerHeadless PRIVATE embree)
-    target_include_directories(PathTracerHeadless SYSTEM PRIVATE
-        $<TARGET_PROPERTY:TBB::tbb,INTERFACE_INCLUDE_DIRECTORIES>
-    )
 
     add_executable(EmbreeSmokeTest
         src/headless/EmbreeSmokeTest.cpp
@@ -405,22 +443,36 @@ add_custom_command(TARGET PathTracerHeadless POST_BUILD
 add_custom_command(TARGET PathTracerHeadless POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}"
-                                     "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
-    COMMENT "Copying scene assets next to PathTracerHeadless"
+    COMMENT "Preparing assets directory next to PathTracerHeadless"
 )
 
+if(PATH_TRACER_ASSETS_AVAILABLE)
+    add_custom_command(TARGET PathTracerHeadless POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}"
+                                         "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
+        COMMENT "Copying scene assets next to PathTracerHeadless"
+    )
+endif()
+
 if(M0_TESTS)
+    set(PATH_TRACER_M0_GOLDEN_SCRIPT "${CMAKE_SOURCE_DIR}/tests/tools/golden_test.sh")
+    if(NOT EXISTS "${PATH_TRACER_M0_GOLDEN_SCRIPT}")
+        message(FATAL_ERROR
+            "M0_TESTS=ON requires internal script '${PATH_TRACER_M0_GOLDEN_SCRIPT}', "
+            "which is intentionally not distributed in the public repository."
+        )
+    endif()
+
     # Golden image tests
     add_test(
         NAME golden_image_test_generate_after
-        COMMAND ${CMAKE_SOURCE_DIR}/tests/tools/golden_test.sh generate after
+        COMMAND "${PATH_TRACER_M0_GOLDEN_SCRIPT}" generate after
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
     add_test(
         NAME golden_image_test_compare
-        COMMAND ${CMAKE_SOURCE_DIR}/tests/tools/golden_test.sh compare --verbose
+        COMMAND "${PATH_TRACER_M0_GOLDEN_SCRIPT}" compare --verbose
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 

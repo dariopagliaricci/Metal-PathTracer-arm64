@@ -13,7 +13,7 @@ It started as a *"Ray Tracing in One Weekend"* clone and evolved into a producti
 - **Presentation Mode** for clean, UI-free demo display
 
 > This README describes the **v2.0 public release** of the Metal path tracer core.
-> Heavy assets (statues, high-res HDRIs) are provided as a separate download.
+> Large scene assets/HDRIs are intentionally not versioned in Git and are provided as a separate download.
 
 ---
 
@@ -25,7 +25,7 @@ It started as a *"Ray Tracing in One Weekend"* clone and evolved into a producti
 - **Dual backends**:
   - **Hardware Ray Tracing (HWRT)** using Metal's ray tracing API (TLAS/BLAS)
   - **Software Ray Tracing (SWRT)** using a CPU-built BVH (tinybvh-style) and compute kernels
-- **Full HWRT/SWRT parity** — both backends produce identical results for all material types including glass and subsurface scattering
+- **HWRT/SWRT parity** (validated via RMSE threshold on linear HDR PFM outputs)
 - **Configurable path depth** and Russian Roulette termination
 - **Internal render scale** (0.5×–2.0×) for trading quality vs performance
 - Accurate **environment map sampling** (importance sampling + MIS)
@@ -169,6 +169,7 @@ Real-time statistics displayed in ImGui:
 - [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo) — 3D gizmo widgets for object transform editing
 - [Intel® Open Image Denoise](https://www.openimagedenoise.org) 2.3.3
 - [MikkTSpace](http://www.mikktspace.com) — industry-standard tangent space for normal map baking
+- [Embree](https://www.embree.org/) (vendored source) — optional CPU ray tracing backend for headless rendering
 - [tinybvh](https://github.com/jbikker/tinybvh)
 - [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader)
 - [tinyply](https://github.com/ddiakopoulos/tinyply)
@@ -199,7 +200,15 @@ This will produce:
 | `PT_MNEE_SWRT_RAYS` | `OFF` | Force MNEE rays to use SWRT in the HWRT path (debug) |
 | `PT_MNEE_OCCLUSION_PARITY` | `OFF` | Compare HWRT vs SWRT MNEE visibility (debug) |
 | `STRICT` | `OFF` | Enable strict compiler warnings (`-Wall -Wextra -Werror`) |
-| `M0_TESTS` | `OFF` | Enable milestone golden-image tests |
+| `PATH_TRACER_ASSETS_DIR` | `./assets` | Path to optional asset pack directory (empty assets folders are created if missing) |
+| `M0_TESTS` | `OFF` | Enable internal milestone golden-image tests (requires private `tests/tools/golden_test.sh`) |
+
+### Public vs internal test coverage
+
+- The public repository does not ship internal golden-image scripts.
+- `M0_TESTS=ON` is reserved for internal environments where `tests/tools/golden_test.sh` exists.
+- Public smoke test script: `tests/public/headless_smoke_test.sh` (deterministic 64x64 headless render).
+- CI in this repository validates configuration/builds and runs the public smoke test.
 
 ### Running the GUI
 
@@ -354,9 +363,14 @@ OBJ files should provide vertex positions and may include normals/UVs for better
 
 [![Latest Version](https://img.shields.io/github/v/tag/dariopagliaricci/Metal-PathTracer-arm64?sort=semver)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/tags)
 
+## CI
+
+- GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+- Validates default configure/build and Embree-enabled configure/build paths on macOS.
+
 ## Assets Pack
 
-The scenes (Hygieia statue, Ajax bust, higher-res HDRIs, detailed dragon meshes) live in a separate asset pack to keep the repo size reasonable:
+Large scenes and high-resolution HDRIs live in a separate asset pack to keep repository size manageable and avoid versioning bulky binaries:
 
 - Download `Metal-PathTracer-Assets.zip` from the [link provided in the GitHub release](https://drive.google.com/file/d/1bn6XsKrmM4go1rTJBAFhyN0r-wA63P3b/view?usp=share_link)
 - Copy/replace the `assets` folder in the root of the project
