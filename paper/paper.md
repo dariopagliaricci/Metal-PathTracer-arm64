@@ -20,15 +20,17 @@ bibliography: paper.bib
 
 # Summary
 
-Metal Path Tracer is an open-source, production-grade physically based progressive
-path tracer targeting macOS on Apple Silicon (`arm64`). Written in C++20 and Metal
-Shading Language, it provides two ray tracing backends that share a common material
-encoding and shading pipeline: a hardware-accelerated backend exploiting Apple's
-Metal ray tracing API with GPU-native TLAS/BLAS acceleration structures (HWRT),
-and a reference software backend using a CPU-built surface-area-heuristic BVH
-dispatched through Metal compute kernels (SWRT). Both backends are validated to
-produce equivalent output within an RMSE tolerance on linear HDR renders, enabling
-reproducible cross-backend comparison on the same hardware.
+Metal Path Tracer is an open-source, reproducible GPU path tracing framework for
+Apple Silicon (`arm64`) that provides validated hardware and software ray tracing
+backends within a single codebase. Written in C++20 and Metal Shading Language, it
+exposes a hardware-accelerated backend exploiting Apple's Metal ray tracing API with
+GPU-native TLAS/BLAS acceleration structures (HWRT), and a reference software backend
+using a CPU-built surface-area-heuristic BVH dispatched through Metal compute kernels
+(SWRT). The HWRT and SWRT backends are validated via debug-mode per-ray intersection probes
+(comparing hit decisions, ray distances, surface normals, and material identities) and
+quantitative comparisons (e.g., RMSE/PSNR/mean-luminance checks) on pre-tonemap
+linear HDR outputs; pixel-identical output is
+not expected due to backend-specific parallel execution order and RNG stream divergence.
 
 The renderer supports eight physically based material models, glTF 2.0/GLB scene
 loading with full PBR metallic-roughness materials and MikkTSpace tangent
@@ -42,12 +44,11 @@ cross-validation. The project is built with CMake and carries an MIT license.
 
 # Statement of Need
 
-Apple Silicon (M1 through M4 and beyond) introduced dedicated hardware ray tracing
-units alongside a tiled GPU architecture. Apple's Metal ray tracing API — available
-since macOS 13 on Apple Silicon — exposes TLAS/BLAS hardware acceleration analogous
-to DirectX Raytracing (DXR) and Vulkan Ray Tracing. Despite this hardware
-availability, no open-source, feature-complete path tracer targets Metal RT as a
-primary rendering backend.
+Apple Silicon uses a tiled GPU architecture, and recent generations (M3 and later)
+add dedicated hardware ray tracing units. Apple's Metal ray tracing API — available
+since macOS 13 on Apple Silicon — exposes TLAS/BLAS acceleration structures analogous
+to DirectX Raytracing (DXR) and Vulkan Ray Tracing. Open-source path tracers that
+target Metal RT as a primary backend remain limited.
 
 Existing research renderers do not fill this gap. `pbrt-v4` [@pharr2023] renders on
 GPU via CUDA/OptiX and requires NVIDIA hardware. Mitsuba 3 [@jakob2022] provides CPU
@@ -82,14 +83,13 @@ Among Metal-native work, Apple's own Metal sample code provides isolated API
 demonstrations, and Blender Cycles provides a Metal compute backend, but neither
 constitutes a standalone, research-grade renderer with a documented feature set and
 public API. The RTOW book series [@shirley2020] provides pedagogical CPU path tracers
-that have been ported to Metal in tutorial form, but these stop well short of
-production features.
+that have been ported to Metal in tutorial form, but these stop well short of the
+feature scope typically needed for research workflows.
 
-To the author's knowledge, no existing open-source path tracer combines all of:
-(1) HWRT via Metal's native acceleration structure API alongside a validated SWRT
-reference in the same codebase; (2) MNEE caustics in Metal Shading Language;
-(3) a complete glTF 2.0 PBR material pipeline on macOS; and (4) OIDN 2.x integration
-using its Metal device backend. Metal Path Tracer provides this combination as a
+Metal Path Tracer integrates HWRT via Metal's native acceleration structure API
+alongside a validated SWRT reference in the same codebase, MNEE caustics in Metal
+Shading Language, a glTF 2.0 PBR material pipeline on macOS, and OIDN 2.x
+integration using its Metal device backend. The project is distributed as a
 documented, installable software package.
 
 # Software Design
@@ -152,30 +152,78 @@ Reinhard, Hable/Uncharted 2, Linear), bloom post-processing, and selectable work
 color space (linear sRGB or ACEScg). Outputs are written as linear-HDR EXR, LDR PNG,
 HDR PFM, or PPM.
 
+# Reproducibility
+
+This repository includes a public deterministic smoke test for reviewer setup
+verification. The following commands build and run the headless renderer with the
+Embree backend:
+
+```bash
+cmake -S . -B build-joss \
+  -DCMAKE_BUILD_TYPE=Release -DPATH_TRACER_ENABLE_EMBREE=ON
+cmake --build build-joss --target PathTracerHeadless
+./tests/public/headless_smoke_test.sh \
+  ./build-joss/PathTracerHeadless --backend=embree
+```
+
+An explicit equivalent render command is:
+
+```bash
+./build-joss/PathTracerHeadless \
+  --backend=embree \
+  --scene=tests/scenes/smoke.scene \
+  --width=64 --height=64 \
+  --sppTotal=4 --maxDepth=4 \
+  --seed=1337 \
+  --enableSoftwareRayTracing=1 \
+  --format=ppm \
+  --output=/tmp/smoke.ppm
+```
+
+For this repository version, the expected output size is 66,925 bytes and the
+reference checksum is:
+
+```bash
+shasum -a 256 /tmp/smoke.ppm
+# 6a5e6c9b2d50bc81c67a5463937575aeb0a367aec547036eef0ab2905a16406c
+```
+
+The smoke test is designed to validate toolchain correctness and deterministic
+execution on macOS 13+ running on Apple Silicon (M-series). No external assets
+are required.
+
+On Apple Silicon systems with Metal support, reviewers can additionally run the
+same scene with `--backend=metal` and `--enableSoftwareRayTracing=0/1` to inspect
+HWRT/SWRT consistency using the shared deterministic seed and scene configuration.
+Embree serves as an optional external reference backend for regression and sanity
+checks; due to differing sampling and implementation details, cross-renderer
+per-pixel RMSE is not used as a strict correctness criterion.
+
 # Research Impact Statement
 
-Metal Path Tracer provides a validated, open-source reference for GPU path tracing on
-Apple Silicon. Publishing verified HWRT and SWRT backends in a single codebase enables
-controlled experiments on Metal RT performance and correctness that are otherwise
-impractical without access to NVIDIA hardware. The glTF 2.0 importer with full PBR
-support allows standardised, interoperable scenes, reducing the barrier to reproducing
+Metal Path Tracer provides a validated reference implementation for comparing hardware
+and software ray tracing pipelines on Apple Silicon under deterministic conditions.
+Publishing verified HWRT and SWRT backends in a single codebase enables controlled
+experiments on Metal RT performance and correctness without requiring NVIDIA-specific
+toolchains. The glTF 2.0 importer with full PBR support allows
+standardised, interoperable scenes, reducing the barrier to reproducing
 results across different renderers.
 
 An open-source implementation of MNEE in Metal Shading Language is included, providing
 a reproducible reference for caustic rendering research on Apple hardware. The MIT
 license and CMake build system permit integration as a subcomponent in larger research
 toolchains. The headless CLI with deterministic RNG seeding supports automated
-benchmarking and CI-driven regression testing. The built-in asset pack (OBJ/PLY meshes,
-HDR environment maps, and Khronos sample glTF scenes) allows reviewers and researchers
-to reproduce renders immediately after build, without external downloads.
+benchmarking and CI-driven regression testing. The public repository includes a
+deterministic smoke scene for baseline reproducibility, and optional asset packs
+extend this to larger OBJ/PLY and glTF examples.
 
 # AI Usage Disclosure
 
-Portions of this paper were drafted with assistance from Claude (Anthropic), a large
-language model. All technical descriptions, algorithmic claims, and design decisions
-were independently verified against the source code by the author. No AI-generated
-content was accepted without manual verification. The Metal Path Tracer software was
-developed without AI assistance.
+Portions of this paper were drafted with assistance from Claude (Anthropic). All
+technical descriptions, algorithmic claims, and design decisions were independently
+verified against the source code by the author. No AI-generated content was accepted
+without manual verification. The Metal Path Tracer software was developed with
+assistance from Codex GPT (OpenAI) for code generation and refactoring support.
 
 # Acknowledgements
 

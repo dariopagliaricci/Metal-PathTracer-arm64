@@ -8,7 +8,7 @@ if [[ $# -ge 1 ]]; then
 else
   BINARY_PATH="${ROOT_DIR}/build/PathTracerHeadless"
 fi
-EXTRA_ARGS=("$@")
+declare -a EXTRA_ARGS=("$@")
 SCENE_PATH="${ROOT_DIR}/tests/scenes/smoke.scene"
 
 if [[ ! -x "${BINARY_PATH}" ]]; then
@@ -29,17 +29,30 @@ trap cleanup EXIT
 
 OUT_FILE="${OUT_DIR}/smoke.ppm"
 
-"${BINARY_PATH}" \
-  --scene="${SCENE_PATH}" \
-  --width=64 \
-  --height=64 \
-  --sppTotal=4 \
-  --maxDepth=4 \
-  --seed=1337 \
-  --enableSoftwareRayTracing=1 \
-  --format=ppm \
-  --output="${OUT_FILE}" \
-  "${EXTRA_ARGS[@]}"
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+  "${BINARY_PATH}" \
+    --scene="${SCENE_PATH}" \
+    --width=64 \
+    --height=64 \
+    --sppTotal=4 \
+    --maxDepth=4 \
+    --seed=1337 \
+    --enableSoftwareRayTracing=1 \
+    --format=ppm \
+    --output="${OUT_FILE}" \
+    "${EXTRA_ARGS[@]}"
+else
+  "${BINARY_PATH}" \
+    --scene="${SCENE_PATH}" \
+    --width=64 \
+    --height=64 \
+    --sppTotal=4 \
+    --maxDepth=4 \
+    --seed=1337 \
+    --enableSoftwareRayTracing=1 \
+    --format=ppm \
+    --output="${OUT_FILE}"
+fi
 
 if [[ ! -s "${OUT_FILE}" ]]; then
   echo "error: smoke render failed, output file missing or empty: ${OUT_FILE}" >&2
