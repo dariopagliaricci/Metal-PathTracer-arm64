@@ -29,7 +29,7 @@ paper/*.fdb_latexmk
 paper/*.toc
 paper/paper.tex
 paper/paper.pdf
-paper/JOSS-subscription.md
+paper/JOSS-submission.md
 
 CMakeCache.txt
 CMakeFiles/
