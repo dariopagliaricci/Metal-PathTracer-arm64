@@ -18,6 +18,18 @@ build-*/
 cmake-build-*/
 /assets/
 imgui.ini
+# LaTeX build artifacts (paper source files are tracked)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.toc
+paper/paper.tex
+paper/paper.pdf
+paper/JOSS-subscription.md
 
 CMakeCache.txt
 CMakeFiles/
@@ -26,6 +38,7 @@ Testing/
 CTestTestfile.cmake
 cmake_install.cmake
 Makefile
+!paper/Makefile
 install_manifest.txt
 
 # Ninja
