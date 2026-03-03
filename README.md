@@ -361,7 +361,8 @@ OBJ files should provide vertex positions and may include normals/UVs for better
 
 ## Release
 
-[![Latest Version](https://img.shields.io/github/v/tag/dariopagliaricci/Metal-PathTracer-arm64?sort=semver)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/tags)
+## Release
+[![CI](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/actions/workflows/ci.yml/badge.svg)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/actions/workflows/ci.yml) [![Latest Version](https://img.shields.io/github/v/tag/dariopagliaricci/Metal-PathTracer-arm64?sort=semver)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/tags)
 
 ## CI
 
