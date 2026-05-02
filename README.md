@@ -392,6 +392,16 @@ Large scenes and high-resolution HDRIs live in a separate asset pack to keep rep
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
+## Support
+
+Metal PathTracer-arm64 is open-source research software for physically based path tracing on Apple Silicon.
+
+Sponsorship helps support:
+- documentation and reproducible benchmark work
+- signed/notarized macOS builds and distribution experiments
+- validation across Apple Silicon hardware
+- continued development of Metal HWRT, SWRT, Embree, and future renderer architecture work
+
 ## References
 
 ### Core Ray Tracing Foundation
