@@ -24,6 +24,10 @@ namespace PathTracer {
 namespace {
 
 constexpr NSUInteger kIncrementalBlasBatchSize = 1u;
+constexpr MTLAccelerationStructureUsage kAccelerationUsagePreferFastIntersection =
+    static_cast<MTLAccelerationStructureUsage>(1u << 4u);
+constexpr MTLAccelerationStructureUsage kAccelerationUsageMinimizeMemory =
+    static_cast<MTLAccelerationStructureUsage>(1u << 5u);
 
 // Shared signal struct captured by GPU completion handlers.
 // Using shared_ptr ensures the struct stays alive even if MetalRtAccel is
@@ -169,12 +173,12 @@ MTLAccelerationStructureUsage MetalUsageForBuildPolicy(SceneAccelBuildPolicy pol
             break;
         case SceneAccelBuildPolicy::HardwareFastTrace:
             if (@available(macOS 26.0, *)) {
-                usage |= MTLAccelerationStructureUsagePreferFastIntersection;
+                usage |= kAccelerationUsagePreferFastIntersection;
             }
             break;
         case SceneAccelBuildPolicy::HardwareCompactMemory:
             if (@available(macOS 26.0, *)) {
-                usage |= MTLAccelerationStructureUsageMinimizeMemory;
+                usage |= kAccelerationUsageMinimizeMemory;
             }
             break;
         case SceneAccelBuildPolicy::HardwareDynamicUpdate:
@@ -207,10 +211,10 @@ std::string MetalUsageFlagsLabel(MTLAccelerationStructureUsage usage) {
         append("extended_limits");
     }
     if (@available(macOS 26.0, *)) {
-        if ((usage & MTLAccelerationStructureUsagePreferFastIntersection) != 0) {
+        if ((usage & kAccelerationUsagePreferFastIntersection) != 0) {
             append("prefer_fast_intersection");
         }
-        if ((usage & MTLAccelerationStructureUsageMinimizeMemory) != 0) {
+        if ((usage & kAccelerationUsageMinimizeMemory) != 0) {
             append("minimize_memory");
         }
     }
