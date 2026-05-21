@@ -680,10 +680,10 @@ The public release contains many scene wrappers and canonical assets. Large
 scenes, high-resolution meshes, HDRIs, and externally licensed datasets may be
 distributed separately to keep the Git repository manageable.
 
-- Download `Metal-PathTracer-Assets.zip` from the
+- Download `Metal-PathTracer-Assets-v3-0-0.zip` from the
   [public asset-pack link](https://drive.google.com/file/d/1Xsb5R_wzJUWYKn3FKulJlHEt4Whyxs1A/view?usp=share_link).
 - Unzip this file.
-- Copy the `assets` folder into the root of `Metal-PathTracer-arm64` before
+- Copy or replace the `assets` folder into the root of `Metal-PathTracer-arm64` before
   rendering asset-pack-dependent scenes.
 
 Important scene IDs include:
