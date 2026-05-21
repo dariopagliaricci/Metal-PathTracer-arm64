@@ -13,6 +13,10 @@
 *.dylib binary
 *.tbb   binary
 
+# === Mesh assets (text, keep normalized) ===
+*.obj text eol=lf
+*.mtl text eol=lf
+
 # === Shader and Metal sources (keep as text) ===
 *.metal text
 *.mm    text

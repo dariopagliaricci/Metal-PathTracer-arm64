@@ -710,6 +710,14 @@ distributed separately to keep the Git repository manageable.
 - Unzip this file.
 - Copy or replace the `assets` folder into the root of `Metal-PathTracer-arm64` before
   rendering asset-pack-dependent scenes.
+- If Git reports mesh assets such as `assets/ajax.obj` as modified after
+  replacement, normalize downloaded Wavefront text files back to the repository
+  LF line-ending policy:
+
+  ```bash
+  find assets -type f \( -name '*.obj' -o -name '*.mtl' \) -exec perl -pi -e 's/\r\n/\n/g' {} +
+  git status --short
+  ```
 
 Important scene IDs include:
 
