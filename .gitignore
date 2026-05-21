@@ -50,7 +50,8 @@ gltf/
 *.out
 
 # Local assets, documentation, and helper scripts are tracked separately.
-/assets/
+/assets/*
+!/assets/CREDITS.md
 /doc/
 /docs/
 /scripts/
