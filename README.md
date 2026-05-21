@@ -333,6 +333,31 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target PathTracerImport PathTracerBistroAudit
 ```
 
+Optional OIDN CPU denoising runtime:
+
+```bash
+OIDN_VERSION=2.4.1
+curl -L \
+  -o /tmp/oidn-${OIDN_VERSION}.arm64.macos.tar.gz \
+  https://github.com/RenderKit/oidn/releases/download/v${OIDN_VERSION}/oidn-${OIDN_VERSION}.arm64.macos.tar.gz
+
+tar -xzf /tmp/oidn-${OIDN_VERSION}.arm64.macos.tar.gz -C /tmp
+
+mkdir -p external/oidn/include external/oidn/lib
+cp -a /tmp/oidn-${OIDN_VERSION}.arm64.macos/include/. external/oidn/include/
+cp -a /tmp/oidn-${OIDN_VERSION}.arm64.macos/lib/. external/oidn/lib/
+
+xattr -dr com.apple.quarantine external/oidn/lib/*.dylib 2>/dev/null || true
+```
+
+Reconfigure after installing OIDN:
+
+```bash
+rm -rf build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
 Main CMake options:
 
 | Option | Default | Description |
