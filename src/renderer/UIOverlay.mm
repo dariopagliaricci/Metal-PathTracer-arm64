@@ -42,12 +42,850 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr float kRadToDeg = 180.0f / kPi;
 constexpr float kDegToRad = kPi / 180.0f;
 
+const char* HistoryResetReasonLabel(uint32_t reason) {
+    switch (reason) {
+        case 0u:
+            return "none";
+        case 1u:
+            return "resolution_changed";
+        case 2u:
+            return "scene_reloaded";
+        case 3u:
+            return "camera_cut";
+        case 4u:
+            return "light_table_changed";
+        case 5u:
+            return "feature_toggle_changed";
+        case 6u:
+            return "acceleration_structure_rebuilt";
+        case 7u:
+            return "emissive_table_changed";
+        case 8u:
+            return "material_table_changed";
+        case 9u:
+            return "frame_age_expired";
+        case 10u:
+            return "manual_debug_reset";
+        default:
+            return "unknown";
+    }
+}
+
 float WrapDegrees(float degrees) {
     degrees = std::fmod(degrees + 180.0f, 360.0f);
     if (degrees < 0.0f) {
         degrees += 360.0f;
     }
     return degrees - 180.0f;
+}
+
+simd::float3 CameraOrbitEye(const PathTracer::RenderSettings& settings) {
+    const float distance = std::max(settings.cameraDistance, 0.1f);
+    const float cosPitch = std::cos(settings.cameraPitch);
+    const simd::float3 offset = {
+        distance * cosPitch * std::cos(settings.cameraYaw),
+        distance * std::sin(settings.cameraPitch),
+        distance * cosPitch * std::sin(settings.cameraYaw)
+    };
+    return settings.cameraTarget + offset;
+}
+
+simd::float3 CameraForwardFromYawPitch(float yaw, float pitch) {
+    const float cosPitch = std::cos(pitch);
+    return simd_make_float3(-cosPitch * std::cos(yaw),
+                            -std::sin(pitch),
+                            -cosPitch * std::sin(yaw));
+}
+
+const char* DirectLightModeName(PathTracer::RenderSettings::DirectLightMode mode) {
+    using DirectLightMode = PathTracer::RenderSettings::DirectLightMode;
+    switch (mode) {
+        case DirectLightMode::LegacyRect:
+            return "legacy";
+        case DirectLightMode::BaselineEmissive:
+            return "baseline_emissive";
+        case DirectLightMode::Ris:
+            return "ris";
+        case DirectLightMode::RisSpatialReuse:
+            return "ris_spatial";
+        case DirectLightMode::RisTemporalReuse:
+            return "ris_temporal";
+        case DirectLightMode::RisWorldReuse:
+            return "ris_world";
+        case DirectLightMode::RisRegirCache:
+            return "ris_regir";
+        case DirectLightMode::RestirDi:
+            return "restir_di";
+        case DirectLightMode::RestirDiRegirHybrid:
+            return "restir_di_regir_hybrid";
+    }
+    return "unknown";
+}
+
+const char* RestirGiModeName(PathTracer::RenderSettings::RestirGiMode mode) {
+    using RestirGiMode = PathTracer::RenderSettings::RestirGiMode;
+    switch (mode) {
+        case RestirGiMode::Off:
+            return "off";
+        case RestirGiMode::DiffusePrototype:
+            return "production_gi_reservoir";
+    }
+    return "unknown";
+}
+
+const char* PathGuidingModeName(PathTracer::RenderSettings::PathGuidingMode mode) {
+    using PathGuidingMode = PathTracer::RenderSettings::PathGuidingMode;
+    switch (mode) {
+        case PathGuidingMode::Off:
+            return "off";
+        case PathGuidingMode::Prototype:
+            return "production_path_guiding";
+    }
+    return "unknown";
+}
+
+const char* RestirPtModeName(PathTracer::RenderSettings::RestirPtMode mode) {
+    using RestirPtMode = PathTracer::RenderSettings::RestirPtMode;
+    switch (mode) {
+        case RestirPtMode::Off:
+            return "off";
+        case RestirPtMode::Research:
+            return "path_reservoir_capture";
+        case RestirPtMode::ExperimentalPathReuse:
+            return "production_path_reuse";
+    }
+    return "unknown";
+}
+
+const char* RadianceCacheModeName(PathTracer::RenderSettings::RadianceCacheMode mode) {
+    using RadianceCacheMode = PathTracer::RenderSettings::RadianceCacheMode;
+    switch (mode) {
+        case RadianceCacheMode::Off:
+            return "off";
+        case RadianceCacheMode::Prototype:
+            return "radiance_cache";
+    }
+    return "unknown";
+}
+
+const char* RestirDebugViewName(PathTracer::RenderSettings::RestirDebugView view) {
+    using RestirDebugView = PathTracer::RenderSettings::RestirDebugView;
+    switch (view) {
+        case RestirDebugView::Beauty:
+            return "Beauty";
+        case RestirDebugView::CandidateSourceId:
+            return "Candidate source";
+        case RestirDebugView::ReservoirConfidence:
+            return "Reservoir confidence";
+        case RestirDebugView::ReGIRCellId:
+            return "ReGIR cell";
+        case RestirDebugView::PathGuidingUsedMask:
+            return "Path-guiding mask";
+        case RestirDebugView::RestirPTReuseMask:
+            return "Path-reuse mask";
+        case RestirDebugView::SVGFVariance:
+            return "SVGF guide";
+        case RestirDebugView::NaNInfMask:
+            return "NaN/Inf mask";
+        case RestirDebugView::QueueStageFailure:
+            return "Queue stage failure";
+        case RestirDebugView::RadianceCache:
+            return "Radiance cache";
+    }
+    return "unknown";
+}
+
+const char* ProductionProfileName(int profile) {
+    switch (profile) {
+        case 1:
+            return "preview";
+        case 2:
+            return "lookdev";
+        case 3:
+            return "final";
+        case 4:
+            return "reference";
+        case 5:
+            return "debug";
+        case 0:
+        default:
+            return "custom";
+    }
+}
+
+void ApplyProductionProfile(int profile, PathTracer::RenderSettings& settings) {
+    using RenderSettings = PathTracer::RenderSettings;
+    switch (profile) {
+        case 1:
+            settings.samplesPerFrame = 1u;
+            settings.executionMode = RenderSettings::ExecutionMode::Wavefront;
+            settings.wavefrontSchedulingPolicy = RenderSettings::WavefrontSchedulingPolicy::Preview;
+            settings.wavefrontCompactionEnabled = true;
+            break;
+        case 2:
+            settings.samplesPerFrame = 1u;
+            settings.executionMode = RenderSettings::ExecutionMode::Wavefront;
+            settings.wavefrontSchedulingPolicy = RenderSettings::WavefrontSchedulingPolicy::Final;
+            settings.wavefrontCompactionEnabled = true;
+            break;
+        case 3:
+            settings.samplesPerFrame = 1u;
+            settings.executionMode = RenderSettings::ExecutionMode::Wavefront;
+            settings.wavefrontSchedulingPolicy = RenderSettings::WavefrontSchedulingPolicy::Offline;
+            settings.wavefrontCompactionEnabled = true;
+            break;
+        case 4:
+            settings.samplesPerFrame = 1u;
+            settings.executionMode = RenderSettings::ExecutionMode::Megakernel;
+            settings.fixedRngSeed = settings.fixedRngSeed == 0u ? 1u : settings.fixedRngSeed;
+            break;
+        case 5:
+            settings.samplesPerFrame = 1u;
+            settings.executionMode = RenderSettings::ExecutionMode::Megakernel;
+            settings.restirDebugEnabled = true;
+            settings.restirDebugCounters = true;
+            break;
+        case 0:
+        default:
+            break;
+    }
+}
+
+bool IsRisFamilyMode(PathTracer::RenderSettings::DirectLightMode mode) {
+    using DirectLightMode = PathTracer::RenderSettings::DirectLightMode;
+    return mode == DirectLightMode::Ris ||
+           mode == DirectLightMode::RisSpatialReuse ||
+           mode == DirectLightMode::RisTemporalReuse ||
+           mode == DirectLightMode::RisWorldReuse ||
+           mode == DirectLightMode::RisRegirCache ||
+           mode == DirectLightMode::RestirDi ||
+           mode == DirectLightMode::RestirDiRegirHybrid;
+}
+
+bool IsSpatialReuseMode(PathTracer::RenderSettings::DirectLightMode mode) {
+    return mode == PathTracer::RenderSettings::DirectLightMode::RisSpatialReuse;
+}
+
+bool IsTemporalReuseMode(PathTracer::RenderSettings::DirectLightMode mode) {
+    return mode == PathTracer::RenderSettings::DirectLightMode::RisTemporalReuse ||
+           mode == PathTracer::RenderSettings::DirectLightMode::RestirDi ||
+           mode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+}
+
+bool IsWorldReuseMode(PathTracer::RenderSettings::DirectLightMode mode) {
+    return mode == PathTracer::RenderSettings::DirectLightMode::RisWorldReuse ||
+           mode == PathTracer::RenderSettings::DirectLightMode::RisRegirCache ||
+           mode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+}
+
+void DrawRestirHelpMarker(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", text);
+    }
+}
+
+void DrawRestirSectionLabel(const char* label) {
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted(label);
+}
+
+void DrawRestirAlarm(const char* label, const char* status, ImVec4 color) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    ImGui::TextColored(color, "%s", status);
+}
+
+void DrawRestirDebugPanel(PathTracer::RenderSettings& settings,
+                          const PathTracer::PerformanceStats& stats) {
+    ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+    if (!ImGui::CollapsingHeader("ReSTIR Debug / Audit")) {
+        return;
+    }
+
+    using DirectLightMode = PathTracer::RenderSettings::DirectLightMode;
+    using RestirGiMode = PathTracer::RenderSettings::RestirGiMode;
+    using PathGuidingMode = PathTracer::RenderSettings::PathGuidingMode;
+    using RestirPtMode = PathTracer::RenderSettings::RestirPtMode;
+    using RestirDebugView = PathTracer::RenderSettings::RestirDebugView;
+
+    const DirectLightMode directMode = settings.directLightMode;
+    const bool risActive = IsRisFamilyMode(directMode);
+    const bool worldActive = IsWorldReuseMode(directMode);
+    const bool giActive = settings.restirGiMode == RestirGiMode::DiffusePrototype;
+    const bool pathGuidingActive = settings.pathGuidingMode == PathGuidingMode::Prototype;
+    const bool restirPtActive = settings.restirPtMode != RestirPtMode::Off;
+    const bool restirPtReuseActive = settings.restirPtMode == RestirPtMode::ExperimentalPathReuse;
+    const bool radianceCacheActive =
+        settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Prototype;
+    const uint64_t nanInfCount = stats.throughputNanInfCount + stats.radianceNanInfCount;
+    const uint64_t directLightCandidateEstimate =
+        risActive ? stats.primaryRayCount * static_cast<uint64_t>(settings.risCandidateCount) : 0u;
+
+    bool debugEnabled = settings.restirDebugEnabled;
+    if (ImGui::Checkbox("Enable Inspector", &debugEnabled)) {
+        settings.restirDebugEnabled = debugEnabled;
+    }
+    ImGui::SameLine();
+    bool counterEnabled = settings.restirDebugCounters;
+    if (ImGui::Checkbox("Counters", &counterEnabled)) {
+        settings.restirDebugCounters = counterEnabled;
+    }
+    ImGui::SameLine();
+    bool alarmsEnabled = settings.restirDebugSanityAlarms;
+    if (ImGui::Checkbox("Alarms", &alarmsEnabled)) {
+        settings.restirDebugSanityAlarms = alarmsEnabled;
+    }
+
+    const char* debugViewLabels[] = {
+        "Beauty",
+        "Candidate source",
+        "Reservoir confidence",
+        "ReGIR cell",
+        "Path-guiding mask",
+        "Path-reuse mask",
+        "SVGF guide",
+        "NaN/Inf mask",
+        "Queue stage failure",
+        "Radiance cache",
+    };
+    int debugView = static_cast<int>(settings.restirDebugView);
+    if (debugView < 0 || debugView >= IM_ARRAYSIZE(debugViewLabels)) {
+        debugView = 0;
+    }
+    ImGui::BeginDisabled(!settings.restirDebugEnabled);
+    if (ImGui::Combo("Live Debug AOV", &debugView, debugViewLabels, IM_ARRAYSIZE(debugViewLabels))) {
+        debugView = std::clamp(debugView, 0, IM_ARRAYSIZE(debugViewLabels) - 1);
+        settings.restirDebugView = static_cast<RestirDebugView>(debugView);
+        if (settings.restirDebugView != RestirDebugView::Beauty) {
+            settings.restirDebugEnabled = true;
+        }
+    }
+    ImGui::EndDisabled();
+    DrawRestirHelpMarker("When the inspector is enabled, non-beauty views replace the live viewport with a derived ReSTIR diagnostic view. Headless uses the same selection.");
+
+    DrawRestirSectionLabel("Current State");
+    ImGui::Text("Execution: %s",
+                settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront
+                    ? "wavefront"
+                    : "megakernel");
+    ImGui::Text("Direct Light: %s", DirectLightModeName(settings.directLightMode));
+    ImGui::Text("RIS M: %u", settings.risCandidateCount);
+    ImGui::Text("ReSTIR GI: %s", RestirGiModeName(settings.restirGiMode));
+    ImGui::Text("Path Guiding: %s", PathGuidingModeName(settings.pathGuidingMode));
+    ImGui::Text("ReSTIR PT: %s", RestirPtModeName(settings.restirPtMode));
+    ImGui::Text("Radiance Cache: %s", RadianceCacheModeName(settings.radianceCacheMode));
+    ImGui::Text("SVGF: %s", settings.svgfDenoiseEnabled ? "on" : "off");
+    ImGui::Text("SPP / seed: %u / %u", stats.sampleCount, settings.fixedRngSeed);
+    ImGui::Text("Debug AOV selection: %s", RestirDebugViewName(settings.restirDebugView));
+    ImGui::Text("Live debug output: %s",
+                settings.restirDebugEnabled && settings.restirDebugView != RestirDebugView::Beauty
+                    ? "active"
+                    : "beauty");
+    if (settings.restirDebugEnabled && settings.restirDebugView != RestirDebugView::Beauty) {
+        ImGui::TextDisabled("Live debug AOVs short-circuit first-hit shading; switch to Beauty for full production counters.");
+    }
+    ImGui::Text("Audit JSON: %s", settings.debugDirectLightAudit ? "armed" : "off");
+
+    DrawRestirSectionLabel("Debug Pixel");
+#if PT_DEBUG_TOOLS
+    bool pathDebug = settings.enablePathDebug;
+    if (ImGui::Checkbox("Path Debug Capture", &pathDebug)) {
+        settings.enablePathDebug = pathDebug;
+    }
+    int pixelX = static_cast<int>(settings.debugPixelX);
+    int pixelY = static_cast<int>(settings.debugPixelY);
+    if (ImGui::InputInt("Pixel X##restir_debug", &pixelX)) {
+        settings.debugPixelX = static_cast<uint32_t>(std::max(pixelX, 0));
+    }
+    if (ImGui::InputInt("Pixel Y##restir_debug", &pixelY)) {
+        settings.debugPixelY = static_cast<uint32_t>(std::max(pixelY, 0));
+    }
+    ImGui::Text("Captured path records: %u / %u", stats.debugPathEntryCount, stats.debugPathMaxEntries);
+#else
+    ImGui::TextDisabled("Debug pixel readback requires PT_DEBUG_TOOLS.");
+#endif
+    ImGui::TextDisabled("Selected light and candidate-source debug-pixel fields are available through direct-light audit JSON.");
+
+    DrawRestirSectionLabel("Counters");
+    if (!settings.restirDebugCounters) {
+        ImGui::TextDisabled("Counters disabled.");
+    } else {
+        ImGui::Text("Direct-light candidates (estimated): %llu",
+                    static_cast<unsigned long long>(directLightCandidateEstimate));
+        ImGui::Text("ReSTIR PT reservoir updates: %llu",
+                    static_cast<unsigned long long>(stats.restirPtReservoirUpdateCount));
+        ImGui::Text("ReGIR cache hits/misses: unavailable");
+        if (giActive) {
+            ImGui::Text("GI: %llu candidates / %llu updates / %llu accept / %llu reject / %llu fallback",
+                        static_cast<unsigned long long>(stats.restirGiCandidateCount),
+                        static_cast<unsigned long long>(stats.restirGiReservoirUpdateCount),
+                        static_cast<unsigned long long>(stats.restirGiAcceptCount),
+                        static_cast<unsigned long long>(stats.restirGiRejectCount),
+                        static_cast<unsigned long long>(stats.restirGiFallbackCount));
+        } else {
+            ImGui::TextDisabled("GI: inactive");
+        }
+        if (pathGuidingActive) {
+            ImGui::Text("Path guiding: %llu used / %llu candidates / %llu fallback / %llu invalid",
+                        static_cast<unsigned long long>(stats.pathGuidingUsedCount),
+                        static_cast<unsigned long long>(stats.pathGuidingCandidateCount),
+                        static_cast<unsigned long long>(stats.pathGuidingFallbackCount),
+                        static_cast<unsigned long long>(stats.pathGuidingInvalidCount));
+        } else {
+            ImGui::TextDisabled("Path guiding: inactive");
+        }
+        if (restirPtActive) {
+            ImGui::Text("ReSTIR PT: %llu candidates / %llu updates / %llu unsupported / %llu invalid / %llu debug records",
+                        static_cast<unsigned long long>(stats.restirPtCandidateCount),
+                        static_cast<unsigned long long>(stats.restirPtReservoirUpdateCount),
+                        static_cast<unsigned long long>(stats.restirPtRejectedUnsupportedCount),
+                        static_cast<unsigned long long>(stats.restirPtRejectedInvalidCount),
+                        static_cast<unsigned long long>(stats.restirPtDebugRecordCount));
+        } else {
+            ImGui::TextDisabled("ReSTIR PT: inactive");
+        }
+        if (restirPtReuseActive) {
+            ImGui::Text("ReSTIR PT reuse: %llu applied / %llu candidates / %llu fallback / %llu invalid",
+                        static_cast<unsigned long long>(stats.restirPtReuseAppliedCount),
+                        static_cast<unsigned long long>(stats.restirPtReuseCandidateCount),
+                        static_cast<unsigned long long>(stats.restirPtReuseFallbackCount),
+                        static_cast<unsigned long long>(stats.restirPtReuseRejectedInvalidCount));
+        } else {
+            ImGui::TextDisabled("ReSTIR PT reuse: inactive");
+        }
+        if (radianceCacheActive) {
+            ImGui::Text("Radiance cache: %llu hits / %llu queries / %llu train / %llu fallback / %llu invalid",
+                        static_cast<unsigned long long>(stats.radianceCacheHitCount),
+                        static_cast<unsigned long long>(stats.radianceCacheQueryCount),
+                        static_cast<unsigned long long>(stats.radianceCacheTrainCount),
+                        static_cast<unsigned long long>(stats.radianceCacheFallbackCount),
+                        static_cast<unsigned long long>(stats.radianceCacheInvalidCount));
+        } else {
+            ImGui::TextDisabled("Radiance cache: inactive");
+        }
+        ImGui::Text("SVGF active pixels: %s", settings.svgfDenoiseEnabled ? "derived from pass state" : "0");
+        ImGui::Text("NaN/Inf counters: throughput=%llu radiance=%llu",
+                    static_cast<unsigned long long>(stats.throughputNanInfCount),
+                    static_cast<unsigned long long>(stats.radianceNanInfCount));
+    }
+
+    if (settings.restirDebugSanityAlarms) {
+        const ImVec4 ok(0.45f, 0.85f, 0.50f, 1.0f);
+        const ImVec4 warn(0.95f, 0.78f, 0.35f, 1.0f);
+        const ImVec4 bad(0.95f, 0.35f, 0.35f, 1.0f);
+        const bool restirDefaults =
+            !giActive && !pathGuidingActive && !restirPtActive && !settings.svgfDenoiseEnabled;
+        const bool risHasEvidence = risActive && directLightCandidateEstimate > 0u;
+        const char* risStatus = risActive ? (risHasEvidence ? "active OK" : "suspect/no candidates")
+                                          : "inactive OK";
+        const ImVec4 risColor = !risActive || risHasEvidence ? ok : bad;
+
+        const char* restirGiStatus = "inactive OK";
+        ImVec4 restirGiColor = ok;
+        if (giActive) {
+            if (stats.restirGiAcceptCount > 0u) {
+                restirGiStatus = "active OK";
+            } else if (stats.restirGiReservoirUpdateCount > 0u) {
+                restirGiStatus = "reservoirs/no accepted reuse";
+                restirGiColor = warn;
+            } else if (stats.restirGiFallbackCount > 0u) {
+                restirGiStatus = "fallback/no eligible samples";
+                restirGiColor = warn;
+            } else {
+                restirGiStatus = "unavailable/zero";
+                restirGiColor = warn;
+            }
+        }
+
+        const char* pathGuidingStatus = "inactive OK";
+        ImVec4 pathGuidingColor = ok;
+        if (pathGuidingActive) {
+            if (stats.pathGuidingUsedCount > 0u) {
+                pathGuidingStatus = "active OK";
+            } else if (stats.pathGuidingFallbackCount > 0u) {
+                pathGuidingStatus = "fallback/no eligible samples";
+                pathGuidingColor = warn;
+            } else if (stats.pathGuidingCandidateCount > 0u) {
+                pathGuidingStatus = "candidates/no guided paths";
+                pathGuidingColor = warn;
+            } else {
+                pathGuidingStatus = "unavailable/zero";
+                pathGuidingColor = warn;
+            }
+        }
+
+        const char* restirPtStatus = "inactive OK";
+        ImVec4 restirPtColor = ok;
+        if (restirPtActive) {
+            if (stats.restirPtCandidateCount > 0u) {
+                restirPtStatus = "active OK";
+            } else if (stats.restirPtRejectedUnsupportedCount > 0u) {
+                restirPtStatus = "unsupported-only";
+                restirPtColor = warn;
+            } else if (stats.restirPtDebugRecordCount > 0u) {
+                restirPtStatus = "debug-only/no reservoir";
+                restirPtColor = warn;
+            } else {
+                restirPtStatus = "unavailable/zero";
+                restirPtColor = warn;
+            }
+        }
+
+        const char* restirPtReuseStatus = "inactive OK";
+        ImVec4 restirPtReuseColor = ok;
+        if (restirPtReuseActive) {
+            if (stats.restirPtReuseAppliedCount > 0u) {
+                restirPtReuseStatus = "active OK";
+            } else if (stats.restirPtReuseFallbackCount > 0u) {
+                restirPtReuseStatus = "fallback/no reuse";
+                restirPtReuseColor = warn;
+            } else if (stats.restirPtReuseCandidateCount > 0u) {
+                restirPtReuseStatus = "candidates/no applied reuse";
+                restirPtReuseColor = warn;
+            } else {
+                restirPtReuseStatus = "unavailable/zero";
+                restirPtReuseColor = warn;
+            }
+        }
+
+        DrawRestirSectionLabel("Sanity Alarms");
+        DrawRestirAlarm("NaN/Inf:", nanInfCount == 0u ? "OK" : "failure", nanInfCount == 0u ? ok : bad);
+        DrawRestirAlarm("Default ReSTIR gates:",
+                        restirDefaults
+                            ? "all default/off"
+                            : "explicitly enabled",
+                        ok);
+        DrawRestirAlarm("RIS-family activity:", risStatus, risColor);
+        DrawRestirAlarm("ReSTIR GI activity:", restirGiStatus, restirGiColor);
+        DrawRestirAlarm("Path-guiding activity:", pathGuidingStatus, pathGuidingColor);
+        DrawRestirAlarm("ReSTIR PT activity:", restirPtStatus, restirPtColor);
+        DrawRestirAlarm("ReSTIR PT reuse:", restirPtReuseStatus, restirPtReuseColor);
+        DrawRestirAlarm("History reset:", "automatic on setting changes", ok);
+        DrawRestirAlarm("World/ReGIR state:",
+                        worldActive ? "active OK; cache counters unavailable" : "inactive OK",
+                        ok);
+    }
+}
+void DrawRestirPanel(PathTracer::RenderSettings& settings,
+                     const PathTracer::PerformanceStats& stats,
+                     bool& outNeedsReset) {
+    ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+    if (!ImGui::CollapsingHeader("ReSTIR")) {
+        return;
+    }
+
+    using DirectLightMode = PathTracer::RenderSettings::DirectLightMode;
+    const char* directLightModeLabels[] = {
+        "legacy",
+        "baseline_emissive",
+        "ris",
+        "ris_spatial",
+        "ris_temporal",
+        "ris_world",
+        "ris_regir",
+        "restir_di",
+        "restir_di_regir_hybrid",
+    };
+
+    ImGui::TextUnformatted("Mode");
+    int directLightMode = static_cast<int>(settings.directLightMode);
+    if (directLightMode < 0 || directLightMode >= IM_ARRAYSIZE(directLightModeLabels)) {
+        directLightMode = 0;
+    }
+    if (ImGui::Combo("Direct Light Mode",
+                     &directLightMode,
+                     directLightModeLabels,
+                     IM_ARRAYSIZE(directLightModeLabels))) {
+        directLightMode = std::clamp(directLightMode, 0, IM_ARRAYSIZE(directLightModeLabels) - 1);
+        settings.directLightMode = static_cast<DirectLightMode>(directLightMode);
+        outNeedsReset = true;
+    }
+    DrawRestirHelpMarker("Uses the same directLightMode values as the headless CLI.");
+
+    const DirectLightMode mode = settings.directLightMode;
+    const bool risActive = IsRisFamilyMode(mode);
+    const bool spatialActive = IsSpatialReuseMode(mode);
+    const bool temporalActive = IsTemporalReuseMode(mode);
+    const bool worldActive = IsWorldReuseMode(mode);
+
+    ImGui::Text("Active direct-light mode: %s", DirectLightModeName(mode));
+    ImGui::TextDisabled("Mode changes reset accumulation through the normal UI settings path.");
+
+    DrawRestirSectionLabel("Production GI");
+    using RestirGiMode = PathTracer::RenderSettings::RestirGiMode;
+    const char* restirGiModeLabels[] = {
+        "Off",
+        "Production GI reservoir",
+    };
+    int restirGiMode = static_cast<int>(settings.restirGiMode);
+    if (restirGiMode < 0 || restirGiMode >= IM_ARRAYSIZE(restirGiModeLabels)) {
+        restirGiMode = 0;
+    }
+    if (ImGui::Combo("ReSTIR GI Mode",
+                     &restirGiMode,
+                     restirGiModeLabels,
+                     IM_ARRAYSIZE(restirGiModeLabels))) {
+        restirGiMode = std::clamp(restirGiMode, 0, IM_ARRAYSIZE(restirGiModeLabels) - 1);
+        settings.restirGiMode = static_cast<RestirGiMode>(restirGiMode);
+        outNeedsReset = true;
+    }
+    DrawRestirHelpMarker("Production material/BSDF-backed first-bounce indirect reservoir reuse. Off by default.");
+    ImGui::Text("Active GI mode: %s", RestirGiModeName(settings.restirGiMode));
+
+    DrawRestirSectionLabel("Path Guiding");
+    using PathGuidingMode = PathTracer::RenderSettings::PathGuidingMode;
+    const char* pathGuidingModeLabels[] = {
+        "Off",
+        "Production path guiding",
+    };
+    int pathGuidingMode = static_cast<int>(settings.pathGuidingMode);
+    if (pathGuidingMode < 0 || pathGuidingMode >= IM_ARRAYSIZE(pathGuidingModeLabels)) {
+        pathGuidingMode = 0;
+    }
+    if (ImGui::Combo("Path Guiding Mode",
+                     &pathGuidingMode,
+                     pathGuidingModeLabels,
+                     IM_ARRAYSIZE(pathGuidingModeLabels))) {
+        pathGuidingMode = std::clamp(pathGuidingMode, 0, IM_ARRAYSIZE(pathGuidingModeLabels) - 1);
+        settings.pathGuidingMode = static_cast<PathGuidingMode>(pathGuidingMode);
+        outNeedsReset = true;
+    }
+    DrawRestirHelpMarker("Production material/BSDF-backed indirect direction guidance. Off by default.");
+    const bool pathGuidingActive = settings.pathGuidingMode == PathGuidingMode::Prototype;
+    ImGui::BeginDisabled(!pathGuidingActive);
+    float guidingStrength = std::clamp(settings.pathGuidingStrength, 0.0f, 1.0f);
+    if (ImGui::SliderFloat("Guiding Strength", &guidingStrength, 0.0f, 1.0f, "%.2f")) {
+        settings.pathGuidingStrength = std::clamp(guidingStrength, 0.0f, 1.0f);
+        outNeedsReset = true;
+    }
+    float guidingCellSize = std::max(settings.pathGuidingCellSize, 1.0e-4f);
+    if (ImGui::InputFloat("Guiding Cell Size", &guidingCellSize, 0.1f, 0.5f, "%.3f")) {
+        settings.pathGuidingCellSize = std::max(guidingCellSize, 1.0e-4f);
+        outNeedsReset = true;
+    }
+    int guidingTrainingInterval =
+        static_cast<int>(std::max<uint32_t>(settings.pathGuidingTrainingInterval, 1u));
+    if (ImGui::InputInt("Guiding Training Interval", &guidingTrainingInterval, 1, 4)) {
+        settings.pathGuidingTrainingInterval =
+            static_cast<uint32_t>(std::max(guidingTrainingInterval, 1));
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::Text("Active path guiding mode: %s", PathGuidingModeName(settings.pathGuidingMode));
+    if (!pathGuidingActive) {
+        ImGui::TextDisabled("Strength and cell size apply only to production path guiding.");
+    }
+
+    DrawRestirSectionLabel("Radiance Cache");
+    using RadianceCacheMode = PathTracer::RenderSettings::RadianceCacheMode;
+    const char* radianceCacheModeLabels[] = {
+        "Off",
+        "Rough indirect cache",
+    };
+    int radianceCacheMode = static_cast<int>(settings.radianceCacheMode);
+    if (radianceCacheMode < 0 || radianceCacheMode >= IM_ARRAYSIZE(radianceCacheModeLabels)) {
+        radianceCacheMode = 0;
+    }
+    if (ImGui::Combo("Radiance Cache Mode",
+                     &radianceCacheMode,
+                     radianceCacheModeLabels,
+                     IM_ARRAYSIZE(radianceCacheModeLabels))) {
+        radianceCacheMode =
+            std::clamp(radianceCacheMode, 0, IM_ARRAYSIZE(radianceCacheModeLabels) - 1);
+        settings.radianceCacheMode = static_cast<RadianceCacheMode>(radianceCacheMode);
+        outNeedsReset = true;
+    }
+    const bool radianceCacheActive = settings.radianceCacheMode == RadianceCacheMode::Prototype;
+    ImGui::BeginDisabled(!radianceCacheActive);
+    float radianceCacheCellSize = std::max(settings.radianceCacheCellSize, 1.0e-4f);
+    if (ImGui::InputFloat("Radiance Cache Cell Size", &radianceCacheCellSize, 0.1f, 0.5f, "%.3f")) {
+        settings.radianceCacheCellSize = std::max(radianceCacheCellSize, 1.0e-4f);
+        outNeedsReset = true;
+    }
+    int radianceCacheMinDepth =
+        static_cast<int>(std::max<uint32_t>(settings.radianceCacheMinDepth, 1u));
+    if (ImGui::InputInt("Radiance Cache Min Depth", &radianceCacheMinDepth, 1, 2)) {
+        settings.radianceCacheMinDepth = static_cast<uint32_t>(std::max(radianceCacheMinDepth, 1));
+        outNeedsReset = true;
+    }
+    float radianceCacheMinConfidence =
+        std::clamp(settings.radianceCacheMinConfidence, 0.0f, 1.0f);
+    if (ImGui::SliderFloat("Radiance Cache Confidence",
+                           &radianceCacheMinConfidence,
+                           0.0f,
+                           1.0f,
+                           "%.2f")) {
+        settings.radianceCacheMinConfidence =
+            std::clamp(radianceCacheMinConfidence, 0.0f, 1.0f);
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::Text("Active radiance cache mode: %s",
+                RadianceCacheModeName(settings.radianceCacheMode));
+    if (!radianceCacheActive) {
+        ImGui::TextDisabled("Rough-indirect cache query, training, and termination are disabled.");
+    }
+
+    DrawRestirSectionLabel("ReSTIR PT Reservoirs");
+    using RestirPtMode = PathTracer::RenderSettings::RestirPtMode;
+    const char* restirPtModeLabels[] = {
+        "Off",
+        "Path reservoir capture",
+        "Production path reuse",
+    };
+    int restirPtMode = static_cast<int>(settings.restirPtMode);
+    if (restirPtMode < 0 || restirPtMode >= IM_ARRAYSIZE(restirPtModeLabels)) {
+        restirPtMode = 0;
+    }
+    if (ImGui::Combo("ReSTIR PT Mode",
+                     &restirPtMode,
+                     restirPtModeLabels,
+                     IM_ARRAYSIZE(restirPtModeLabels))) {
+        restirPtMode = std::clamp(restirPtMode, 0, IM_ARRAYSIZE(restirPtModeLabels) - 1);
+        settings.restirPtMode = static_cast<RestirPtMode>(restirPtMode);
+        outNeedsReset = true;
+    }
+    DrawRestirHelpMarker("Captures production BSDF-backed path-reservoir metadata and can reuse compatible diffuse/PBR path samples when explicitly selected. The mode label is retained for compatibility.");
+    const bool restirPtReuseActive = settings.restirPtMode == RestirPtMode::ExperimentalPathReuse;
+    const bool restirPtAnyActive = settings.restirPtMode != RestirPtMode::Off;
+    ImGui::BeginDisabled(!restirPtAnyActive);
+    int restirPtMaxReservoirs = static_cast<int>(std::max(settings.restirPtMaxReservoirs, 1u));
+    if (ImGui::InputInt("PT Max Reservoirs", &restirPtMaxReservoirs, 256, 1024)) {
+        settings.restirPtMaxReservoirs = static_cast<uint32_t>(std::max(restirPtMaxReservoirs, 1));
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::BeginDisabled(!restirPtAnyActive);
+    bool restirPtDebug = settings.restirPtDebug;
+    if (ImGui::Checkbox("PT Debug Records", &restirPtDebug)) {
+        settings.restirPtDebug = restirPtDebug;
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    if (!restirPtAnyActive && settings.restirPtDebug) {
+        ImGui::TextDisabled("PT debug records are latched but only collect while a PT reservoir mode is active.");
+    }
+    ImGui::BeginDisabled(!restirPtReuseActive);
+    float restirPtReuseStrength = std::clamp(settings.restirPtReuseStrength, 0.0f, 1.0f);
+    if (ImGui::SliderFloat("PT Reuse Strength", &restirPtReuseStrength, 0.0f, 1.0f, "%.2f")) {
+        settings.restirPtReuseStrength = std::clamp(restirPtReuseStrength, 0.0f, 1.0f);
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::Text("Active ReSTIR PT mode: %s", RestirPtModeName(settings.restirPtMode));
+    if (!restirPtAnyActive) {
+        ImGui::TextDisabled("Path-reservoir capture and reuse are disabled.");
+    } else if (!restirPtReuseActive) {
+        ImGui::TextDisabled("PT reuse strength applies only to production path reuse.");
+    }
+
+    DrawRestirSectionLabel("RIS");
+    ImGui::BeginDisabled(!risActive);
+    int risCandidateCount = static_cast<int>(std::max(settings.risCandidateCount, 1u));
+    if (ImGui::InputInt("Candidate Count (M)", &risCandidateCount)) {
+        settings.risCandidateCount = static_cast<uint32_t>(std::max(risCandidateCount, 1));
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    DrawRestirHelpMarker("Number of local emissive candidates used by RIS-family, ReSTIR-DI, and ReSTIR-DI + ReGIR hybrid modes.");
+    if (!risActive) {
+        ImGui::TextDisabled("M applies only to RIS-family, ReSTIR-DI, and hybrid direct-light modes.");
+    }
+
+    DrawRestirSectionLabel("Spatial");
+    ImGui::Text("Status: %s", spatialActive ? "active" : "inactive");
+    ImGui::BeginDisabled(!spatialActive);
+    int spatialReuseK = static_cast<int>(std::max(settings.spatialReuseNeighborCount, 1u));
+    if (ImGui::InputInt("Neighbor Count (K)", &spatialReuseK)) {
+        settings.spatialReuseNeighborCount = static_cast<uint32_t>(std::max(spatialReuseK, 1));
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    DrawRestirHelpMarker("Same-frame neighbor count used only by directLightMode=ris_spatial.");
+    if (!spatialActive) {
+        ImGui::TextDisabled("K is writable only when directLightMode=ris_spatial.");
+    }
+
+    DrawRestirSectionLabel("Temporal");
+    ImGui::Text("Status: %s", temporalActive ? "active" : "inactive");
+    ImGui::TextDisabled("Current temporal reuse is narrow same-pixel R4 reuse; restir_di and hybrid enable it.");
+    ImGui::TextDisabled("No additional temporal tuning controls are wired yet.");
+    DrawRestirHelpMarker("Temporal reprojection, motion handling, and history-policy controls do not exist in runtime settings yet.");
+
+    DrawRestirSectionLabel("World");
+    ImGui::Text("Status: %s", worldActive ? "active" : "inactive");
+    ImGui::BeginDisabled(!worldActive);
+    float worldCellSize = std::max(settings.worldReuseCellSize, 1.0e-4f);
+    if (ImGui::InputFloat("Cell Size", &worldCellSize, 0.05f, 0.25f, "%.4f")) {
+        settings.worldReuseCellSize = std::max(worldCellSize, 1.0e-4f);
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    DrawRestirHelpMarker("Existing checkpoint world-cell size used by directLightMode=ris_world, ris_regir, or restir_di_regir_hybrid.");
+    if (!worldActive) {
+        ImGui::TextDisabled("Cell size is writable only when directLightMode=ris_world, ris_regir, or restir_di_regir_hybrid.");
+    }
+    ImGui::TextDisabled("World query radius remains fixed by the checkpoint shader path.");
+
+    DrawRestirSectionLabel("Audit / Debug");
+    bool audit = settings.debugDirectLightAudit;
+    if (ImGui::Checkbox("Direct-light audit", &audit)) {
+        settings.debugDirectLightAudit = audit;
+        outNeedsReset = true;
+    }
+    DrawRestirHelpMarker("Enables the existing direct-light audit path for the selected debug pixel when supported.");
+#if PT_DEBUG_TOOLS
+    const bool debugPixelRelevant = settings.debugDirectLightAudit || settings.enablePathDebug;
+    ImGui::BeginDisabled(!debugPixelRelevant);
+    int pixelX = static_cast<int>(settings.debugPixelX);
+    int pixelY = static_cast<int>(settings.debugPixelY);
+    if (ImGui::InputInt("Debug Pixel X", &pixelX)) {
+        settings.debugPixelX = static_cast<uint32_t>(std::max(pixelX, 0));
+        outNeedsReset = true;
+    }
+    if (ImGui::InputInt("Debug Pixel Y", &pixelY)) {
+        settings.debugPixelY = static_cast<uint32_t>(std::max(pixelY, 0));
+        outNeedsReset = true;
+    }
+    ImGui::EndDisabled();
+    DrawRestirHelpMarker("Shared debug pixel used by direct-light audit and path-debug capture.");
+    if (!debugPixelRelevant) {
+        ImGui::TextDisabled("Enable direct-light audit or path debug to edit the shared debug pixel.");
+    }
+#else
+    ImGui::TextDisabled("Debug pixel controls require PT_DEBUG_TOOLS.");
+#endif
+
+    DrawRestirSectionLabel("Read-only Status");
+    ImGui::Text("RIS family active: %s", risActive ? "yes" : "no");
+    ImGui::Text("Spatial reuse active: %s", spatialActive ? "yes" : "no");
+    ImGui::Text("Temporal reuse active: %s", temporalActive ? "yes" : "no");
+    ImGui::Text("World reuse active: %s", worldActive ? "yes" : "no");
+    ImGui::Text("Hybrid ReGIR candidate source: %s",
+                mode == DirectLightMode::RestirDiRegirHybrid ? "yes" : "no");
+    ImGui::Text("Production GI active: %s",
+                settings.restirGiMode == RestirGiMode::DiffusePrototype ? "yes" : "no");
+    ImGui::Text("Production path guiding active: %s",
+                settings.pathGuidingMode == PathGuidingMode::Prototype ? "yes" : "no");
+    ImGui::Text("Guided samples: %llu used / %llu candidates",
+                static_cast<unsigned long long>(stats.pathGuidingUsedCount),
+                static_cast<unsigned long long>(stats.pathGuidingCandidateCount));
+    ImGui::Text("ReSTIR PT reservoirs: %llu updates / %llu candidates",
+                static_cast<unsigned long long>(stats.restirPtReservoirUpdateCount),
+                static_cast<unsigned long long>(stats.restirPtCandidateCount));
+    ImGui::Text("ReSTIR PT reuse: %llu applied / %llu candidates",
+                static_cast<unsigned long long>(stats.restirPtReuseAppliedCount),
+                static_cast<unsigned long long>(stats.restirPtReuseCandidateCount));
+#if PT_DEBUG_TOOLS
+    ImGui::Text("Path debug capture: %u / %u",
+                stats.debugPathEntryCount,
+                stats.debugPathMaxEntries);
+#endif
+    ImGui::Text("Internal resolution: %u x %u", stats.renderWidth, stats.renderHeight);
+    ImGui::TextDisabled("Persistent reservoir state is managed automatically; no manual cache control is exposed.");
 }
 
 namespace fs = std::filesystem;
@@ -60,23 +898,17 @@ struct CameraMatrices {
 CameraMatrices BuildCameraMatrices(const PathTracer::RenderSettings& settings,
                                    CGSize viewportSize) {
     CameraMatrices matrices{};
-    const float distance = std::max(settings.cameraDistance, 0.1f);
-    const float yaw = settings.cameraYaw;
-    const float pitch = settings.cameraPitch;
-    const float cosPitch = std::cos(pitch);
-    const float sinPitch = std::sin(pitch);
-    const float cosYaw = std::cos(yaw);
-    const float sinYaw = std::sin(yaw);
+    simd::float3 eye{};
+    simd::float3 forward{};
+    if (settings.cameraControlMode == PathTracer::RenderSettings::CameraControlMode::FirstPerson) {
+        eye = settings.firstPersonCameraPosition;
+        forward = simd::normalize(CameraForwardFromYawPitch(settings.cameraYaw,
+                                                            settings.cameraPitch));
+    } else {
+        eye = CameraOrbitEye(settings);
+        forward = simd::normalize(settings.cameraTarget - eye);
+    }
 
-    const simd::float3 lookAt = settings.cameraTarget;
-    const simd::float3 offset = {
-        distance * cosPitch * cosYaw,
-        distance * sinPitch,
-        distance * cosPitch * sinYaw
-    };
-    const simd::float3 eye = lookAt + offset;
-
-    const simd::float3 forward = simd::normalize(lookAt - eye);
     const simd::float3 upReference = {0.0f, 1.0f, 0.0f};
     simd::float3 right = simd::normalize(simd::cross(forward, upReference));
     if (!std::isfinite(right.x) || simd::length(right) < 1.0e-4f) {
@@ -569,11 +1401,88 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             ImGui::Text("Camera Motion: %s", stats.cameraMotionActive ? "Active" : "Idle");
             ImGui::Text("SPP / Min: %.1f", stats.samplesPerMinute);
             ImGui::Text("Progress: %s", "Infinite samples");
+            const char* executionLabel =
+                (stats.renderExecutionMode ==
+                 static_cast<uint32_t>(PathTracer::RenderSettings::ExecutionMode::Wavefront))
+                    ? "Wavefront"
+                    : "Megakernel";
+            ImGui::Text("Execution: %s", executionLabel);
             const char* intersectionLabel =
                 (stats.intersectionMode == static_cast<uint32_t>(PathTracerShaderTypes::IntersectionMode::HardwareRayTracing))
                     ? "Hardware Ray Tracing"
                     : "Software BVH";
             ImGui::Text("Intersection: %s", intersectionLabel);
+            if (stats.renderExecutionMode ==
+                static_cast<uint32_t>(PathTracer::RenderSettings::ExecutionMode::Wavefront)) {
+                static const char* kWavefrontPolicyLabels[] = {"Preview", "Final", "Offline", "Research"};
+                const uint32_t policyIndex =
+                    std::min<uint32_t>(stats.wavefrontSchedulingPolicy, 3u);
+                ImGui::Text("Wavefront Policy: %s compaction=%s compactDispatches=%llu",
+                            kWavefrontPolicyLabels[policyIndex],
+                            stats.wavefrontCompactionEnabled ? "on" : "off",
+                            static_cast<unsigned long long>(
+                                stats.wavefrontCompactQueueDispatchCount));
+                ImGui::Text("Wavefront Queues: active=%u next=%u shadow=%u terminated=%u overflow=%u",
+                            stats.wavefrontActiveRayCount,
+                            stats.wavefrontNextRayCount,
+                            stats.wavefrontShadowRayCount,
+                            stats.wavefrontTerminatedCount,
+                            stats.wavefrontOverflowFlag);
+                ImGui::Text("Wavefront Env Shadows: %u", stats.wavefrontEnvShadowRayCount);
+                ImGui::Text("Wavefront Termination: miss=%llu emissive=%llu maxDepth=%llu overflow=%llu",
+                            static_cast<unsigned long long>(stats.wavefrontTerminateMissCount),
+                            static_cast<unsigned long long>(stats.wavefrontTerminateEmissiveCount),
+                            static_cast<unsigned long long>(stats.wavefrontTerminateMaxDepthCount),
+                            static_cast<unsigned long long>(stats.wavefrontTerminateOverflowCount));
+                ImGui::Text("Wavefront AOV Valid: albedo=%u normal=%u",
+                            stats.wavefrontAovAlbedoValidCount,
+                            stats.wavefrontAovNormalValidCount);
+                static const char* kWavefrontQueueLabels[] = {
+                    "primary", "diffuse", "glossy", "specular",
+                    "transmission", "shadow", "material", "reservoir",
+                    "medium", "cache query", "cache train", "guiding train",
+                };
+                if (ImGui::TreeNode("Wavefront Typed Queue Occupancy")) {
+                    for (uint32_t i = 0u; i < PerformanceStats::kWavefrontQueueMetricCount; ++i) {
+                        ImGui::Text("%s: active=%u peak=%u cap=%u occ=%.2f%% peak=%.2f%% overflow=%u",
+                                    kWavefrontQueueLabels[i],
+                                    stats.wavefrontQueueActiveCounts[i],
+                                    stats.wavefrontQueuePeakActiveCounts[i],
+                                    stats.wavefrontQueueCapacities[i],
+                                    static_cast<float>(stats.wavefrontQueueOccupancyRatios[i] * 100.0),
+                                    static_cast<float>(stats.wavefrontQueuePeakOccupancyRatios[i] * 100.0),
+                                    stats.wavefrontQueueOverflowCounts[i]);
+                    }
+                    ImGui::Text("Compaction Cost: %.3f ms", stats.wavefrontQueueCompactionCostMs);
+                    ImGui::TreePop();
+                }
+                ImGui::Text("Wavefront Memory: active=%.2f next=%.2f hit=%.2f shadow=%.2f path=%.2f total=%.2f MiB",
+                            static_cast<float>(stats.wavefrontQueueBytesActive / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.wavefrontQueueBytesNext / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.wavefrontQueueBytesHit / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.wavefrontQueueBytesShadow / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.wavefrontQueueBytesPathState / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.wavefrontQueueBytesTotal / (1024.0 * 1024.0)));
+                if (stats.wavefrontBudgetBytes > 0u) {
+                    ImGui::Text("Wavefront Budget Usage: %.2f%% of recommendedMaxWorkingSetSize",
+                                static_cast<float>(stats.wavefrontBudgetUsagePercent));
+                }
+                ImGui::Text("Transport Memory: total=%.2f private=%.2f shared=%.2f staging=%.2f MiB",
+                            static_cast<float>(stats.transportMemoryBytesTotal / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.transportMemoryBytesPrivate / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.transportMemoryBytesShared / (1024.0 * 1024.0)),
+                            static_cast<float>(stats.transportMemoryBytesStaging / (1024.0 * 1024.0)));
+                ImGui::Text("Transport Records: %u invalidated=%u last=%s",
+                            stats.transportMemoryRecordCount,
+                            stats.transportMemoryInvalidatedRecordCount,
+                            HistoryResetReasonLabel(stats.transportMemoryLastInvalidationReason));
+                if (stats.restirDiInitializeDispatchCount > 0u ||
+                    stats.restirDiInitialCandidateDispatchCount > 0u ||
+                    stats.restirDiVisibilityDispatchCount > 0u) {
+                    ImGui::Text("Explicit ReSTIR DI trace path: %s",
+                                stats.restirDiHardwareTraceActive ? "hardware" : "software");
+                }
+            }
             if (stats.hardwareRayCount > 0) {
                 ImGui::Text("HW Rays: %llu (Hit %.2f%% / Miss %.2f%%)",
                             static_cast<unsigned long long>(stats.hardwareRayCount),
@@ -631,6 +1540,32 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Render Settings")) {
+            int executionMode = static_cast<int>(settings.executionMode);
+            const char* executionModes[] = {"Megakernel", "Wavefront"};
+            if (ImGui::Combo("Execution", &executionMode, executionModes, IM_ARRAYSIZE(executionModes))) {
+                executionMode = std::clamp(executionMode, 0, 1);
+                settings.executionMode = static_cast<RenderSettings::ExecutionMode>(executionMode);
+                outNeedsReset = true;
+            }
+            if (settings.executionMode == RenderSettings::ExecutionMode::Wavefront) {
+                int wavefrontPolicy = static_cast<int>(settings.wavefrontSchedulingPolicy);
+                const char* wavefrontPolicies[] = {"Preview", "Final", "Offline", "Research"};
+                if (ImGui::Combo("Wavefront Policy",
+                                 &wavefrontPolicy,
+                                 wavefrontPolicies,
+                                 IM_ARRAYSIZE(wavefrontPolicies))) {
+                    wavefrontPolicy = std::clamp(wavefrontPolicy, 0, 3);
+                    settings.wavefrontSchedulingPolicy =
+                        static_cast<RenderSettings::WavefrontSchedulingPolicy>(wavefrontPolicy);
+                    outNeedsReset = true;
+                }
+                bool compactionEnabled = settings.wavefrontCompactionEnabled;
+                if (ImGui::Checkbox("Wavefront Compaction", &compactionEnabled)) {
+                    settings.wavefrontCompactionEnabled = compactionEnabled;
+                    outNeedsReset = true;
+                }
+            }
+
             int samplesPerFrame = static_cast<int>(settings.samplesPerFrame);
             if (ImGui::SliderInt("Samples / Frame", &samplesPerFrame, 1, 16)) {
                 settings.samplesPerFrame = static_cast<uint32_t>(std::max(samplesPerFrame, 1));
@@ -653,6 +1588,9 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 ImGui::TextDisabled("Hardware ray tracing unavailable on this device");
             }
         }
+
+        DrawRestirPanel(settings, stats, outNeedsReset);
+        DrawRestirDebugPanel(settings, stats);
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Environment")) {
@@ -983,6 +1921,23 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
 
             ImGui::BeginDisabled(!settings.fireflyClampEnabled);
 
+            int clampMode = static_cast<int>(settings.fireflyClampMode);
+            const char* clampModes[] = {"Luminance", "Max Component"};
+            if (ImGui::Combo("Clamp Mode", &clampMode, clampModes, IM_ARRAYSIZE(clampModes))) {
+                clampMode = std::clamp(clampMode, 0, 1);
+                settings.fireflyClampMode = static_cast<RenderSettings::FireflyClampMode>(clampMode);
+                outNeedsReset = true;
+            }
+
+            float maxContribution = std::max(settings.fireflyClampMaxContribution, 0.1f);
+            if (ImGui::SliderFloat("Contribution Limit", &maxContribution, 0.1f, 1.0e6f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
+                settings.fireflyClampMaxContribution = std::max(maxContribution, 0.1f);
+                outNeedsReset = true;
+            }
+
+            ImGui::TextDisabled("Matches headless clamp controls: mode + per-sample contribution limit.");
+            ImGui::SeparatorText("Advanced");
+
             float clampFactor = settings.fireflyClampFactor;
             if (ImGui::SliderFloat("Clamp Factor", &clampFactor, 1.0f, 128.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
                 settings.fireflyClampFactor = std::clamp(clampFactor, 1.0f, 256.0f);
@@ -998,12 +1953,6 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             float throughputClamp = settings.throughputClamp;
             if (ImGui::SliderFloat("Throughput Clamp", &throughputClamp, 1.0f, 256.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
                 settings.throughputClamp = std::clamp(throughputClamp, 1.0f, 512.0f);
-                outNeedsReset = true;
-            }
-
-            float maxContribution = settings.fireflyClampMaxContribution;
-            if (ImGui::SliderFloat("Max Contribution", &maxContribution, 0.0f, 1.0e6f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
-                settings.fireflyClampMaxContribution = std::max(maxContribution, 0.0f);
                 outNeedsReset = true;
             }
 
@@ -1028,6 +1977,40 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             ImGui::TextDisabled("Higher clamp values reduce bias but may allow more fireflies.");
 
             ImGui::EndDisabled();
+        }
+
+        ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+        if (ImGui::CollapsingHeader("Production")) {
+            const char* profileLabels[] = {
+                "Custom",
+                "Preview",
+                "Lookdev",
+                "Final",
+                "Reference",
+                "Debug",
+            };
+            m_productionProfile =
+                std::clamp(m_productionProfile, 0, IM_ARRAYSIZE(profileLabels) - 1);
+            if (ImGui::Combo("Render Profile",
+                             &m_productionProfile,
+                             profileLabels,
+                             IM_ARRAYSIZE(profileLabels))) {
+                ApplyProductionProfile(m_productionProfile, settings);
+                outNeedsReset = true;
+            }
+            if (ImGui::Button("Apply Profile Defaults")) {
+                ApplyProductionProfile(m_productionProfile, settings);
+                outNeedsReset = true;
+            }
+            ImGui::SameLine();
+            ImGui::Text("Active: %s", ProductionProfileName(m_productionProfile));
+            ImGui::SeparatorText("Headless Parity");
+            ImGui::Text("CLI profile: --renderProfile=%s", ProductionProfileName(m_productionProfile));
+            ImGui::Text("Metadata sidecar: enabled by default in PathTracerHeadless");
+            ImGui::Text("Queue item: --renderQueueItemJson=<path> / --runRenderQueueItemJson=<path>");
+            ImGui::Text("Debug bundle: --debugBundleDir=<dir>");
+            ImGui::Text("Checkpoint: --checkpointManifestJson=<path> / --resumeCheckpointJson=<path>");
+            ImGui::Text("Tile plan: --tileManifestJson=<path> --tileSize=<w,h>");
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
@@ -1118,7 +2101,46 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+        if (ImGui::CollapsingHeader("Denoising (SVGF)")) {
+            bool svgfEnabled = settings.svgfDenoiseEnabled;
+            if (ImGui::Checkbox("Enable SVGF", &svgfEnabled)) {
+                settings.svgfDenoiseEnabled = svgfEnabled;
+            }
+
+            if (settings.svgfDenoiseEnabled) {
+                int iterations = static_cast<int>(settings.svgfAtrousIterations);
+                if (ImGui::SliderInt("A-Trous Iterations", &iterations, 1, 5)) {
+                    settings.svgfAtrousIterations =
+                        static_cast<uint32_t>(std::clamp(iterations, 1, 5));
+                }
+                ImGui::SliderFloat("Normal Sigma", &settings.svgfNormalSigma, 1.0f, 128.0f, "%.1f");
+                ImGui::SliderFloat("Albedo Sigma", &settings.svgfAlbedoSigma, 1.0f, 64.0f, "%.1f");
+                ImGui::SliderFloat("Luminance Sigma", &settings.svgfLuminanceSigma, 0.1f, 16.0f, "%.2f");
+                settings.svgfNormalSigma = std::max(settings.svgfNormalSigma, 1.0e-4f);
+                settings.svgfAlbedoSigma = std::max(settings.svgfAlbedoSigma, 1.0e-4f);
+                settings.svgfLuminanceSigma = std::max(settings.svgfLuminanceSigma, 1.0e-4f);
+            } else {
+                ImGui::TextDisabled("SVGF is currently disabled.");
+            }
+        }
+
+        ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Camera")) {
+            using CameraControlMode = PathTracer::RenderSettings::CameraControlMode;
+            int cameraMode = static_cast<int>(settings.cameraControlMode);
+            const char* cameraModes[] = {"Orbit", "First Person"};
+            if (ImGui::Combo("Control Mode", &cameraMode, cameraModes, 2)) {
+                CameraControlMode nextMode =
+                    (cameraMode == 1) ? CameraControlMode::FirstPerson : CameraControlMode::Orbit;
+                if (nextMode != settings.cameraControlMode) {
+                    if (nextMode == CameraControlMode::FirstPerson) {
+                        settings.firstPersonCameraPosition = CameraOrbitEye(settings);
+                    }
+                    settings.cameraControlMode = nextMode;
+                    outNeedsReset = true;
+                }
+            }
+
             float yawDegrees = WrapDegrees(settings.cameraYaw * kRadToDeg);
             if (ImGui::SliderFloat("Yaw (deg)", &yawDegrees, -180.0f, 180.0f, "%.1f")) {
                 settings.cameraYaw = yawDegrees * kDegToRad;
@@ -1128,6 +2150,23 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             if (ImGui::SliderFloat("Pitch (deg)", &pitchDegrees, -89.9f, 89.9f, "%.1f")) {
                 pitchDegrees = std::clamp(pitchDegrees, -89.9f, 89.9f);
                 settings.cameraPitch = pitchDegrees * kDegToRad;
+            }
+
+            if (settings.cameraControlMode == CameraControlMode::FirstPerson) {
+                float position[3] = {
+                    settings.firstPersonCameraPosition.x,
+                    settings.firstPersonCameraPosition.y,
+                    settings.firstPersonCameraPosition.z
+                };
+                if (ImGui::InputFloat3("Position", position, "%.3f")) {
+                    settings.firstPersonCameraPosition =
+                        simd_make_float3(position[0], position[1], position[2]);
+                    outNeedsReset = true;
+                }
+                float speed = settings.firstPersonMoveSpeed;
+                if (ImGui::SliderFloat("Move Speed", &speed, 0.1f, 50.0f, "%.2f")) {
+                    settings.firstPersonMoveSpeed = std::max(speed, 0.01f);
+                }
             }
 
             float vfov = settings.cameraVerticalFov;

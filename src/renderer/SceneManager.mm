@@ -1,5 +1,6 @@
 #import "renderer/SceneManager.h"
 
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #include <TargetConditionals.h>
 
@@ -8,6 +9,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -40,10 +42,119 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr float kDefaultCarpaintBaseEta[3] = {1.3456f, 0.9652f, 0.6172f};
 constexpr float kDefaultCarpaintBaseK[3] = {7.4746f, 6.3995f, 5.3031f};
 
+bool SceneLoadDiagnosticsEnabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("PT_SCENE_LOAD_DIAGNOSTICS");
+        if (!value || !*value) {
+            return false;
+        }
+        return std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "FALSE") != 0 &&
+               std::strcmp(value, "no") != 0 &&
+               std::strcmp(value, "NO") != 0;
+    }();
+    return enabled;
+}
+
+bool SceneLoadDiagnosticsVerboseEnabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("PT_SCENE_LOAD_DIAGNOSTICS_VERBOSE");
+        if (!value || !*value) {
+            return false;
+        }
+        return std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "FALSE") != 0 &&
+               std::strcmp(value, "no") != 0 &&
+               std::strcmp(value, "NO") != 0;
+    }();
+    return SceneLoadDiagnosticsEnabled() && enabled;
+}
+
+struct MeshDirectiveStats {
+    uint32_t meshCount = 0u;
+    uint64_t vertexCount = 0u;
+    uint64_t indexCount = 0u;
+    uint64_t triangleCount = 0u;
+};
+
+MeshDirectiveStats CollectMeshDirectiveStats(const SceneResources& resources) {
+    MeshDirectiveStats stats{};
+    const auto& meshes = resources.meshes();
+    stats.meshCount = static_cast<uint32_t>(meshes.size());
+    for (const auto& mesh : meshes) {
+        stats.vertexCount += static_cast<uint64_t>(mesh.vertices.size());
+        stats.indexCount += static_cast<uint64_t>(mesh.indices.size());
+    }
+    stats.triangleCount = stats.indexCount / 3u;
+    return stats;
+}
+
+void DeriveOrbitCameraFromPositionTarget(RenderSettings& settings,
+                                         const simd::float3& position,
+                                         const simd::float3& target) {
+    const simd::float3 offset = position - target;
+    const float distanceSq = simd::dot(offset, offset);
+    if (!(distanceSq > 1.0e-12f) || !std::isfinite(distanceSq)) {
+        return;
+    }
+
+    const float horizontalDistance =
+        std::sqrt(std::max(offset.x * offset.x + offset.z * offset.z, 0.0f));
+    settings.cameraTarget = target;
+    settings.cameraDistance = std::sqrt(distanceSq);
+    settings.cameraYaw = std::atan2(offset.z, offset.x);
+    settings.cameraPitch = std::atan2(offset.y, horizontalDistance);
+    settings.firstPersonCameraPosition = position;
+}
+
+void PumpMainThreadEventsBriefly() {
+    if (![NSThread isMainThread]) {
+        return;
+    }
+    NSApplication* app = [NSApplication sharedApplication];
+    if (!app) {
+        return;
+    }
+    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:0.001];
+    NSArray<NSString*>* modes = @[
+        NSDefaultRunLoopMode,
+        NSEventTrackingRunLoopMode,
+        NSModalPanelRunLoopMode
+    ];
+    for (NSString* mode in modes) {
+        while (true) {
+            NSEvent* event = [app nextEventMatchingMask:NSEventMaskAny
+                                              untilDate:deadline
+                                                 inMode:mode
+                                                dequeue:YES];
+            if (!event) {
+                break;
+            }
+            [app sendEvent:event];
+        }
+    }
+}
+
+inline void PumpEventsEvery(size_t counter, size_t interval = 16384u) {
+    if (counter > 0u && (counter % interval) == 0u) {
+        PumpMainThreadEventsBriefly();
+    }
+}
+
 struct LoadedMeshData {
     std::vector<SceneResources::MeshVertex> vertices;
     std::vector<uint32_t> indices;
 };
+
+// Per-thread cache for repeated mesh path directives within a single scene load.
+// Cleared when a new parse begins.
+thread_local std::unordered_map<std::string, std::shared_ptr<LoadedMeshData>> gSceneMeshLoadCache;
+
+inline void ClearSceneMeshLoadCache() {
+    gSceneMeshLoadCache.clear();
+}
 
 struct VertexKey {
     int position = -1;
@@ -145,6 +256,7 @@ static bool LoadObjMesh(const fs::path& filePath,
         }
 
         for (const auto& index : mesh.indices) {
+            PumpEventsEvery(outMesh.indices.size());
             if (index.vertex_index < 0) {
                 errorMessage = "OBJ references a position index that is out of range";
                 return false;
@@ -289,6 +401,7 @@ static bool LoadPlyMesh(const fs::path& filePath,
 
         outMesh.vertices.resize(vertexCount);
         for (size_t i = 0; i < vertexCount; ++i) {
+            PumpEventsEvery(i);
             const ValueType x = src[i * 3 + 0];
             const ValueType y = src[i * 3 + 1];
             const ValueType z = src[i * 3 + 2];
@@ -334,6 +447,7 @@ static bool LoadPlyMesh(const fs::path& filePath,
                 return false;
             }
             for (size_t i = 0; i < vertexCount; ++i) {
+                PumpEventsEvery(i);
                 const ValueType nx = src[i * 3 + 0];
                 const ValueType ny = src[i * 3 + 1];
                 const ValueType nz = src[i * 3 + 2];
@@ -376,6 +490,7 @@ static bool LoadPlyMesh(const fs::path& filePath,
                 return false;
             }
             for (size_t i = 0; i < vertexCount; ++i) {
+                PumpEventsEvery(i);
                 const ValueType u = src[i * 2 + 0];
                 const ValueType v = src[i * 2 + 1];
                 outMesh.vertices[i].uv = simd_make_float2(static_cast<float>(u),
@@ -432,6 +547,7 @@ static bool LoadPlyMesh(const fs::path& filePath,
 
         size_t offset = 0;
         for (size_t face = 0; face < faceCount; ++face) {
+            PumpEventsEvery(face, 2048u);
             IndexType first = src[offset + 0];
             if constexpr (std::is_signed_v<IndexType>) {
                 if (first < 0) {
@@ -568,6 +684,40 @@ static simd::float4x4 ComposeTransform(const simd::float3& translation,
 }
 
 std::optional<fs::path> ResolveDefaultScenesDirectory() {
+    // Prefer repo-root assets during development to avoid stale copied assets
+    // inside build directories.
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    if (!ec) {
+        // Walk up ancestors and prefer the first directory that looks like the repo root.
+        for (fs::path probe = cwd; !probe.empty(); probe = probe.parent_path()) {
+            fs::path gitMarker = probe / ".git";
+            fs::path assetsDir = probe / "assets";
+            if (fs::exists(gitMarker, ec) &&
+                fs::exists(assetsDir, ec) &&
+                fs::is_directory(assetsDir, ec)) {
+                fs::path canonical = fs::canonical(assetsDir, ec);
+                if (!ec) {
+                    return canonical;
+                }
+                ec.clear();
+            }
+            fs::path parent = probe.parent_path();
+            if (parent == probe) {
+                break;
+            }
+        }
+
+        // Fallback: use cwd/assets.
+        fs::path candidate = cwd / "assets";
+        if (fs::exists(candidate, ec) && fs::is_directory(candidate, ec)) {
+            fs::path canonical = fs::canonical(candidate, ec);
+            if (!ec) {
+                return canonical;
+            }
+        }
+    }
+
 #if TARGET_OS_OSX
     @autoreleasepool {
         NSBundle* bundle = [NSBundle mainBundle];
@@ -588,17 +738,6 @@ std::optional<fs::path> ResolveDefaultScenesDirectory() {
     }
 #endif
 
-    std::error_code ec;
-    fs::path cwd = fs::current_path(ec);
-    if (!ec) {
-        fs::path candidate = cwd / "assets";
-        if (fs::exists(candidate, ec) && fs::is_directory(candidate, ec)) {
-            fs::path canonical = fs::canonical(candidate, ec);
-            if (!ec) {
-                return canonical;
-            }
-        }
-    }
     return std::nullopt;
 }
 
@@ -678,6 +817,37 @@ bool SceneManager::loadSceneFromPath(const std::string& path,
                                      SceneResources& resources,
                                      RenderSettings& inOutSettings,
                                      std::string* errorMessage) {
+    StagedLoadState state{};
+    std::string beginError;
+    if (!beginStagedLoadSceneFromPath(path, resources, inOutSettings, state, &beginError)) {
+        if (errorMessage) {
+            *errorMessage = beginError;
+        }
+        return false;
+    }
+
+    std::string continueError;
+    while (true) {
+        const StagedLoadStatus status =
+            continueStagedLoadScene(state, resources, inOutSettings, std::numeric_limits<size_t>::max(), &continueError);
+        if (status == StagedLoadStatus::Complete) {
+            return true;
+        }
+        if (status == StagedLoadStatus::Failed) {
+            resources.clear();
+            if (errorMessage) {
+                *errorMessage = "Failed parsing scene '" + path + "': " + continueError;
+            }
+            return false;
+        }
+    }
+}
+
+bool SceneManager::beginStagedLoadSceneFromPath(const std::string& path,
+                                                SceneResources& resources,
+                                                RenderSettings& inOutSettings,
+                                                StagedLoadState& state,
+                                                std::string* errorMessage) {
     std::ifstream stream(path);
     if (!stream.is_open()) {
         if (errorMessage) {
@@ -686,39 +856,205 @@ bool SceneManager::loadSceneFromPath(const std::string& path,
         return false;
     }
 
+    ClearSceneMeshLoadCache();
     resources.clear();
-    RenderSettings parsedSettings = inOutSettings;
+    state = StagedLoadState{};
+    state.scenePath = path;
+    state.sceneDirectoryOverride = m_sceneDirectory;
+    state.parsedSettings = inOutSettings;
     const RenderSettings defaults{};
-    parsedSettings.cameraVerticalFov = defaults.cameraVerticalFov;
-    parsedSettings.cameraDefocusAngle = defaults.cameraDefocusAngle;
-    parsedSettings.cameraFocusDistance = defaults.cameraFocusDistance;
-    parsedSettings.backgroundMode = defaults.backgroundMode;
-    parsedSettings.backgroundColor = defaults.backgroundColor;
-    parsedSettings.environmentMapPath = defaults.environmentMapPath;
-    parsedSettings.environmentRotation = defaults.environmentRotation;
-    parsedSettings.environmentIntensity = defaults.environmentIntensity;
-    parsedSettings.fireflyClampEnabled = defaults.fireflyClampEnabled;
-    parsedSettings.fireflyClampFactor = defaults.fireflyClampFactor;
-    parsedSettings.fireflyClampFloor = defaults.fireflyClampFloor;
-    parsedSettings.throughputClamp = defaults.throughputClamp;
-    parsedSettings.specularTailClampBase = defaults.specularTailClampBase;
-    parsedSettings.specularTailClampRoughnessScale = defaults.specularTailClampRoughnessScale;
-    parsedSettings.minSpecularPdf = defaults.minSpecularPdf;
-    parsedSettings.renderWidth = defaults.renderWidth;
-    parsedSettings.renderHeight = defaults.renderHeight;
-    parsedSettings.enableSoftwareRayTracing = defaults.enableSoftwareRayTracing;
+    state.parsedSettings.cameraControlMode = defaults.cameraControlMode;
+    state.parsedSettings.firstPersonCameraPosition = defaults.firstPersonCameraPosition;
+    state.parsedSettings.firstPersonMoveSpeed = defaults.firstPersonMoveSpeed;
+    state.parsedSettings.cameraVerticalFov = defaults.cameraVerticalFov;
+    state.parsedSettings.cameraDefocusAngle = defaults.cameraDefocusAngle;
+    state.parsedSettings.cameraFocusDistance = defaults.cameraFocusDistance;
+    state.parsedSettings.explicitCameraEnabled = defaults.explicitCameraEnabled;
+    state.parsedSettings.explicitCameraPosition = defaults.explicitCameraPosition;
+    state.parsedSettings.explicitCameraForward = defaults.explicitCameraForward;
+    state.parsedSettings.explicitCameraUp = defaults.explicitCameraUp;
+    state.parsedSettings.backgroundMode = defaults.backgroundMode;
+    state.parsedSettings.backgroundColor = defaults.backgroundColor;
+    state.parsedSettings.environmentMapPath = defaults.environmentMapPath;
+    state.parsedSettings.environmentRotation = defaults.environmentRotation;
+    state.parsedSettings.environmentIntensity = defaults.environmentIntensity;
+    state.parsedSettings.fireflyClampEnabled = defaults.fireflyClampEnabled;
+    state.parsedSettings.fireflyClampFactor = defaults.fireflyClampFactor;
+    state.parsedSettings.fireflyClampFloor = defaults.fireflyClampFloor;
+    state.parsedSettings.throughputClamp = defaults.throughputClamp;
+    state.parsedSettings.specularTailClampBase = defaults.specularTailClampBase;
+    state.parsedSettings.specularTailClampRoughnessScale = defaults.specularTailClampRoughnessScale;
+    state.parsedSettings.minSpecularPdf = defaults.minSpecularPdf;
+    state.parsedSettings.renderWidth = defaults.renderWidth;
+    state.parsedSettings.renderHeight = defaults.renderHeight;
+    state.parsedSettings.enableSoftwareRayTracing = defaults.enableSoftwareRayTracing;
 
-    std::string parseError;
-    if (!parseScene(stream, resources, parsedSettings, parseError)) {
-        resources.clear();
-        if (errorMessage) {
-            *errorMessage = "Failed parsing scene '" + path + "': " + parseError;
+    std::string line;
+    size_t lineNumber = 0;
+    std::string pending;
+    size_t pendingStartLine = 0;
+    while (std::getline(stream, line)) {
+        ++lineNumber;
+        std::string trimmed = trim(line);
+        if (trimmed.empty() || trimmed[0] == '#') {
+            if (!pending.empty()) {
+                state.directives.emplace_back(pendingStartLine == 0 ? lineNumber : pendingStartLine, pending);
+                pending.clear();
+                pendingStartLine = 0;
+            }
+            continue;
         }
-        return false;
+
+        bool continuation = false;
+        if (!trimmed.empty() && trimmed.back() == '\\') {
+            continuation = true;
+            trimmed.pop_back();
+            trimmed = trim(trimmed);
+        }
+
+        if (!trimmed.empty()) {
+            if (pending.empty()) {
+                pending = trimmed;
+                pendingStartLine = lineNumber;
+            } else {
+                pending.append(" ");
+                pending.append(trimmed);
+            }
+        }
+
+        if (!continuation && !pending.empty()) {
+            state.directives.emplace_back(pendingStartLine, pending);
+            pending.clear();
+            pendingStartLine = 0;
+        }
     }
 
-    inOutSettings = parsedSettings;
+    if (!pending.empty()) {
+        state.directives.emplace_back(pendingStartLine == 0 ? lineNumber : pendingStartLine, pending);
+    }
+
+    if (SceneLoadDiagnosticsEnabled()) {
+        std::fprintf(stderr,
+                     "[SceneDiag] beginParse scene='%s' directives=%zu\n",
+                     path.c_str(),
+                     state.directives.size());
+    }
+
     return true;
+}
+
+SceneManager::StagedLoadStatus SceneManager::continueStagedLoadScene(StagedLoadState& state,
+                                                                     SceneResources& resources,
+                                                                     RenderSettings& inOutSettings,
+                                                                     size_t maxDirectives,
+                                                                     std::string* errorMessage) const {
+    auto flushDirective = [&](const std::string& content, size_t startLine, std::string& localError) -> bool {
+        if (content.empty()) {
+            return true;
+        }
+
+        auto tokens = tokenize(content);
+        auto keywordIt = tokens.find(kKeywordToken);
+        if (keywordIt == tokens.end()) {
+            return true;
+        }
+
+        const std::string& keyword = keywordIt->second;
+        bool success = false;
+
+        if (keyword == "camera") {
+            success = parseCamera(tokens, state.parsedSettings, localError);
+            if (success) {
+                state.sawExplicitCameraDirective = true;
+            }
+        } else if (keyword == "renderer") {
+            success = parseRenderer(tokens, state.parsedSettings, localError);
+        } else if (keyword == "background") {
+            success = parseBackground(tokens, state.parsedSettings, localError, state.sceneDirectoryOverride);
+        } else if (keyword == "material") {
+            success = parseMaterial(tokens,
+                                    resources,
+                                    localError,
+                                    state.materialIndicesByName,
+                                    state.sceneDirectoryOverride);
+        } else if (keyword == "sphere") {
+            success = parseSphere(tokens, resources, localError);
+        } else if (keyword == "box") {
+            success = parseBox(tokens, resources, localError);
+        } else if (keyword == "rectangle" || keyword == "rect") {
+            success = parseRectangle(tokens, resources, localError);
+        } else if (keyword == "disk") {
+            success = parseDisk(tokens, resources, localError);
+        } else if (keyword == "sun" || keyword == "directional" || keyword == "distant") {
+            success = parseDirectionalLight(tokens, resources, localError);
+        } else if (keyword == "mesh") {
+            success = parseMesh(tokens,
+                                resources,
+                                localError,
+                                state.parsedSettings,
+                                !state.sawExplicitCameraDirective,
+                                state.sceneDirectoryOverride,
+                                state.materialIndicesByName);
+        } else {
+            return true;
+        }
+
+        if (!success) {
+            std::ostringstream oss;
+            oss << "line " << startLine << ": " << localError;
+            localError = oss.str();
+        }
+        return success;
+    };
+
+    if (state.nextDirective >= state.directives.size()) {
+        inOutSettings = state.parsedSettings;
+        if (SceneLoadDiagnosticsEnabled()) {
+            const MeshDirectiveStats stats = CollectMeshDirectiveStats(resources);
+            std::fprintf(stderr,
+                         "[SceneDiag] parseComplete scene='%s' materials=%u meshes=%u vertices=%llu indices=%llu triangles=%llu\n",
+                         state.scenePath.c_str(),
+                         resources.materialCount(),
+                         stats.meshCount,
+                         static_cast<unsigned long long>(stats.vertexCount),
+                         static_cast<unsigned long long>(stats.indexCount),
+                         static_cast<unsigned long long>(stats.triangleCount));
+        }
+        return StagedLoadStatus::Complete;
+    }
+
+    const size_t limit = std::max<size_t>(1u, maxDirectives);
+    size_t processed = 0u;
+    while (state.nextDirective < state.directives.size() && processed < limit) {
+        const auto& directive = state.directives[state.nextDirective];
+        std::string localError;
+        if (!flushDirective(directive.second, directive.first, localError)) {
+            if (errorMessage) {
+                *errorMessage = localError;
+            }
+            return StagedLoadStatus::Failed;
+        }
+        ++state.nextDirective;
+        ++processed;
+    }
+
+    if (state.nextDirective >= state.directives.size()) {
+        inOutSettings = state.parsedSettings;
+        if (SceneLoadDiagnosticsEnabled()) {
+            const MeshDirectiveStats stats = CollectMeshDirectiveStats(resources);
+            std::fprintf(stderr,
+                         "[SceneDiag] parseComplete scene='%s' materials=%u meshes=%u vertices=%llu indices=%llu triangles=%llu\n",
+                         state.scenePath.c_str(),
+                         resources.materialCount(),
+                         stats.meshCount,
+                         static_cast<unsigned long long>(stats.vertexCount),
+                         static_cast<unsigned long long>(stats.indexCount),
+                         static_cast<unsigned long long>(stats.triangleCount));
+        }
+        return StagedLoadStatus::Complete;
+    }
+
+    return StagedLoadStatus::InProgress;
 }
 
 bool SceneManager::discoverScenes(std::string* errorMessage) {
@@ -792,6 +1128,8 @@ bool SceneManager::parseScene(std::istream& stream,
                               SceneResources& resources,
                               RenderSettings& inOutSettings,
                               std::string& errorMessage) const {
+    ClearSceneMeshLoadCache();
+
     std::string line;
     size_t lineNumber = 0;
     std::string pending;
@@ -824,13 +1162,21 @@ bool SceneManager::parseScene(std::istream& stream,
         } else if (keyword == "background") {
             success = parseBackground(tokens, inOutSettings, localError, m_sceneDirectory);
         } else if (keyword == "material") {
-            success = parseMaterial(tokens, resources, localError, materialIndicesByName);
+            success = parseMaterial(tokens,
+                                    resources,
+                                    localError,
+                                    materialIndicesByName,
+                                    m_sceneDirectory);
         } else if (keyword == "sphere") {
             success = parseSphere(tokens, resources, localError);
         } else if (keyword == "box") {
             success = parseBox(tokens, resources, localError);
         } else if (keyword == "rectangle" || keyword == "rect") {
             success = parseRectangle(tokens, resources, localError);
+        } else if (keyword == "disk") {
+            success = parseDisk(tokens, resources, localError);
+        } else if (keyword == "sun" || keyword == "directional" || keyword == "distant") {
+            success = parseDirectionalLight(tokens, resources, localError);
         } else if (keyword == "mesh") {
             success = parseMesh(tokens,
                                 resources,
@@ -991,6 +1337,30 @@ bool SceneManager::parseUInt(const std::string& value, uint32_t& out) {
     return true;
 }
 
+bool SceneManager::parseFloat2(const std::string& value, simd::float2& out) {
+    std::istringstream stream(value);
+    std::string component;
+    float components[2] = {0.0f, 0.0f};
+    int index = 0;
+
+    while (std::getline(stream, component, ',')) {
+        if (index >= 2) {
+            return false;
+        }
+        if (!parseFloat(component, components[index])) {
+            return false;
+        }
+        ++index;
+    }
+
+    if (index != 2) {
+        return false;
+    }
+
+    out = simd_make_float2(components[0], components[1]);
+    return true;
+}
+
 bool SceneManager::parseFloat3(const std::string& value, simd::float3& out) {
     std::istringstream stream(value);
     std::string component;
@@ -1087,6 +1457,10 @@ bool SceneManager::parseMaterialType(const std::string& value,
         out = PathTracerShaderTypes::MaterialType::CarPaint;
         return true;
     }
+    if (lower == "pbr" || lower == "pbr_mr" || lower == "pbrmetallicroughness") {
+        out = PathTracerShaderTypes::MaterialType::PbrMetallicRoughness;
+        return true;
+    }
 
     return false;
 }
@@ -1094,6 +1468,42 @@ bool SceneManager::parseMaterialType(const std::string& value,
 bool SceneManager::parseCamera(const std::unordered_map<std::string, std::string>& tokens,
                                RenderSettings& inOutSettings,
                                std::string& errorMessage) {
+    bool explicitCameraTokenSeen = false;
+    bool explicitPositionSeen = false;
+    bool explicitForwardSeen = false;
+    bool explicitTargetSeen = false;
+    if (auto it = tokens.find("position"); it != tokens.end()) {
+        simd::float3 position{};
+        if (!parseFloat3(it->second, position)) {
+            errorMessage = "camera position expects three comma-separated floats";
+            return false;
+        }
+        inOutSettings.explicitCameraPosition = position;
+        explicitPositionSeen = true;
+        explicitCameraTokenSeen = true;
+    }
+
+    if (auto it = tokens.find("forward"); it != tokens.end()) {
+        simd::float3 forward{};
+        if (!parseFloat3(it->second, forward)) {
+            errorMessage = "camera forward expects three comma-separated floats";
+            return false;
+        }
+        inOutSettings.explicitCameraForward = forward;
+        explicitForwardSeen = true;
+        explicitCameraTokenSeen = true;
+    }
+
+    if (auto it = tokens.find("up"); it != tokens.end()) {
+        simd::float3 up{};
+        if (!parseFloat3(it->second, up)) {
+            errorMessage = "camera up expects three comma-separated floats";
+            return false;
+        }
+        inOutSettings.explicitCameraUp = up;
+        explicitCameraTokenSeen = true;
+    }
+
     if (auto it = tokens.find("target"); it != tokens.end()) {
         simd::float3 target{};
         if (!parseFloat3(it->second, target)) {
@@ -1101,6 +1511,7 @@ bool SceneManager::parseCamera(const std::unordered_map<std::string, std::string
             return false;
         }
         inOutSettings.cameraTarget = target;
+        explicitTargetSeen = true;
     }
 
     if (auto it = tokens.find("distance"); it != tokens.end()) {
@@ -1146,6 +1557,26 @@ bool SceneManager::parseCamera(const std::unordered_map<std::string, std::string
             return false;
         }
         inOutSettings.cameraDefocusAngle = std::max(defocus, 0.0f);
+    }
+
+    if (explicitPositionSeen && explicitTargetSeen && !explicitForwardSeen) {
+        const simd::float3 forward =
+            inOutSettings.cameraTarget - inOutSettings.explicitCameraPosition;
+        const float forwardLenSq = simd::dot(forward, forward);
+        if (forwardLenSq > 1.0e-12f && std::isfinite(forwardLenSq)) {
+            inOutSettings.explicitCameraForward = forward / std::sqrt(forwardLenSq);
+        }
+        explicitCameraTokenSeen = true;
+    }
+
+    if (explicitPositionSeen && explicitTargetSeen) {
+        DeriveOrbitCameraFromPositionTarget(inOutSettings,
+                                            inOutSettings.explicitCameraPosition,
+                                            inOutSettings.cameraTarget);
+    }
+
+    if (explicitCameraTokenSeen) {
+        inOutSettings.explicitCameraEnabled = true;
     }
 
     if (auto it = tokens.find("focusDist"); it != tokens.end()) {
@@ -1262,6 +1693,35 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
         inOutSettings.enableRussianRoulette = (flag != 0);
     }
 
+    auto parseExecutionMode = [&](const std::string& tokenName) -> bool {
+        auto itTok = tokens.find(tokenName);
+        if (itTok == tokens.end()) {
+            return true;
+        }
+        std::string lower;
+        lower.reserve(itTok->second.size());
+        for (char ch : itTok->second) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lower == "0" || lower == "megakernel" || lower == "legacy" || lower == "path") {
+            inOutSettings.executionMode = RenderSettings::ExecutionMode::Megakernel;
+            return true;
+        }
+        if (lower == "1" || lower == "wavefront") {
+            inOutSettings.executionMode = RenderSettings::ExecutionMode::Wavefront;
+            return true;
+        }
+        errorMessage = "renderer " + tokenName + " expects megakernel or wavefront";
+        return false;
+    };
+
+    if (!parseExecutionMode("renderMode")) {
+        return false;
+    }
+    if (!parseExecutionMode("executionMode")) {
+        return false;
+    }
+
     if (auto it = tokens.find("acesVariant"); it != tokens.end()) {
         uint32_t variant = 0;
         if (!parseUInt(it->second, variant)) {
@@ -1329,6 +1789,22 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
             return false;
         }
         inOutSettings.fireflyClampEnabled = (flag != 0);
+    }
+
+    if (auto it = tokens.find("fireflyClampMode"); it != tokens.end()) {
+        std::string lower;
+        lower.reserve(it->second.size());
+        for (char ch : it->second) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lower == "luminance") {
+            inOutSettings.fireflyClampMode = RenderSettings::FireflyClampMode::Luminance;
+        } else if (lower == "maxcomponent") {
+            inOutSettings.fireflyClampMode = RenderSettings::FireflyClampMode::MaxComponent;
+        } else {
+            errorMessage = "renderer fireflyClampMode expects luminance or maxcomponent";
+            return false;
+        }
     }
 
     if (auto it = tokens.find("fireflyClampFactor"); it != tokens.end()) {
@@ -1451,6 +1927,12 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
         return false;
     }
     if (!parseBoolRendererToken("gltfCompatLinearEmissive", inOutSettings.gltfCompatForceLinearEmissive)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfCompatFlipTexcoordV", inOutSettings.gltfCompatFlipTexcoordV)) {
+        return false;
+    }
+    if (!parseBoolRendererToken("gltfFlipTexcoordV", inOutSettings.gltfCompatFlipTexcoordV)) {
         return false;
     }
     if (!parseBoolRendererToken("debugShowBaseColor", inOutSettings.debugShowBaseColor)) {
@@ -1598,7 +2080,8 @@ bool SceneManager::parseBackground(const std::unordered_map<std::string, std::st
 bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::string>& tokens,
                                  SceneResources& resources,
                                  std::string& errorMessage,
-                                 std::unordered_map<std::string, uint32_t>& materialIndicesByName) {
+                                 std::unordered_map<std::string, uint32_t>& materialIndicesByName,
+                                 const std::string& sceneDirectory) {
     auto typeIt = tokens.find("type");
     if (typeIt == tokens.end()) {
         errorMessage = "material requires a type token";
@@ -1625,6 +2108,29 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
     } else if (auto itColor = tokens.find("color"); itColor != tokens.end()) {
         if (!parseFloat3(itColor->second, baseColor)) {
             errorMessage = "material color expects three floats";
+            return false;
+        }
+    }
+
+    std::string baseColorTexturePath;
+    if (auto it = tokens.find("baseColorTexture"); it != tokens.end()) {
+        baseColorTexturePath = it->second;
+    } else if (auto it = tokens.find("albedoTexture"); it != tokens.end()) {
+        baseColorTexturePath = it->second;
+    } else if (auto it = tokens.find("texture"); it != tokens.end()) {
+        baseColorTexturePath = it->second;
+    }
+    simd::float2 baseColorUvScale = simd_make_float2(1.0f, 1.0f);
+    simd::float2 baseColorUvOffset = simd_make_float2(0.0f, 0.0f);
+    if (auto it = tokens.find("uvScale"); it != tokens.end()) {
+        if (!parseFloat2(it->second, baseColorUvScale)) {
+            errorMessage = "material uvScale expects two floats";
+            return false;
+        }
+    }
+    if (auto it = tokens.find("uvOffset"); it != tokens.end()) {
+        if (!parseFloat2(it->second, baseColorUvOffset)) {
+            errorMessage = "material uvOffset expects two floats";
             return false;
         }
     }
@@ -2055,6 +2561,7 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
         }
         sssSigmaOverrideValue = sssSigmaAProvided && sssSigmaSProvided;
         sssMeanFreePathValue = std::max(sssMeanFreePathValue, 1.0e-4f);
+
     }
 
     simd::float3 dielectricSigmaAValue = simd_make_float3(0.0f, 0.0f, 0.0f);
@@ -2123,6 +2630,60 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
                           carpaintBaseTintValue,
                           thinDielectric,
                           materialName);
+
+    if (!baseColorTexturePath.empty()) {
+        fs::path texturePath(baseColorTexturePath);
+        if (texturePath.is_relative()) {
+            texturePath = fs::path(sceneDirectory) / texturePath;
+        }
+        std::error_code textureEc;
+        fs::path textureCanonical = fs::weakly_canonical(texturePath, textureEc);
+        if (textureEc || !fs::exists(textureCanonical, textureEc)) {
+            errorMessage = "material baseColorTexture not found: " + texturePath.string();
+            return false;
+        }
+
+        std::string textureError;
+        PathTracer::TextureLoadStatus textureStatus = PathTracer::TextureLoadStatus::Failed;
+        uint32_t textureIndex = resources.addMaterialTextureFromFile(textureCanonical.string(),
+                                                                     /*srgb=*/true,
+                                                                     &textureError,
+                                                                     nullptr,
+                                                                     PathTracer::MaterialTextureSemantic::BaseColor,
+                                                                     &textureStatus);
+        if (textureIndex == 0xFFFFFFFFu) {
+            if (textureStatus == PathTracer::TextureLoadStatus::SkippedByPolicy) {
+                textureIndex = 0xFFFFFFFFu;
+            } else {
+                errorMessage = textureError.empty()
+                    ? "failed to load material baseColorTexture"
+                    : textureError;
+                return false;
+            }
+        }
+
+        if (textureIndex != 0xFFFFFFFFu) {
+            const auto* materials = resources.materialsData();
+            if (!materials || materialIndex >= resources.materialCount()) {
+                errorMessage = "internal error while assigning material texture";
+                return false;
+            }
+
+            auto updated = materials[materialIndex];
+            updated.textureIndices0.x = textureIndex;
+            updated.textureUvSet0.x = 0u;
+            updated.textureTransform0 = simd_make_float4(baseColorUvScale.x, 0.0f, baseColorUvOffset.x, 0.0f);
+            updated.textureTransform1 = simd_make_float4(0.0f, baseColorUvScale.y, baseColorUvOffset.y, 0.0f);
+            if (type == PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) {
+                updated.pbrParams.x = 0.0f;
+                updated.pbrParams.y = std::max(roughness, 1.0e-4f);
+            }
+            if (!resources.updateMaterial(materialIndex, updated)) {
+                errorMessage = "failed to update textured material";
+                return false;
+            }
+        }
+    }
 
     if (!materialName.empty()) {
         materialIndicesByName[materialName] = materialIndex;
@@ -2359,6 +2920,170 @@ bool SceneManager::parseRectangle(const std::unordered_map<std::string, std::str
     return true;
 }
 
+bool SceneManager::parseDisk(const std::unordered_map<std::string, std::string>& tokens,
+                             SceneResources& resources,
+                             std::string& errorMessage) {
+    auto materialIt = tokens.find("material");
+    if (materialIt == tokens.end()) {
+        errorMessage = "disk requires a material token";
+        return false;
+    }
+
+    uint32_t materialIndex = 0;
+    if (!parseUInt(materialIt->second, materialIndex)) {
+        errorMessage = "disk material expects an integer index";
+        return false;
+    }
+    if (materialIndex >= resources.materialCount()) {
+        errorMessage = "disk references material index that has not been defined yet";
+        return false;
+    }
+
+    const char* axisLabels[3] = {"x", "y", "z"};
+    simd::float3 center = simd_make_float3(0.0f, 0.0f, 0.0f);
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        auto it = tokens.find(axisLabels[axis]);
+        if (it == tokens.end()) {
+            std::ostringstream oss;
+            oss << "disk requires " << axisLabels[axis] << " token";
+            errorMessage = oss.str();
+            return false;
+        }
+        float valueMin = 0.0f;
+        float valueMax = 0.0f;
+        bool isFixed = false;
+        if (!parseFloatRange(it->second, valueMin, valueMax, isFixed) || !isFixed) {
+            std::ostringstream oss;
+            oss << "disk " << axisLabels[axis] << " expects a single float";
+            errorMessage = oss.str();
+            return false;
+        }
+        center[axis] = valueMin;
+    }
+
+    auto radiusIt = tokens.find("radius");
+    if (radiusIt == tokens.end()) {
+        errorMessage = "disk requires a radius token";
+        return false;
+    }
+    float radius = 0.0f;
+    if (!parseFloat(radiusIt->second, radius)) {
+        errorMessage = "disk radius expects a float";
+        return false;
+    }
+    radius = std::max(radius, 0.0f);
+    if (!(radius > 0.0f)) {
+        errorMessage = "disk radius must be > 0";
+        return false;
+    }
+
+    auto axisIt = tokens.find("axis");
+    if (axisIt == tokens.end()) {
+        errorMessage = "disk requires an axis token (x, y, or z)";
+        return false;
+    }
+
+    uint32_t normalAxis = 2u;
+    std::string axisValue = axisIt->second;
+    std::string axisLower;
+    axisLower.reserve(axisValue.size());
+    for (char ch : axisValue) {
+        axisLower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (axisLower == "x") {
+        normalAxis = 0u;
+    } else if (axisLower == "y") {
+        normalAxis = 1u;
+    } else if (axisLower == "z") {
+        normalAxis = 2u;
+    } else {
+        errorMessage = "disk axis must be x, y, or z";
+        return false;
+    }
+
+    bool normalPositive = true;
+    if (auto normalIt = tokens.find("normal"); normalIt != tokens.end()) {
+        float normalValue = 1.0f;
+        if (!parseFloat(normalIt->second, normalValue)) {
+            errorMessage = "disk normal expects a float";
+            return false;
+        }
+        normalPositive = normalValue >= 0.0f;
+    }
+
+    bool twoSided = false;
+    if (auto twoSidedIt = tokens.find("twoSided"); twoSidedIt != tokens.end()) {
+        uint32_t flag = 0;
+        if (!parseUInt(twoSidedIt->second, flag)) {
+            errorMessage = "disk twoSided expects 0 or 1";
+            return false;
+        }
+        twoSided = (flag != 0);
+    }
+
+    resources.addDisk(center, normalAxis, normalPositive, radius, twoSided, materialIndex);
+    return true;
+}
+
+bool SceneManager::parseDirectionalLight(const std::unordered_map<std::string, std::string>& tokens,
+                                         SceneResources& resources,
+                                         std::string& errorMessage) {
+    simd::float3 directionToLight = simd_make_float3(0.0f, 1.0f, 0.0f);
+    bool hasDirection = false;
+    for (const char* key : {"direction", "dir", "directionToLight"}) {
+        auto it = tokens.find(key);
+        if (it == tokens.end()) {
+            continue;
+        }
+        if (!parseFloat3(it->second, directionToLight)) {
+            errorMessage = "sun direction expects three floats";
+            return false;
+        }
+        hasDirection = true;
+        break;
+    }
+    if (!hasDirection) {
+        errorMessage = "sun requires direction=<x,y,z> pointing from the shaded point toward the light";
+        return false;
+    }
+
+    simd::float3 color = simd_make_float3(1.0f, 0.93f, 0.82f);
+    if (auto colorIt = tokens.find("color"); colorIt != tokens.end()) {
+        if (!parseFloat3(colorIt->second, color)) {
+            errorMessage = "sun color expects three floats";
+            return false;
+        }
+    } else if (auto radianceIt = tokens.find("radiance"); radianceIt != tokens.end()) {
+        if (!parseFloat3(radianceIt->second, color)) {
+            errorMessage = "sun radiance expects three floats";
+            return false;
+        }
+    }
+
+    float intensity = 1.0f;
+    if (auto intensityIt = tokens.find("intensity"); intensityIt != tokens.end()) {
+        if (!parseFloat(intensityIt->second, intensity)) {
+            errorMessage = "sun intensity expects a float";
+            return false;
+        }
+    }
+
+    float selectionWeight = 1.0f;
+    if (auto weightIt = tokens.find("selectionWeight"); weightIt != tokens.end()) {
+        if (!parseFloat(weightIt->second, selectionWeight)) {
+            errorMessage = "sun selectionWeight expects a float";
+            return false;
+        }
+    }
+
+    resources.addDirectionalLight(directionToLight,
+                                  simd_make_float3(std::max(color.x * intensity, 0.0f),
+                                                   std::max(color.y * intensity, 0.0f),
+                                                   std::max(color.z * intensity, 0.0f)),
+                                  selectionWeight);
+    return true;
+}
+
 bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>& tokens,
                              SceneResources& resources,
                              std::string& errorMessage,
@@ -2463,6 +3188,12 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
         }
 
         if (extensionLower == ".gltf" || extensionLower == ".glb") {
+        if (SceneLoadDiagnosticsVerboseEnabled()) {
+            std::fprintf(stderr,
+                         "[SceneDiag] meshRoute path='%s' ext='%s' route=gltf\n",
+                         meshPath.string().c_str(),
+                         extensionLower.c_str());
+        }
             std::string gltfError;
             GltfCameraInfo gltfCamera{};
             GltfLoadOptions gltfOptions{};
@@ -2471,6 +3202,7 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
             gltfOptions.emissiveScale = std::max(inOutSettings.gltfEmissiveScale, 0.0f);
             gltfOptions.forceLinearBaseColor = inOutSettings.gltfCompatForceLinearBaseColor;
             gltfOptions.forceLinearEmissive = inOutSettings.gltfCompatForceLinearEmissive;
+            gltfOptions.flipTexcoordV = inOutSettings.gltfCompatFlipTexcoordV;
             auto appendDisableOrmPatterns = [&](const std::string& value) {
                 std::string token;
                 token.reserve(value.size());
@@ -2525,6 +3257,14 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
                 simd::float4x4 combined = simd_mul(sceneTransform, meshLocalToWorld);
                 resources.setMeshTransform(meshIndex, combined);
             }
+            if (SceneLoadDiagnosticsVerboseEnabled()) {
+                const size_t loadedMeshCount = (meshEndIndex > meshStartIndex) ? (meshEndIndex - meshStartIndex) : 0u;
+                std::fprintf(stderr,
+                             "[SceneDiag] meshRoute path='%s' ext='%s' route=gltf loadedMeshes=%zu\n",
+                             meshPath.string().c_str(),
+                             extensionLower.c_str(),
+                             loadedMeshCount);
+            }
             if (allowEmbeddedCameraOverride &&
                 gltfCamera.valid && gltfCamera.hasPerspective && gltfCamera.yfov > 0.0f) {
                 constexpr float kPi = 3.14159265358979323846f;
@@ -2541,6 +3281,15 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
                 inOutSettings.cameraYaw = yaw;
                 inOutSettings.cameraPitch = pitch;
                 inOutSettings.cameraVerticalFov = gltfCamera.yfov * (180.0f / kPi);
+                inOutSettings.cameraDefocusAngle = 0.0f;
+                inOutSettings.cameraFocusDistance = distance;
+            } else if (allowEmbeddedCameraOverride && gltfCamera.hasSceneBounds) {
+                const float distance = std::max(gltfCamera.sceneRadius * 2.25f, 0.1f);
+                inOutSettings.cameraTarget = gltfCamera.sceneCenter;
+                inOutSettings.cameraDistance = distance;
+                inOutSettings.cameraYaw = 0.72f;
+                inOutSettings.cameraPitch = 0.18f;
+                inOutSettings.cameraVerticalFov = std::max(inOutSettings.cameraVerticalFov, 45.0f);
                 inOutSettings.cameraDefocusAngle = 0.0f;
                 inOutSettings.cameraFocusDistance = distance;
             }
@@ -2566,24 +3315,25 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
         return false;
     }
 
-    LoadedMeshData meshData;
+    std::shared_ptr<LoadedMeshData> meshData = std::make_shared<LoadedMeshData>();
+    bool meshCacheHit = false;
     std::string loadError;
     if (isPlane) {
-        meshData.vertices.resize(4);
-        meshData.indices = {0, 1, 2, 0, 2, 3};
+        meshData->vertices.resize(4);
+        meshData->indices = {0, 1, 2, 0, 2, 3};
 
-        meshData.vertices[0].position = simd_make_float3(-0.5f, 0.0f, -0.5f);
-        meshData.vertices[1].position = simd_make_float3(0.5f, 0.0f, -0.5f);
-        meshData.vertices[2].position = simd_make_float3(0.5f, 0.0f, 0.5f);
-        meshData.vertices[3].position = simd_make_float3(-0.5f, 0.0f, 0.5f);
+        meshData->vertices[0].position = simd_make_float3(-0.5f, 0.0f, -0.5f);
+        meshData->vertices[1].position = simd_make_float3(0.5f, 0.0f, -0.5f);
+        meshData->vertices[2].position = simd_make_float3(0.5f, 0.0f, 0.5f);
+        meshData->vertices[3].position = simd_make_float3(-0.5f, 0.0f, 0.5f);
 
-        for (auto& vertex : meshData.vertices) {
+        for (auto& vertex : meshData->vertices) {
             vertex.normal = simd_make_float3(0.0f, 1.0f, 0.0f);
         }
-        meshData.vertices[0].uv = simd_make_float2(0.0f, 0.0f);
-        meshData.vertices[1].uv = simd_make_float2(1.0f, 0.0f);
-        meshData.vertices[2].uv = simd_make_float2(1.0f, 1.0f);
-        meshData.vertices[3].uv = simd_make_float2(0.0f, 1.0f);
+        meshData->vertices[0].uv = simd_make_float2(0.0f, 0.0f);
+        meshData->vertices[1].uv = simd_make_float2(1.0f, 0.0f);
+        meshData->vertices[2].uv = simd_make_float2(1.0f, 1.0f);
+        meshData->vertices[3].uv = simd_make_float2(0.0f, 1.0f);
     } else {
         std::string extension = meshPath.extension().string();
         std::string extensionLower;
@@ -2592,43 +3342,77 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
             extensionLower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
         }
 
-        bool loaded = false;
-        if (extensionLower == ".obj") {
-            loaded = LoadObjMesh(meshPath, meshData, loadError);
-        } else if (extensionLower == ".ply") {
-            loaded = LoadPlyMesh(meshPath, meshData, loadError);
-        } else {
+        if (extensionLower != ".obj" && extensionLower != ".ply") {
             errorMessage = "mesh format not supported: " + extension;
             return false;
         }
 
-        if (!loaded) {
-            errorMessage = loadError;
-            return false;
+        const std::string meshCacheKey = meshPath.string();
+        auto cacheIt = gSceneMeshLoadCache.find(meshCacheKey);
+        if (cacheIt != gSceneMeshLoadCache.end() && cacheIt->second) {
+            meshData = cacheIt->second;
+            meshCacheHit = true;
+        } else {
+            bool loaded = false;
+            if (extensionLower == ".obj") {
+                loaded = LoadObjMesh(meshPath, *meshData, loadError);
+            } else {
+                loaded = LoadPlyMesh(meshPath, *meshData, loadError);
+            }
+
+            if (!loaded) {
+                errorMessage = loadError;
+                return false;
+            }
+
+            gSceneMeshLoadCache[meshCacheKey] = meshData;
+        }
+
+        if (SceneLoadDiagnosticsVerboseEnabled()) {
+            std::fprintf(stderr,
+                         "[SceneDiag] meshRoute path='%s' ext='%s' route=%s cacheHit=%d vertices=%zu indices=%zu triangles=%zu\n",
+                         meshPath.string().c_str(),
+                         extensionLower.c_str(),
+                         (extensionLower == ".ply") ? "tinyply" : "tinyobj",
+                         meshCacheHit ? 1 : 0,
+                         meshData->vertices.size(),
+                         meshData->indices.size(),
+                         meshData->indices.size() / 3u);
         }
     }
 
-    if (meshData.indices.size() % 3 != 0) {
+    if (meshData->indices.size() % 3 != 0) {
         errorMessage = "mesh loader produced a non-triangle index buffer";
         return false;
     }
 
     simd::float4x4 localToWorld = ComposeTransform(translation, rotationDeg, scale);
-    uint32_t vertexCount = static_cast<uint32_t>(meshData.vertices.size());
-    uint32_t indexCount = static_cast<uint32_t>(meshData.indices.size());
+    uint32_t vertexCount = static_cast<uint32_t>(meshData->vertices.size());
+    uint32_t indexCount = static_cast<uint32_t>(meshData->indices.size());
 
     if (vertexCount == 0 || indexCount == 0) {
         errorMessage = "mesh contains no renderable geometry";
         return false;
     }
 
-    resources.addMesh(meshData.vertices.data(),
+    resources.addMesh(meshData->vertices.data(),
                       vertexCount,
-                      meshData.indices.data(),
+                      meshData->indices.data(),
                       indexCount,
                       localToWorld,
+                      localToWorld,
                       materialIndex,
-                      std::move(meshName));
+                      std::move(meshName),
+                      isPlane ? std::string{} : meshPath.string());
+
+    if (SceneLoadDiagnosticsVerboseEnabled() && isPlane) {
+        std::fprintf(stderr,
+                     "[SceneDiag] meshRoute route=proceduralPlane vertices=%u indices=%u triangles=%u\n",
+                     vertexCount,
+                     indexCount,
+                     indexCount / 3u);
+    }
+
     return true;
 }
 

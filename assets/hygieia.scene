@@ -1,0 +1,18 @@
+# Steel Metal Hygieia Scene
+
+camera target=0.00,1.60,0.00 distance=9.50 yaw=1.5 pitch=0.0 vfov=25.50 defocusAngle=0.10 focusDist=1.5
+background env=venice_sunrise_4k.hdr
+renderer maxDepth=16 samplesPerFrame=1 tonemap=2 exposure=0.5 reinhardWhite=1.50 \
+        fireflyClampEnabled=1 fireflyClampFactor=6.0 fireflyClampFloor=0.6 \
+        throughputClamp=10.0 specularTailClampBase=3.0 \
+        specularTailClampRoughnessScale=8.0 minSpecularPdf=0.0005
+
+# Materials (0=steel, 1=black metal, 2=red metal)
+material type=metal albedo=0.90,0.90,0.90 roughness=0.30 eta=1.657,0.880,0.521 k=9.223,6.270,5.303
+material type=metal albedo=0.04,0.04,0.04 roughness=0.25 eta=1.660,1.547,1.517 k=2.292,2.089,1.993
+material type=metal albedo=0.85,0.10,0.10 roughness=0.25 eta=0.200,0.924,1.102 k=3.913,2.453,2.142
+
+# Meshes (note: no spaces inside tuples, each line ends cleanly)
+mesh name=hygieia_center path=hygieia.obj material=0 translate=0.00,-0.01,0.00 scale=1.00,1.00,1.00 rotate=0.00,45.00,0.00
+mesh name=hygieia_left   path=hygieia.obj material=1 translate=-2.40,-0.01,0.00 scale=1.00,1.00,1.00 rotate=0.00,45.00,0.00
+mesh name=hygieia_right  path=hygieia.obj material=2 translate=2.40,-0.01,0.00 scale=1.00,1.00,1.00 rotate=0.00,30.00,0.00

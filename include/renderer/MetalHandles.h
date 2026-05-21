@@ -6,6 +6,8 @@
 #include <MetalKit/MetalKit.h>
 
 @protocol CAMetalDrawable;
+@protocol MTLCounterSet;
+@protocol MTLCounterSampleBuffer;
 
 using MTLDeviceHandle = id<MTLDevice>;
 using MTLCommandQueueHandle = id<MTLCommandQueue>;
@@ -14,10 +16,13 @@ using MTLComputePipelineStateHandle = id<MTLComputePipelineState>;
 using MTLRenderPipelineStateHandle = id<MTLRenderPipelineState>;
 using MTLRenderCommandEncoderHandle = id<MTLRenderCommandEncoder>;
 using MTLLibraryHandle = id<MTLLibrary>;
+using MTLArgumentEncoderHandle = id<MTLArgumentEncoder>;
 using MTLBufferHandle = id<MTLBuffer>;
 using MTLAccelerationStructureHandle = id<MTLAccelerationStructure>;
 using MTLTextureHandle = id<MTLTexture>;
 using MTLSamplerStateHandle = id<MTLSamplerState>;
+using MTLCounterSetHandle = id<MTLCounterSet>;
+using MTLCounterSampleBufferHandle = id<MTLCounterSampleBuffer>;
 using MTLRenderPassDescriptorHandle = MTLRenderPassDescriptor*;
 using MTLCAMetalDrawableHandle = id<CAMetalDrawable>;
 using MTKViewHandle = MTKView*;
@@ -41,10 +46,13 @@ using MTLComputePipelineStateHandle = void*;
 using MTLRenderPipelineStateHandle = void*;
 using MTLRenderCommandEncoderHandle = void*;
 using MTLLibraryHandle = void*;
+using MTLArgumentEncoderHandle = void*;
 using MTLBufferHandle = void*;
 using MTLAccelerationStructureHandle = void*;
 using MTLTextureHandle = void*;
 using MTLSamplerStateHandle = void*;
+using MTLCounterSetHandle = void*;
+using MTLCounterSampleBufferHandle = void*;
 using MTLRenderPassDescriptorHandle = void*;
 using MTLCAMetalDrawableHandle = void*;
 using MTKViewHandle = MTKView*;

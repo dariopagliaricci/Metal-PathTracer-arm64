@@ -1,0 +1,11 @@
+# R1A portable positive acceptance scene: one emissive mesh plane expected.
+# The procedural plane is two triangles with total area 1.0; uniform 2x scale makes total area 4.0.
+camera target=0.0,0.0,0.0 distance=5.0 yaw=1.570796 pitch=0.0 vfov=35.0 defocusAngle=0.0 focusDist=5.0
+background solid=0.0,0.0,0.0
+renderer maxDepth=2 samplesPerFrame=1 tonemap=1 exposure=0.0 russianRoulette=0
+
+material name=emissive_white type=diffuse_light albedo=0.0,0.0,0.0 emit=1.0,1.0,1.0
+
+# expected-emissive-count=2
+# expected-total-emitted-power=4.0000
+mesh name=r1a_positive_plane type=plane material=emissive_white scale=2.0,2.0,2.0

@@ -1,77 +1,162 @@
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-Icon?
-._*
+# Python
+.venv/
 
-# Xcode
-xcuserdata/
-*.xcuserstate
-*.xcscmblueprint
-DerivedData/
-*.xccheckout
-
-# CMake build directories
+# Build directories
 build/
 build-*/
 cmake-build-*/
-/assets/
-imgui.ini
-# LaTeX build artifacts (paper source files are tracked)
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.fls
-paper/*.fdb_latexmk
-paper/*.toc
-paper/paper.tex
-paper/paper.pdf
-paper/JOSS-submission.md
+xcode_build/
+*.app
 
-CMakeCache.txt
-CMakeFiles/
-CMakeScripts/
-Testing/
-CTestTestfile.cmake
-cmake_install.cmake
-Makefile
-!paper/Makefile
-install_manifest.txt
+# macOS
+.DS_Store
+*.dSYM
+xcuserdata/
+*.xcworkspace
+*.xcodeproj
 
-# Ninja
-.ninja_deps
-.ninja_log
-
-# VSCode / CLion / editors
+# IDE
 .vscode/
 .idea/
-*.iml
+*.swp
+*.swo
+*~
 
-# Obj-C / Metal intermediates
-*.pch
-*.dSYM/
-*.ipa
-*.xcarchive
+# ImGui
+imgui.ini
 
-# Shader / Metal compiled outputs (if generated)
-*.metallib
-*.air
+# Embree is an installed/system dependency. Local source checkouts are allowed
+# for experiments, but are not part of the primary repository layout.
+/external/embree/
 
-# Logs
-*.log
+# Compiled Object files
+*.o
+*.obj
+*.ply
 
-# Render outputs (but track screenshots folder for repository)
+# Ignore KTX and glTF files (large binary assets)
+gltf/
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+
+# Compiled Static libraries
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+
+# Local assets, documentation, and helper scripts are tracked separately.
+/assets/
+/doc/
+/docs/
+/scripts/
+
+#Artifacts
+artifacts/
+
+
+# Renders (output directory for offline renders)
 renders/
-*.exr
-# *.pfm
-# *.ppm
-# *.png
-# *.jpg
-# *.jpeg
 
-# External tools caches (if any)
-*.cache
-v1.0-Release-minor-update.md
+# Ignore golden test renders
+goldens/
+
+# Ignore internal documentation
+docs/
+
+# === Temporary test outputs / golden image runs ===
+*.pfm
+*.log
+*.tmp
+*.out
+
+# === Codex / AI session artifacts (local only) ===
+# Prompts, specs, and session notes
+codex/
+codex-files/
+PROMPTS/
+timebox.log
+.timebox.log
+session.lock
+session_*.md
+
+# Tools (local helper scripts, not part of the renderer codebase)
+tools/
+
+# GitHub workflows (local only)
+.github/*
+!.github/FUNDING.yml
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/ci.yml
+
+# Checkpoint helpers and archives
+checkpoints/
+*.zip
+*.tar
+*.7z
+
+# Local Codex summaries / JSON logs
+codex-log.txt
+codex-guard.sh
+codex_session_*.json
+codex_history_*.txt
+
+# Patch backups from 'patch' or 'diff'
+*.orig
+*.rej
+
+# === Local Codex helper scripts / patches ===
+scripts/
+*.patch
+
+# If you have a scratch folder for renders, ignore that folder instead:
+renders/
+tmp/
+assets/tmp/
+tests/tmp/
+
+# Ignore local image files (e.g., from test runs or local experiments)
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.pfm
+
+# milestone files
+milestones/
+
+# tests
+tests/
+validation/
+
+# Codex files
+codex-files/
+
+!tests/
+tests/*
+!tests/scenes/
+tests/scenes/*
+!tests/scenes/restir/
+tests/scenes/restir/*
+!tests/scenes/restir/r1a/
+!tests/scenes/restir/r1a/r1a_negative.scene
+!tests/scenes/restir/r1a/r1a_positive.scene
+!tests/scenes/restir/r1b/
+!tests/scenes/restir/r1b/r1b_single_emissive_receiver.scene
+!tests/scenes/restir/r1b/r1b_two_emissive_balance.scene
+!tests/scenes/restir/r2/
+!tests/scenes/restir/r2/r2_emissive_closure.scene
+
+!validation/
+validation/*
+!validation/baselines/
+validation/baselines/*
+!validation/baselines/ris_thresholds.json
+!validation/baselines/r3_spatial_thresholds.json
+!validation/baselines/r3_final_thresholds.json
+!validation/baselines/r4_temporal_thresholds.json

@@ -1,0 +1,13 @@
+# R1B bootstrap placeholder: one emissive mesh plane above one diffuse receiver plane.
+# This scene is for future baseline emissive-inventory sampling validation, not R1A acceptance.
+# expected-emissive-count=2
+camera target=0.0,1.0,0.0 distance=6.0 yaw=1.570796 pitch=-0.20 vfov=35.0 defocusAngle=0.0 focusDist=6.0
+background solid=0.0,0.0,0.0
+renderer maxDepth=4 samplesPerFrame=1 tonemap=1 exposure=0.0 russianRoulette=0
+
+material name=matte_gray type=lambert albedo=0.7,0.7,0.7
+material name=emissive_key type=diffuse_light albedo=0.0,0.0,0.0 emit=4.0,4.0,4.0
+
+mesh name=r1b_ground type=plane material=matte_gray position=0.0,0.0,0.0 scale=4.0,1.0,4.0
+mesh name=r1b_receiver_plane type=plane material=matte_gray position=0.0,1.0,-1.25 scale=1.5,1.0,1.5 rotate=90.0,0.0,0.0
+mesh name=r1b_key_plane type=plane material=emissive_key position=0.0,3.5,0.0 scale=1.5,1.0,1.5

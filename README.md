@@ -1,314 +1,609 @@
-# Path Tracer Metal (v2.0)
+# Metal PathTracer
 
-A physically based, progressive path tracer for **macOS + Apple Silicon**, written in C++ and Metal.
-It started as a *"Ray Tracing in One Weekend"* clone and evolved into a production-grade renderer with:
+A physically based renderer for macOS and Apple Silicon, written in C++20,
+Objective-C++, and Metal.
 
-- Hardware **ray tracing** (Metal RT) and a **software BVH** reference path tracer
-- **glTF 2.0** scene loading with full PBR metallic-roughness materials and texture support
-- **MNEE** caustics (Manifold Next Event Estimation)
-- HDR environment lighting with importance sampling and MIS
-- Extended material models (plastic, subsurface, car paint, PBR metallic-roughness)
-- Intel® Open Image Denoise integration
-- Headless CLI rendering with Metal and optional Embree CPU backends
-- **Presentation Mode** for clean, UI-free demo display
+Metal PathTracer is a research-grade production renderer with multiple transport
+backends, large-scene asset onboarding, deterministic headless rendering,
+runtime diagnostics, and explicitly gated experimental systems.
 
-> This README describes the **v2.0 public release** of the Metal path tracer core.
-> Large scene assets/HDRIs are intentionally not versioned in Git and are provided as a separate download.
+The current public release line is `v3.0.0`. This release includes the renderer
+scalability foundation, Bistro-class large-scene support, ReSTIR/RIS/ReGIR
+research paths, wavefront execution work, Embree reference rendering,
+importer/texture conversion tooling, and production metadata/debug-bundle
+support.
 
----
+## Current Status
 
-## Features
+The default renderer remains conservative: core path tracing paths are enabled by
+default, while high-risk research modes are opt-in and controlled through CLI
+flags and UI/debug settings.
 
-### Rendering & performance
+Production-ready or primary paths:
 
-- **Progressive path tracing** with temporal accumulation
-- **Dual backends**:
-  - **Hardware Ray Tracing (HWRT)** using Metal's ray tracing API (TLAS/BLAS)
-  - **Software Ray Tracing (SWRT)** using a CPU-built BVH (tinybvh-style) and compute kernels
-- **HWRT/SWRT parity** (validated via RMSE threshold on linear HDR PFM outputs)
-- **Configurable path depth** and Russian Roulette termination
-- **Internal render scale** (0.5×–2.0×) for trading quality vs performance
-- Accurate **environment map sampling** (importance sampling + MIS)
-- **Specular Next Event Estimation (NEE)** for direct specular connections
-- **MNEE** (Manifold Next Event Estimation) caustics — toggleable at runtime and via CLI
+- Metal GPU renderer with hardware ray tracing where available and a software
+  BVH fallback/debug path.
+- Progressive physically based path tracing with deterministic headless output.
+- Megakernel execution path plus an actively developed wavefront execution path.
+- glTF 2.0 / GLB runtime loading with PBR metallic-roughness materials, texture
+  transforms, tangent generation, normal maps, emissive materials, transmission
+  fallback, and KTX2 texture loading for imported assets.
+- Large-scene reporting and memory-budget policy checks before acceleration
+  structure builds.
+- Headless render profiles, metadata sidecars, settings JSON, debug bundles,
+  checkpoint manifests, tiled render manifests, PBR metrics, and deterministic
+  render queue item JSON.
+- Intel Open Image Denoise CPU postprocess when the vendored native libraries are
+  present, plus Metal SVGF-style denoise as a gated research path.
+- `PathTracerImport`, an importer-only Assimp pipeline that converts static FBX,
+  OBJ, and other supported source formats into deterministic glTF/GLB output.
 
-### Materials & lighting
+Gated research paths that are present but opt-in:
 
-- Physically based material model implemented in `shaders/pathtrace.metal`:
-  - Lambertian diffuse
-  - Conductor metal with `eta`/`k` and roughness
-  - Dielectric glass with IOR, absorption, and coat support
-  - Emissive / diffuse light materials
-  - **Plastic** with clear coat, tint, and absorption
-  - **Subsurface scattering** (random-walk style) for marble/wax/jade-like materials
-  - **Car paint** with configurable base layer and flake controls
-  - **PBR Metallic-Roughness** — full glTF 2.0 material model (baseColor, metallic, roughness, occlusion, emissive, transmission)
-- Analytic primitives: spheres, rectangles, boxes
-- Triangle meshes via OBJ/PLY (powered by tinyobjloader + tinyply)
-- **glTF 2.0 / GLB** mesh and material loading (custom loader, no extra runtime dependency)
-  - Multi-UV-set textures (TEXCOORD_0 / TEXCOORD_1) with KHR_texture_transform support
-  - Mip-mapped material textures with per-sampler filtering (glTF sampler descriptors)
-  - Thin-dielectric transmission fallback for scenes lacking explicit volume data
-  - Camera auto-import from embedded glTF camera nodes
-  - MikkTSpace-compliant tangent generation for correct normal-mapped shading
-- HDR environment maps with rotation + intensity overrides
+- RIS-family direct lighting, ReGIR world reuse, ReSTIR DI, and DI+ReGIR hybrid.
+- Bounded ReSTIR GI prototype and ReSTIR PT research/experimental path reuse.
+- Path guiding and radiance cache prototypes.
+- Path-space caustic transport, homogeneous volume transport, and
+  hero-wavelength spectral transport.
+- ReSTIR debug inspector views and counters.
+- Wavefront active-work scheduling through selectable preview, final, offline,
+  and research scheduling policies.
 
-### Post-processing & output
+Embree is maintained as a selectable CPU reference renderer for visual-output
+parity checks, asset validation, and backend comparison. Metal remains the
+primary GPU renderer.
 
-- **Intel® Open Image Denoise (OIDN)** 2.3.3 integration
-  - AOV path supports a sample-count channel for better denoising
-- **Working color space**: Linear sRGB or ACEScg (ACES AP1) — selectable per-render
-- Multiple tonemappers:
-  - Linear, ACES (Fitted or Simple variant), Reinhard (configurable white point), Hable
-- **Bloom** post-processing — luminance threshold, intensity, and radius controls
-- GUI EXR export:
-  - **Save EXR…** button in the ImGui "Output / Export" panel
-  - Writes a **linear HDR EXR** at internal render resolution
-  - Optional multilayer EXR with sample count AOV
-- Headless output formats:
-  - EXR (linear)
-  - PNG (LDR, tonemapped)
-  - PFM (HDR float32)
-  - PPM (debug/simple)
+## Repository Map
 
-### Developer tooling
-
-- **Headless renderer** (`PathTracerHeadless`) for batch/offline rendering
-  - **Metal GPU backend** (default)
-  - **Embree CPU backend** (optional, enabled via `-DPATH_TRACER_ENABLE_EMBREE=ON`)
-- ImGui-based UI overlay:
-  - Real-time stats (GPU time, BVH stats, samples/min, backend mode, etc.)
-  - Camera + renderer controls
-  - Render scale, tonemapping, denoiser toggle, bloom, EXR export
-  - **Scene panel**: live material editing with per-material reset
-  - **Object panel**: mesh transform editing via ImGuizmo 3D gizmos (translate / rotate / scale, local/world space)
-- **Presentation Mode** — borderless fullscreen, minimal overlay, resolution lock (720p / 1080p), target screen selection
-
+- `src/renderer`, `include/renderer` - Metal renderer, scene resources,
+  pass graph, transport memory registry, accumulation, denoise, UI, and
+  acceleration setup.
+- `src/headless`, `include/headless` - Metal and Embree headless backends.
+- `src/import`, `include/import` - Assimp import pipeline, Bistro audit, texture
+  conversion, KTX2 writing/loading support.
+- `shaders` - Metal shader tree split by core math, tracing, BSDF, lighting,
+  ReSTIR, wavefront, reconstruction, guiding, cache, volume, spectral, caustics,
+  scene access, and debug views.
+- `assets` - scene files and canonical assets, including Bistro,
+  San Miguel, Living Room, Bitterli, automotive, Khronos, Blender, and synthetic
+  fixtures.
+- `tests` - public smoke tests and optional renderer regression fixtures when
+  included in the release package.
+- `Images/Images-Legacy`, `Images/Metal-Wavefront-Images`, `Images/Embree-Renders` - public gallery
+  render sets used below.
 
 ## Renderings Gallery
 
+The galleries below show selected release renders from the legacy material set,
+current Metal wavefront output, and Embree reference output.
+
+### Legacy Gallery
+
+Images from `Images/Images-Legacy`.
+
 <div align="center">
 
-![Ajax Alloys Render](screenshots/ajax00.jpg)
+![Hygieia hardware ray tracing legacy render](Images/Images-Legacy/hygieia_HWRT.jpg)
 
-![Ajax Other Alloys Render ](screenshots/ajax01.jpg)
+![Hygieia metal material legacy render](Images/Images-Legacy/hygieia_metal.jpeg)
 
-![Ajax Car Paint Render](screenshots/car-paint-validation.jpg)
+![glTF BoomBox legacy render](Images/Images-Legacy/boombox.jpg)
 
-![Hygieia Silver - Glass - Gold Render](screenshots/hygieia_HWRT.jpg)
+![Damaged Helmet legacy render 1](Images/Images-Legacy/damaged-helmet-01.jpg)
 
-![Hygieia Alloys Render](screenshots/hygieia_metal.jpg)
+![Damaged Helmet legacy render 2](Images/Images-Legacy/damaged-helmet-02.jpg)
 
-![Jason Alloys Render](screenshots/jason-alloys.jpg)
+![Marble and wax validation legacy render](Images/Images-Legacy/marble-wax-validation.jpg)
 
-![Lucy Plastic Render](screenshots/lucy-plastic.jpg)
-
-![Lucy Glass Render](screenshots/lucy-glass-HWRT.jpg)
-
-![Ajax Marble - Wax Render](screenshots/marble-wax-validation.jpg)
-
-![Ajax Plastic Render](screenshots/plastic.jpg)
-
-![Sci-Fi Damaged Helmet Render](screenshots/damaged-helmet-03.jpg)
-
-![BoomBox Render](screenshots/boombox.jpg)
-
-![Lantern Render](screenshots/lantern.jpg)
-
-![Flight Helmet Render](screenshots/flight-helmet.jpg)
-
-![Stanford Dragon Render](screenshots/stanford_dragon.jpg)
+![Plastic material validation legacy render](Images/Images-Legacy/plastic_validation.jpg)
 
 </div>
 
----
+### Metal Wavefront Gallery
 
-### Ray Tracing Acceleration
+Current Metal wavefront renders from `Images/Metal-Wavefront-Images`.
 
-The path tracer supports two acceleration structures:
+<div align="center">
 
-**Hardware Ray Tracing** (Apple Silicon):
-- Uses Metal's native ray tracing API
-- TLAS (top-level) over mesh instances
-- BLAS (bottom-level) for triangle meshes
-- Automatic BVH construction on GPU
-- Lower traversal overhead than software
+![Bistro full sun ReSTIR wavefront render](Images/Metal-Wavefront-Images/bistro_full_sun_restir_alt_denoised_1024spp_denoised.jpg)
 
-**Software Ray Tracing** (Fallback):
-- Custom BVH with Surface Area Heuristic (SAH) construction
-- Linear BVH layout for cache-friendly traversal
-- Stack-based traversal with 128-entry stack
-- Early exit optimization for shadow rays
-- Per-ray statistics: nodes visited, primitive tests, coherency metrics
+![Bistro night open-front ReSTIR wavefront render](Images/Metal-Wavefront-Images/bistro_night_openfront_restir_denoised_1024spp_denoised.jpg)
 
-Real-time statistics displayed in ImGui:
-- Average nodes visited per ray
-- Average primitive tests per ray
-- Shadow ray early exit percentage
-- Both-children-visited percentage (traversal coherency)
+![San Miguel balcony sun ReSTIR wavefront render](Images/Metal-Wavefront-Images/san_miguel_balcony_sun_restir_denoised_1024spp_denoised.jpg)
+
+![San Miguel sunlit alternate ReSTIR wavefront render](Images/Metal-Wavefront-Images/san_miguel_2_restir_sunlit_alternate_denoised_1024spp_denoised.jpg)
+
+![Sponza sunlight HDRI ReSTIR wavefront render](Images/Metal-Wavefront-Images/sponza_sunlight_hdri_restir_denoised_1024spp_denoised.jpg)
+
+![Bitterli staircase wavefront render](Images/Metal-Wavefront-Images/bitterli_staircase_denoised_1024spp_denoised.jpg)
+
+![Living room ReGIR stress wavefront render](Images/Metal-Wavefront-Images/living_room_regir_stress_denoised_1024spp_denoised.jpg)
+
+![Living room practical lights ReGIR stress wavefront render](Images/Metal-Wavefront-Images/living_room_regir_practicals_stress_denoised_1024spp_denoised.jpg)
+
+![LuxCore balls wavefront render](Images/Metal-Wavefront-Images/luxcoreballs_denoised_1024spp_denoised.jpg)
+
+![McLaren MCL35M wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2021_f1_mclaren_mcl35m_denoised_1024spp_denoised.jpg)
+
+![Mercedes W12 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2021_f1_mercedes_benz_w12_denoised_1024spp_denoised.jpg)
+
+![Alpine A521 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2021_f1_alpine_a521_denoised_1024spp_denoised.jpg)
+
+![Mercedes W11 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_mercedes_benz_w11_denoised_1024spp_denoised.jpg)
+
+![McLaren MCL35 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_mclaren_mcl35_denoised_1024spp_denoised.jpg)
+
+![Racing Point RP20 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_racing_point_rp20_denoised_1024spp_denoised.jpg)
+
+![Alfa Romeo C39 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_alfa_romeo_c39_denoised_1024spp_denoised.jpg)
+
+![Haas VF20 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_haas_vf20_denoised_1024spp_denoised.jpg)
+
+![Williams FW43 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_whilliams_fw43_denoised_1024spp_denoised.jpg)
+
+![Mercedes W10 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_f1_mercedes_benz_w10_denoised_1024spp_denoised.jpg)
+
+![McLaren MCL34 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_mclaren_mcl34_denoised_1024spp_denoised.jpg)
+
+![Red Bull RB15 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_f1_red_bull_rb15_denoised_1024spp_denoised.jpg)
+
+![Alfa Romeo C38 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_f1_alfa_romeo_c38_denoised_1024spp_denoised.jpg)
+
+![Haas VF-19 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_haas_vf_19_denoised_1024spp_denoised.jpg)
+
+</div>
+
+### Embree Gallery
+
+CPU reference renders from `Images/Embree-Renders`.
+
+<div align="center">
+
+![Bistro sun Embree render](Images/Embree-Renders/bistro_full_sun_restir_alt_16spp_denoised_denoised.jpg)
+
+![Sponza sunlight Embree render](Images/Embree-Renders/sponza_sunlight_hdri_restir_denoised_16spp_denoised.jpg)
+
+![Bitterli staircase Embree render](Images/Embree-Renders/bitterli_staircase_denoised_16spp_denoised.jpg)
+
+![San Miguel balcony Embree render](Images/Embree-Renders/san_miguel_balcony_sun_restir_denoised_16spp_denoised.jpg)
+
+![San Miguel alternate Embree render](Images/Embree-Renders/san_miguel_2_restir_sunlit_alternate_denoised_16spp_denoised.jpg)
+
+![Living room Embree render](Images/Embree-Renders/living_room_denoised_16spp_denoised.jpg)
+
+![glTF Damaged Helmet Embree render](Images/Embree-Renders/gltf_damaged_helmet_denoised_16spp_denoised.jpg)
+
+![Ajax Embree render](Images/Embree-Renders/ajax_denoised_16spp_denoised.jpg)
+
+![Hygieia Embree render](Images/Embree-Renders/hygieia_denoised_16spp_denoised.jpg)
+
+![Hygieia other Embree render](Images/Embree-Renders/hygieia_other_denoised_16spp_denoised.jpg)
+
+![Jason alloys Embree render](Images/Embree-Renders/jason_alloys_denoised_16spp_denoised.jpg)
+
+![Lucy glass Embree render](Images/Embree-Renders/lucy_glass_denoised_16spp_denoised.jpg)
+
+![Lucy plastic Embree render](Images/Embree-Renders/lucy_plastic_denoised_16spp_denoised.jpg)
+
+![Dragon car paint Embree render](Images/Embree-Renders/dragon_carpaint_denoised_16spp_denoised.jpg)
+
+![Bugatti Chiron Embree render](Images/Embree-Renders/bugatti_chiron_top_edition_matchref_16spp_denoised_denoised.jpg)
+
+![Ferrari F14 T Embree render](Images/Embree-Renders/ferrari_f14_t_2014_matchref_denoised_16spp_denoised.jpg)
+
+![McLaren MCL35M Embree render](Images/Embree-Renders/f1_bulk_2021_f1_mclaren_mcl35m_denoised_16spp_denoised.jpg)
+
+![Mercedes W12 Embree render](Images/Embree-Renders/f1_bulk_2021_f1_mercedes_benz_w12_denoised_16spp_denoised.jpg)
+
+![Alpine A521 Embree render](Images/Embree-Renders/f1_bulk_2021_f1_alpine_a521_denoised_16spp_denoised.jpg)
+
+![Mercedes W11 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_mercedes_benz_w11_denoised_16spp_denoised.jpg)
+
+![McLaren MCL35 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_mclaren_mcl35_denoised_16spp_denoised.jpg)
+
+![Racing Point RP20 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_racing_point_rp20_denoised_16spp_denoised.jpg)
+
+![Alfa Romeo C39 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_alfa_romeo_c39_denoised_16spp_denoised.jpg)
+
+![Haas VF20 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_haas_vf20_denoised_16spp_denoised.jpg)
+
+![Williams FW43 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_whilliams_fw43_denoised_16spp_denoised.jpg)
+
+![Mercedes W10 Embree render](Images/Embree-Renders/f1_bulk_2019_f1_mercedes_benz_w10_denoised_16spp_denoised.jpg)
+
+![McLaren MCL34 Embree render](Images/Embree-Renders/f1_bulk_2019_mclaren_mcl34_denoised_16spp_denoised.jpg)
+
+![Red Bull RB15 Embree render](Images/Embree-Renders/f1_bulk_2019_f1_red_bull_rb15_denoised_16spp_denoised.jpg)
+
+![Alfa Romeo C38 Embree render](Images/Embree-Renders/f1_bulk_2019_f1_alfa_romeo_c38_denoised_16spp_denoised.jpg)
+
+![Haas VF-19 Embree render](Images/Embree-Renders/f1_bulk_2019_haas_vf_19_denoised_16spp_denoised.jpg)
+
+</div>
+
+## Features
+
+### Transport and Rendering
+
+- Progressive path tracing with temporal accumulation.
+- Metal hardware ray tracing path using TLAS/BLAS where supported.
+- Metal software BVH path for fallback, parity checks, and debug workflows.
+- Megakernel and wavefront execution modes.
+- Configurable path depth, Russian roulette, render scale, exposure, tonemapping,
+  bloom, color space, and deterministic seeds.
+- Environment map importance sampling and MIS.
+- Specular NEE and MNEE caustics.
+- Optional firefly clamp modes for production output control.
+- Path-space caustic transport prototype.
+- Homogeneous volume transport prototype with isotropic or Henyey-Greenstein
+  phase.
+- Hero-wavelength spectral transport prototype with dielectric dispersion.
+
+### Materials and Assets
+
+- Lambertian, metal, dielectric/glass, diffuse light, plastic, subsurface, car
+  paint, and glTF PBR metallic-roughness materials.
+- Analytic spheres, rectangles, boxes, OBJ/PLY meshes, and glTF/GLB meshes.
+- MikkTSpace tangent generation for normal mapped assets.
+- Runtime KTX2 texture loading for converted importer output.
+- Canonical scenes for Bistro, Sponza, San Miguel, Living Room, Bitterli,
+  LuxCore balls, automotive assets, glTF sample assets, and synthetic fixtures.
+- Texture clamp and texture-budget controls for large-scene bring-up.
+
+### Research Lighting Stack
+
+- Direct light modes: `legacy`, `baseline_emissive`, `ris`, `ris_spatial`,
+  `ris_temporal`, `ris_world`, `ris_regir`, `restir_di`, and
+  `restir_di_regir_hybrid`.
+- ReSTIR DI explicit pass graph path for headless and opt-in GUI profiling.
+- ReSTIR GI diffuse prototype.
+- ReSTIR PT research and experimental path reuse modes.
+- ReGIR/world-space candidate reuse.
+- Path guiding and radiance cache prototypes.
+- ReSTIR debug AOVs for candidate source, reservoir confidence, ReGIR cell ID,
+  path-guiding mask, ReSTIR PT reuse mask, SVGF variance, NaN/Inf mask, queue
+  failures, and radiance cache diagnostics.
+
+### Tooling
+
+- GUI app with ImGui renderer controls, material editing, object transform
+  editing through ImGuizmo, performance panels, EXR export, and presentation
+  mode.
+- Headless renderer for reproducible offline rendering and validation.
+- Optional Embree CPU backend for reference rendering and visual-output parity
+  checks.
+- Importer executable for static scene conversion into glTF/GLB.
+- Bistro material audit executable.
+- PBR metrics, debug AOVs, material-channel inspection, and deterministic
+  render metadata for repeatable renderer analysis.
 
 ## Requirements
 
-- **macOS:** 12.0 or later
-- **Xcode:** 13.0 or later (for Metal compiler)
-- **CMake:** 3.24 or later
-- **Apple Silicon:**
-  - M3 and later: Hardware ray tracing acceleration enabled
-  - M1/M2: Software ray tracing (fallback)
-  - **Important** Apple exposes `MTLDevice.supportsRaytracing` even on M1/M2, so the renderer still launches the HWRT pipeline and Metal silently emulates it on the GPU cores. The ImGui stats therefore show "Hardware Ray Tracing" as *active* even though traversal runs in software. Toggle **Software Ray Tracing** in the Settings panel or pass `--enableSoftwareRayTracing=1` if you want to stay on the pure BVH path for debugging or parity.
-  - **Large-scene memory guard:** the renderer refuses HWRT builds if the estimated BLAS/TLAS size plus scratch exceeds `recommendedMaxWorkingSetSize`. This budget is device-specific and **not** equal to total unified memory, so very large mesh scenes can be blocked even on machines with plenty of RAM. Practical implication: scenes with tens of millions of triangles (e.g. `lucy-plastic.scene`) or multiple instances of heavy meshes can exceed the budget. In our testing on an M1 Pro 16 GB, two `lucy-scaled` instances render, while three can exceed the budget and be refused. Higher-end GPUs (e.g. M1/M2 Max or M3+) typically have a larger budget, but limits still apply.
+- macOS 12 or newer.
+- Apple Silicon is the primary target.
+- Xcode / Apple Clang with Metal compiler support.
+- CMake 3.24 or newer.
+- Optional: Assimp for `PathTracerImport`.
+- Optional: Embree 4.4 or newer for the CPU headless backend.
+- Vendored Intel Open Image Denoise 2.4.1 and TBB native libraries in
+  `external/oidn` for CPU denoising. The release is validated against the
+  bundled OIDN/TBB runtime. Newer OIDN releases should be tested by replacing
+  `external/oidn`, reconfiguring CMake, and rerunning validation; until then,
+  the bundled version is the supported runtime. Source-only rebuilds can disable
+  it with `-DPATH_TRACER_ENABLE_OIDN=OFF`.
 
-### Toolchain
+Apple exposes Metal ray tracing capability differently across devices and OS
+versions. The renderer logs backend selection explicitly, and `--force-hwrt` /
+`--force-swrt` can be used when a validation run must fail instead of silently
+falling back.
 
-- CMake ≥ 3.24
-- Xcode / Apple Clang with C++20 and ObjC++
-
-### Dependencies (vendored in `external/`)
-
-- [Dear ImGui](https://github.com/ocornut/imgui)
-- [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo) — 3D gizmo widgets for object transform editing
-- [Intel® Open Image Denoise](https://www.openimagedenoise.org) 2.3.3
-- [MikkTSpace](http://www.mikktspace.com) — industry-standard tangent space for normal map baking
-- [Embree](https://www.embree.org/) (vendored source) — optional CPU ray tracing backend for headless rendering
-- [tinybvh](https://github.com/jbikker/tinybvh)
-- [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader)
-- [tinyply](https://github.com/ddiakopoulos/tinyply)
-
----
+Large scenes are checked against `MTLDevice.recommendedMaxWorkingSetSize` before
+acceleration-structure build. This is a device-specific working-set budget, not
+the same as total unified memory.
 
 ## Building
 
-### CMake (Command-line)
+Basic Metal build:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build --target PathTracer PathTracerHeadless
 ```
 
-This will produce:
-- `build/PathTracer.app` – GUI application
-- `build/PathTracerHeadless` – headless CLI renderer
-- Shaders and assets copied next to the binaries (via CMake post-build steps)
+Dedicated wavefront/Metal development build:
 
-### CMake Options
+```bash
+cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release
+cmake --build build-metal --clean-first --target PathTracer PathTracerHeadless
+```
+
+Embree-enabled build:
+
+```bash
+brew install embree
+cmake -S . -B build-embree -DCMAKE_BUILD_TYPE=Release -DPATH_TRACER_ENABLE_EMBREE=ON
+cmake --build build-embree --clean-first --target PathTracerHeadless EmbreeSmokeTest
+```
+
+Importer build with Assimp:
+
+```bash
+brew install assimp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target PathTracerImport PathTracerBistroAudit
+```
+
+Main CMake options:
 
 | Option | Default | Description |
-|---|---|---|
-| `PATH_TRACER_ENABLE_EMBREE` | `OFF` | Build the Embree CPU headless backend |
-| `PATH_TRACER_ENABLE_OIDN` | `ON` | Enable Intel OIDN denoiser integration (auto-disables if OIDN dylibs are missing in `external/oidn/lib`) |
-| `PT_DEBUG_TOOLS` | `OFF` | Enable HWRT/SWRT debug tooling (path debug, parity assertions) |
-| `PT_MNEE_SWRT_RAYS` | `OFF` | Force MNEE rays to use SWRT in the HWRT path (debug) |
-| `PT_MNEE_OCCLUSION_PARITY` | `OFF` | Compare HWRT vs SWRT MNEE visibility (debug) |
-| `STRICT` | `OFF` | Enable strict compiler warnings (`-Wall -Wextra -Werror`) |
-| `PATH_TRACER_ASSETS_DIR` | `./assets` | Path to optional asset pack directory (empty assets folders are created if missing) |
-| `M0_TESTS` | `OFF` | Enable internal milestone golden-image tests (requires private `tests/tools/golden_test.sh`) |
+| --- | --- | --- |
+| `PATH_TRACER_ENABLE_EMBREE` | `OFF` | Build and link the Embree CPU backend. |
+| `PATH_TRACER_ENABLE_ASSIMP` | `ON` | Enable the Assimp-backed importer when Assimp is found. |
+| `PATH_TRACER_ENABLE_OIDN` | `ON` | Enable OIDN if vendored native libraries are present. |
+| `PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY` | `OFF` | Build only the Embree smoke target. |
+| `PT_DEBUG_TOOLS` | `OFF` | Enable HWRT/SWRT path debug and parity tooling in the GUI target. |
+| `PT_MNEE_SWRT_RAYS` | `OFF` | Force MNEE rays through SWRT for HWRT debug. |
+| `PT_MNEE_OCCLUSION_PARITY` | `OFF` | Compare MNEE visibility through HWRT and SWRT. |
+| `STRICT` | `OFF` | Enable strict warnings. |
+| `M0_TESTS` | `OFF` | Enable optional golden-image CTest entries. |
 
-### Public vs internal test coverage
+Generated targets:
 
-- The public repository does not ship internal golden-image scripts.
-- `M0_TESTS=ON` is reserved for internal environments where `tests/tools/golden_test.sh` exists.
-- Public smoke test script: `tests/public/headless_smoke_test.sh` (deterministic 64x64 headless render).
-- CI in this repository validates configuration/builds and runs the public smoke test.
+- `PathTracer.app` - interactive GUI renderer.
+- `PathTracerHeadless` - deterministic CLI renderer.
+- `PathTracerImport` - importer-only static scene converter.
+- `PathTracerBistroAudit` - Bistro material/texture audit tool.
+- `EmbreeSmokeTest` - Embree API smoke target when Embree is enabled.
 
-### Running the GUI
-
-Run the app bundle to watch the progressive path tracer converge:
+## Running the GUI
 
 ```bash
 open build/PathTracer.app
 ```
 
-Or (for debugging purposes):
+Debug launch:
 
 ```bash
 ./build/PathTracer.app/Contents/MacOS/PathTracer
 ```
 
-Pass `--presentation=1` to start directly in Presentation Mode (borderless fullscreen, no UI panels):
+Large-scene / ReSTIR DI interactive profiling launch:
+
+```bash
+PT_HWRT_BUILD_POLICY=compact_memory \
+PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI=1 \
+./build-metal/PathTracer.app/Contents/MacOS/PathTracer --scene=bistro_full
+```
+
+Presentation mode:
 
 ```bash
 ./build/PathTracer.app/Contents/MacOS/PathTracer --presentation=1
 ```
 
-### Controls and UI Panels
+Supported interactive GUI command-line flags:
 
-**Camera:**
-- Typical FPS/orbit controls (exact bindings depend on your local setup)
+| Flag | Values | Purpose |
+| --- | --- | --- |
+| `--scene=<id-or-path>` / `--scene <id-or-path>` | Scene ID or `.scene` path | Starts the GUI on a specific scene instead of the default startup scene. |
+| `--presentation=1` | `1`, `true`, `on`, `0`, `false`, `off` | Starts with presentation mode enabled or disabled. Presentation mode can also be changed from the UI. |
 
-**Settings Panel:**
-- Backend: Hardware Ray Tracing vs Software BVH
-- Samples per frame
-- Max path depth, Russian Roulette toggle
-- Specular NEE toggle
-- MNEE toggle (Manifold Next Event Estimation caustics)
-- Denoiser on/off
-- Working color space (Linear sRGB / ACEScg)
-- Tonemapper (Linear / ACES Fitted / ACES Simple / Reinhard / Hable)
-- Exposure (in stops)
-- Bloom (enable, threshold, intensity, radius)
+Useful interactive runtime environment flags:
 
-**Scene Panel:**
-- Live material editor — modify base color, roughness, metallic, emission, IOR, coat, SSS, and all other per-material parameters
-- Per-material reset to scene defaults
-- Object list — select any mesh and edit its world transform with ImGuizmo 3D gizmos
+| Variable | Values | Purpose |
+| --- | --- | --- |
+| `PT_HWRT_BUILD_POLICY` | `fast_build`, `fast_trace`, `compact_memory`, `dynamic_update` | Overrides the Metal hardware acceleration-structure build policy. Use `compact_memory` for large static scenes when memory footprint matters. |
+| `PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI` | `1` / `0` | Enables the explicit ReSTIR DI pass graph in the interactive GUI when `restir_di` or `restir_di_regir_hybrid` direct lighting is selected. Without it, the GUI keeps the lower-overhead fused path for responsiveness. |
+| `PT_SCENE_LOAD_DIAGNOSTICS` | `1` / `0` | Prints scene-loading, asset-resolution, and staged-load diagnostics. |
+| `PT_SCENE_LOAD_DIAGNOSTICS_VERBOSE` | `1` / `0` | Adds verbose scene-load diagnostics; requires `PT_SCENE_LOAD_DIAGNOSTICS=1`. |
+| `PT_HWRT_KEEP_TRIANGLE_BUFFER` | `1` / `0` | Keeps CPU triangle data available after hardware acceleration setup for debugging and parity inspection. |
+| `PT_CAPTURE_DELAY_SECONDS` | Floating-point seconds | Delays automated capture/export flows that need the first frames to settle. |
 
-**Output / Export Panel:**
-- Save EXR… button
-- Saves a linear EXR snapshot of the current accumulation
-- Outputs to `./renders/render-YYYYMMDD-HHMMSS.exr` (see limitations)
+Low-level dispatch isolation/debug variables:
 
-**Performance Panel:**
-- FPS and GPU/CPU timings
-- Sample count and samples/min
-- BVH statistics (nodes, prims, average nodes/leaf tests per ray)
-- Intersection mode label: "Hardware Ray Tracing" vs "Software Ray Tracing"
+| Variable | Values | Purpose |
+| --- | --- | --- |
+| `PT_SKIP_BLAS_USE_RESOURCES` | `1` / `0` | Skips BLAS `useResource` binding for isolation when debugging Metal resource residency issues. |
+| `PT_SKIP_TEXTURE_USE_RESOURCES` | `1` / `0` | Skips texture `useResource` binding for isolation when debugging texture residency issues. |
+| `PT_FORCE_TG_WIDTH` / `PT_FORCE_TG_HEIGHT` | Positive integers | Overrides selected compute threadgroup dimensions for kernel-dispatch experiments. |
+| `PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE` | `1` / `0` | Headless validation switch for the fused ReSTIR DI reference path; keep disabled for normal interactive GUI use. |
 
-**Presentation Mode:**
-- Toggle via the View menu or `--presentation=1` CLI flag
-- Hides all UI panels and shows only a minimal status overlay
-- Supports borderless fullscreen or maximized window
-- Resolution lock at 720p or 1080p
-- Automatically resets accumulation on toggle
+Environment flags can be prefixed on the launch command, as above, or exported
+once in the shell before starting `PathTracer.app`.
 
-## Headless CLI Rendering
+## Headless Rendering
 
-For offline renders without a GUI, use the `PathTracerHeadless` CLI:
+Minimal render:
 
 ```bash
-build/PathTracerHeadless --scene=hygieia-other --enableSoftwareRayTracing=1 \
-    --width=1920 --height=1080 --sppTotal=4096 \
-    --output=renders/hygieia.exr
+build/PathTracerHeadless \
+  --scene=sponza \
+  --width=1280 \
+  --height=720 \
+  --spp=1024 \
+  --seed=42 \
+  --out=renders/sponza.exr \
+  --verbose
 ```
 
-**Key flags:**
+Metal wavefront render:
 
-- `--scene=<id-or-path>` — Required. Scene identifier (from assets) or path to a `.scene` / `.gltf` / `.glb` file.
-- `--output=<path>` — Output filename. Defaults to `renders/<scene>_<WxH>.<format>`.
-- `--width/--height` — Override render resolution (clamped to ≥ 8).
-- `--sppTotal` — Total samples to accumulate (default 1024).
-- `--maxDepth` — Override maximum path depth.
-- `--seed` — Fixed RNG seed (0 = random).
-- `--envRotation`, `--envIntensity` — Environment overrides (degrees / multiplier).
-- `--enableSoftwareRayTracing[=0|1]` — Force software ray tracing instead of hardware acceleration.
-- `--enableMnee[=0|1]` — Enable MNEE caustics (default: disabled).
-- `--denoiser[=0|1]` — Enable/disable Intel OIDN denoising (default: enabled).
-- `--tonemap`, `--exposure` — Override tonemapping/exposure for LDR outputs.
-- `--format=<exr|png|pfm|ppm>` — Output format (default EXR, linear HDR).
-- `--backend=<metal|embree>` — Select headless backend: `metal` (default, GPU) or `embree` (CPU, requires `-DPATH_TRACER_ENABLE_EMBREE=ON`).
-- `--enableEmbree[=0|1]` — Alias for `--backend=embree`.
-- `--threads=<int>` — Worker thread count for the Embree backend.
-- `--verbose` — Print per-frame progress.
+```bash
+build/PathTracerHeadless \
+  --scene=bistro_full \
+  --renderProfile=final \
+  --executionMode=wavefront \
+  --directLightMode=restir_di_regir_hybrid \
+  --denoise=1 \
+  --out=renders/bistro_full_wavefront.exr \
+  --verbose
+```
 
-All overrides apply **after** scene parsing. HDR formats (`exr`, `pfm`) are saved linear.
+Embree reference render:
 
+```bash
+build-embree/PathTracerHeadless \
+  --backend=embree \
+  --scene=assets/plastic.scene \
+  --width=512 \
+  --height=512 \
+  --sppTotal=32 \
+  --threads=8 \
+  --denoise=1 \
+  --format=png \
+  --output=renders/plastic_embree.png
+```
+
+Render profiles:
+
+| Profile | Defaults |
+| --- | --- |
+| `preview` | 64 spp, wavefront preview scheduling. |
+| `lookdev` | 256 spp, wavefront final scheduling. |
+| `final` | 1024 spp, wavefront offline scheduling. |
+| `reference` | 4096 spp, megakernel, fixed seed if none is supplied. |
+| `debug` | 16 spp, megakernel, ReSTIR debug counters, PBR metrics. |
+| `custom` | No profile defaults. |
+
+Important headless flag groups:
+
+- Scene/output: `--scene`, `--output` / `--out`, `--format`, `--width`,
+  `--height`, `--sppTotal` / `--spp`, `--seed`, `--maxDepth`.
+- Backend: `--backend=metal|embree`, `--enableEmbree`, `--threads`,
+  `--force-hwrt`, `--force-swrt`, `--enableSoftwareRayTracing`.
+- Execution: `--executionMode=megakernel|wavefront`,
+  `--wavefront-policy=preview|final|offline|research`,
+  `--wavefront-compaction=0|1`.
+- Lighting/reuse: `--directLightMode`, `--ris-m`, `--spatial-reuse-k`,
+  `--world-reuse-cell-size`, `--restirGiMode`, `--restirPtMode`,
+  `--pathGuidingMode`, `--radianceCacheMode`.
+- Advanced transport: `--causticTransportMode`, `--volumeTransportMode`,
+  `--spectralMode`, plus their related tuning flags.
+- Large scenes: `--stats`, `--budget-policy=strict|warn|ignore`,
+  `--pilot-mode=geo_only|albedo_only|full_clamped`, `--texture-max-dim`,
+  `--max-texture-bytes`.
+- Output quality: `--tonemap`, `--exposure`, `--firefly-clamp-mode`,
+  `--firefly-clamp-value`, `--denoise`, OIDN guide flags, `--svgfDenoise`.
+- Production metadata: `--pbrMetrics`, `--pbrMetricsJson`,
+  `--outputMetadata`, `--outputMetadataJson`, `--settingsJson`,
+  `--renderQueueItemJson`, `--runRenderQueueItemJson`, `--debugBundleDir`,
+  `--checkpointManifestJson`, `--resumeCheckpointJson`, `--tileManifestJson`,
+  `--tileSize`.
+- Debug/audit: `--materialMrDebugJson`, `--directLightAuditJson`,
+  `--restirDebug`, `--restirDebugView`, `--restirDebugCounters`,
+  `--restirDebugMetricsJson`, `--cameraSearchReport`, `--debugPath`,
+  `--debugPixel`, `--parityAssert`, material texture debug flags, and AOV
+  visualization flags.
+
+Run `build/PathTracerHeadless --help` for the complete current CLI surface.
+
+### Gated Research Mode Examples
+
+The advanced transport systems are explicit opt-in paths. They are intended for
+renderer research, parity work, and controlled production experiments where the
+selected mode is recorded in metadata/debug output.
+
+ReSTIR DI plus ReGIR hybrid on the Metal wavefront path:
+
+```bash
+build/PathTracerHeadless \
+  --scene=bistro_full \
+  --renderProfile=final \
+  --executionMode=wavefront \
+  --wavefront-policy=offline \
+  --directLightMode=restir_di_regir_hybrid \
+  --outputMetadataJson=renders/bistro_restir_metadata.json \
+  --out=renders/bistro_restir_regir.exr
+```
+
+ReSTIR GI diffuse reuse:
+
+```bash
+build/PathTracerHeadless \
+  --scene=living_room \
+  --renderProfile=lookdev \
+  --restirGiMode=restir_gi_diffuse \
+  --directLightMode=restir_di \
+  --out=renders/living_room_restir_gi.exr
+```
+
+Path guiding and radiance cache prototypes:
+
+```bash
+build/PathTracerHeadless \
+  --scene=sponza \
+  --renderProfile=lookdev \
+  --pathGuidingMode=path_guiding \
+  --pathGuidingStrength=0.35 \
+  --radianceCacheMode=radiance_cache \
+  --radianceCacheMinConfidence=0.35 \
+  --out=renders/sponza_guiding_cache.exr
+```
+
+Path-space caustics, homogeneous volumes, and hero-wavelength spectral transport:
+
+```bash
+build/PathTracerHeadless \
+  --scene=suzanne_caustics \
+  --renderProfile=lookdev \
+  --causticTransportMode=path_space \
+  --volumeTransportMode=homogeneous \
+  --volumeSigmaA=0.02,0.02,0.02 \
+  --volumeSigmaS=0.04,0.04,0.04 \
+  --spectralMode=hero_wavelength \
+  --spectralDispersionStrength=0.012 \
+  --out=renders/suzanne_research_transport.exr
+```
+
+Notes:
+
+- HDR outputs (`exr`, `pfm`) are written in linear space.
+- Embree uses the same `--format` output surface as Metal. EXR/PFM are linear
+  HDR outputs; PNG/PPM are tonemapped visual outputs.
+- `--denoise=1` writes a second file with `_denoised` before the extension.
+- Metal backend logs and large-scene reports are diagnostics, not progress
+  indicators. Use `--verbose` for progress with percentage and ETA.
+
+## Import Pipeline
+
+Runtime rendering is glTF-first. FBX and broad DCC import are handled offline by
+`PathTracerImport`.
+
+```bash
+build/PathTracerImport \
+  --input assets/canonical/bistro/source/BistroExterior.fbx \
+  --output assets/canonical/bistro/imported_exterior \
+  --format glb \
+  --textures convert \
+  --import-mode canonical
+```
+
+Importer flags:
+
+- `--format glb|gltf` - output format, default `glb`.
+- `--textures copy|convert|embed|link` - texture policy, default `copy`.
+- `--import-mode generic|canonical` - import mode, default `generic`.
+
+`--textures=convert` supports Bistro's validated DDS set (`DXT1`/BC1,
+`DXT5`/BC3, `ATI2`/BC5) plus common raster image formats. The importer emits a
+deterministic output directory containing the scene, textures, and
+`import_manifest.json` with schema/version metadata.
+
+If Assimp is not found, the executable still builds in stub mode and exits with
+an explicit diagnostic.
 
 ## Scene Format
 
-Scenes are described with plain-text `.scene` files under `assets/`. Scenes support spheres, rectangles, boxes, triangle meshes (OBJ/PLY), and **glTF 2.0 / GLB** assets:
+Scene files live under `assets` and can also reference external asset files.
+The renderer accepts scene identifiers such as `sponza`, `bistro_full`,
+`bitterli_staircase`, `living_room`, `san_miguel_balcony_sun_restir`, or a path
+to a `.scene`, `.gltf`, or `.glb` file.
 
-```
-camera target=0,0,0 distance=10 yaw=0 pitch=0 vfov=40 defocusAngle=0.6 focusDist=10
-renderer samplesPerFrame=8 maxDepth=20 envRotation=30 envIntensity=1.5 enableSoftwareRayTracing=0 width=1920 height=1080
+Example:
+
+```text
+camera target=0,0,0 distance=10 yaw=0 pitch=0 vfov=40 defocusAngle=0 focusDist=10
+renderer samplesPerFrame=1 maxDepth=12 width=1280 height=720 envRotation=30 envIntensity=1
 
 background env=assets/HDR/studio.hdr
 
@@ -318,127 +613,174 @@ mesh path=models/dragon.obj material=0 translate=0,0,0 scale=1,1,1 rotate=0,180,
 sphere center=0,-1001,0 radius=1000 material=1
 ```
 
-**glTF / GLB loading** — pass a `.gltf` or `.glb` file as the mesh path; materials are imported automatically:
+Supported primitive declarations include `sphere`, `rectangle`, `box`, and
+`mesh`. Meshes may be OBJ, PLY, glTF, or GLB. glTF materials are imported
+automatically.
 
+Renderer overrides can be specified in the scene file and/or on the CLI. CLI
+overrides are applied after parsing.
+
+## Validation
+
+Build the public release targets:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
-mesh path=models/DamagedHelmet.glb translate=0,0,0 scale=1,1,1 rotate=0,0,0
+
+Run the public smoke render:
+
+```bash
+build/PathTracerHeadless \
+  --scene=sponza \
+  --width=320 \
+  --height=180 \
+  --spp=1 \
+  --seed=42 \
+  --out=renders/public_smoke.png \
+  --format=png \
+  --verbose
 ```
 
-**Geometry Types**:
-- `sphere center=X,Y,Z radius=R material=INDEX`
-- `rectangle axis=MIN,MAX perpendicular=VALUE offset=MIN,MAX material=INDEX`
-- `box min=X,Y,Z max=X,Y,Z material=INDEX [translate] [scale] [rotate]`
-- `mesh path=FILE material=INDEX [translate] [scale] [rotate]` — OBJ, PLY, glTF, or GLB
+If a release package includes CTest entries, run:
 
-**Material Types**:
-- `type=lambert` — Matte diffuse
-- `type=metal` — Reflective with Fresnel (optional `fuzz`)
-- `type=dielectric` — Glass/clear (optional `refractiveIndex`)
-- `type=diffuse_light` — Emissive for area lights
-- `type=plastic` — Clear-coat diffuse with tint and absorption
-- `type=subsurface` — Random-walk BSSRDF (marble/wax/jade)
-- `type=carpaint` — Metallic base + procedural flake layer
-- glTF meshes import `PbrMetallicRoughness` materials automatically
+```bash
+ctest --test-dir build --verbose
+```
 
-**Backgrounds**:
-- `background env=path/to/file.hdr` — HDR environment map
-- `background solid=R,G,B` — Solid color
-- `background gradient=R,G,B` — Sky gradient
-- `envRotation` (degrees) and `envIntensity` (multiplier) can be supplied via the `renderer` block to orient and scale the environment map.
+On runners without Metal support, Metal-dependent CTest entries are reported as
+skipped.
 
-**Renderer Overrides**:
-- `samplesPerFrame`, `maxDepth`, `tonemap`, `exposure`, `seed`
-- `envRotation` (degrees) and `envIntensity` (multiplier)
-- `enableSoftwareRayTracing[=0|1]`
-- `enableMnee[=0|1]`
-- `width` / `height` (clamped to ≥ 8)
-- `gltfViewerCompatibilityMode` / `gltfCompat` — opt-in glTF viewer parity behavior
-- `gltfThinWalledFallback` / `gltfThinFallback` — treat transmission-only materials as thin dielectrics
-- `gltfEmissiveScale` — extra emissive multiplier for glTF scenes
-- `gltfCompatLinearBaseColor` / `gltfCompatLinearEmissive` — treat textures as linear (debug/compat)
+Optional Embree smoke validation when Embree is installed:
 
-OBJ files should provide vertex positions and may include normals/UVs for better shading. glTF files are loaded with MikkTSpace-compliant tangent generation.
+```bash
+cmake -S . -B build-embree -DCMAKE_BUILD_TYPE=Release -DPATH_TRACER_ENABLE_EMBREE=ON
+cmake --build build-embree --target PathTracerHeadless EmbreeSmokeTest
+ctest --test-dir build-embree -R embree --verbose
+```
+
+If a public smoke-test helper is included in the release package, it can be run
+directly:
+
+```bash
+tests/public/headless_smoke_test.sh
+```
 
 ## Release
 
-## Release
-[![CI](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/actions/workflows/ci.yml/badge.svg)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/actions/workflows/ci.yml) [![Latest Version](https://img.shields.io/github/v/tag/dariopagliaricci/Metal-PathTracer-arm64?sort=semver)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/tags)
+[![Latest Version](https://img.shields.io/github/v/tag/dariopagliaricci/Metal-PathTracer-arm64?sort=semver)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/tags)
 
-## CI
-
-- GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-- Validates default configure/build and Embree-enabled configure/build paths on macOS.
+Release notes, source archives, and asset-pack links are published through
+[GitHub Releases](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases).
 
 ## Assets Pack
 
-Large scenes and high-resolution HDRIs live in a separate asset pack to keep repository size manageable and avoid versioning bulky binaries:
+The public release contains many scene wrappers and canonical assets. Large
+scenes, high-resolution meshes, HDRIs, and externally licensed datasets may be
+distributed separately to keep the Git repository manageable.
 
-- Download `Metal-PathTracer-Assets.zip` from the [link provided in the GitHub release](https://drive.google.com/file/d/1bn6XsKrmM4go1rTJBAFhyN0r-wA63P3b/view?usp=share_link)
-- Copy/replace the `assets` folder in the root of the project
+- Download `Metal-PathTracer-Assets.zip` from the
+  [link provided in the GitHub release](https://drive.google.com/file/d/1bn6XsKrmM4go1rTJBAFhyN0r-wA63P3b/view?usp=share_link).
+- Copy or replace the `assets` folder in the project root before rendering
+  asset-pack-dependent scenes.
 
+Important scene IDs include:
 
-## Known limitations
+- `bistro_full`, `bistro_full_sun_restir_alt`, `bistro_night_openfront_restir`
+- `sponza`, `sponza_sunlight_hdri_restir`
+- `bitterli_staircase`
+- `living_room`, `living_room_regir_stress`,
+  `living_room_regir_practicals_stress`
+- `san_miguel_2_0`, `san_miguel_balcony_sun_restir`,
+  `san_miguel_2_restir_sunlit_alternate`
+- `luxcoreballs`
+- `gltf-boombox`, `gltf-lantern`, `gltf-flight-helmet`,
+  `gltf-damaged-helmet`, `gltf-emissive-strength`
+- automotive/F1 scenes for Ferrari, Red Bull, McLaren, Mercedes, Alfa Romeo,
+  Alpine, Williams, Haas, Toro Rosso, Racing Point, and Bugatti scenes.
 
-**EXR save UX:**
-- The ImGui "Save EXR…" button currently:
-  - Saves immediately to `./renders/render-YYYYMMDD-HHMMSS.exr`
-  - Does not show a native file dialog
+## Operational Notes
 
-**Platform support:**
-- Binaries and OIDN libraries in `external/oidn/lib` are built for Apple Silicon (arm64)
-- Intel macs and non-macOS platforms are not supported in this configuration
+- macOS on Apple Silicon is the intended supported platform for this renderer.
+- OIDN/TBB native libraries are expected under `external/oidn/lib` for release
+  builds with CPU denoising. The supported runtime is the bundled OIDN 2.4.1
+  package; newer OIDN drops are upgrade candidates until validated. If a
+  source-only checkout omits those native libraries, CMake disables OIDN and
+  core rendering remains usable.
+- Embree is a selectable CPU reference renderer for visual-output parity,
+  asset validation, and backend comparison.
+- Advanced transport systems are explicit opt-in research/production
+  experiments; use the commands in the gated research mode examples above.
+- Wavefront execution is selectable through `--executionMode=wavefront`, with
+  scheduling controlled by `--wavefront-policy`.
+- GUI EXR export intentionally writes timestamped captures to
+  `renders/render-YYYYMMDD-HHMMSS.exr`. Headless runs use `--output` / `--out`
+  when an exact path is required.
+- The importer handles static scenes only; animation, skinning, morph targets,
+  and full DCC material graphs are outside the current importer scope.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Support
-
-Metal PathTracer-arm64 is open-source research software for physically based path tracing on Apple Silicon.
-
-Sponsorship helps support:
-- documentation and reproducible benchmark work
-- signed/notarized macOS builds and distribution experiments
-- validation across Apple Silicon hardware
-- continued development of Metal HWRT, SWRT, Embree, and future renderer architecture work
+This project is licensed under the MIT License. See `LICENSE`.
 
 ## References
 
-### Core Ray Tracing Foundation
-- [Ray Tracing in One Weekend Series](https://raytracing.github.io/) - Peter Shirley
-  - Introduces fundamental path tracing concepts and scene format
+### Physically Based Rendering
 
-### Physically-Based Rendering
-- [Physically Based Rendering: From Theory to Implementation](https://www.pbr-book.org/) - Matt Pharr, Wenzel Jakob, and Greg Humphreys
-  - GGX microfacet BRDF implementation
-  - Multiple Importance Sampling (balance heuristic)
-  - Environment map importance sampling using alias method
-  - Conductor and dielectric Fresnel equations
+- [*Physically Based Rendering: From Theory to Implementation*](https://www.pbr-book.org/)
+  - Matt Pharr, Wenzel Jakob, and Greg Humphreys.
+- [*Robust Monte Carlo Methods for Light Transport Simulation*](https://graphics.stanford.edu/papers/veach_thesis/)
+  - Eric Veach's thesis; MIS and bidirectional light transport foundation.
+- [*Optimally Combining Sampling Techniques for Monte Carlo Rendering*](https://graphics.stanford.edu/courses/cs348b-03/papers/veach-chapter9.pdf)
+  - Veach and Guibas, SIGGRAPH 1995.
 
-### Key Papers and Techniques
-- **Walter et al. 2007** - "Microfacet Models for Refraction through Rough Surfaces" (EGSR 2007)
-  - GGX distribution and Smith masking functions
-- **Veach & Guibas 1995** - "Optimally Combining Sampling Techniques for Monte Carlo Rendering" (SIGGRAPH 1995)
-  - Multiple Importance Sampling theory and balance heuristic
-- **Hanika et al. 2015** - "Manifold Next Event Estimation" (EGSR 2015)
-  - MNEE caustics algorithm
+### Transport, Caustics, and Reuse
 
-### Tonemapping Operators
-- **Stephen Hill & Krzysztof Narkowicz** - ACES fitted approximation
-- **John Hable** - Uncharted 2 tonemap operator (GDC 2010 presentation "Filmic Tonemapping for Real-time Rendering")
-- **Erik Reinhard** - Reinhard tone mapping operator
+- [*Microfacet Models for Refraction through Rough Surfaces*](https://www.cs.cornell.edu/~srm/publications/EGSR07-btdf.pdf)
+  - Walter et al., EGSR 2007.
+- [*Manifold Next Event Estimation*](https://jo.dreggn.org/home/2015_mnee.pdf)
+  - Hanika et al., EGSR 2015.
+- [*Spatiotemporal Reservoir Resampling for Real-Time Ray Tracing with Dynamic Direct Lighting*](https://research.nvidia.com/publication/2020-07_spatiotemporal-reservoir-resampling-real-time-ray-tracing-dynamic-direct)
+  - Bitterli et al., ReSTIR DI.
+- [*ReSTIR GI: Path Resampling for Real-Time Path Tracing*](https://research.nvidia.com/publication/2021-07_restir-gi-path-resampling-real-time-path-tracing)
+  - Ouyang et al., ReSTIR GI.
 
-### Standards & Formats
-- [glTF 2.0 Specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html) - Khronos Group
-- [MikkTSpace](http://www.mikktspace.com/) - Morten Mikkelsen — tangent space standard
+### Reconstruction and Color
+
+- [Intel Open Image Denoise](https://www.openimagedenoise.org/)
+  - CPU denoising backend.
+- [ACES Filmic Tone Mapping Curve](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
+  - Krzysztof Narkowicz ACES approximation.
+- [Filmic Tonemapping Operators](https://filmicworlds.com/blog/filmic-tonemapping-operators/)
+  - John Hable's filmic tonemapping notes.
+- [Photographic Tone Reproduction for Digital Images](https://www.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf)
+  - Reinhard et al.
+
+### Standards and Platform APIs
+
+- [glTF 2.0 Specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html)
+  - Khronos Group scene and material format.
+- [Metal Shading Language Specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf)
+  - Apple.
+- [Metal Ray Tracing](https://developer.apple.com/metal/)
+  - Apple Metal platform documentation.
+- [MikkTSpace](http://www.mikktspace.com/)
+  - Tangent-space standard used for normal mapped assets.
 
 ### Dependencies and Libraries
-- [Intel Open Image Denoise (OIDN)](https://www.openimagedenoise.org/) - ML-based denoising (Apache 2.0)
-- [Dear ImGui](https://github.com/ocornut/imgui) - Immediate mode GUI (MIT)
-- [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo) - 3D gizmo widgets (MIT)
-- [TinyBVH](https://github.com/jacco/tinybvh) - BVH construction (MIT)
-- [TinyObjLoader](https://github.com/tinyobjloader/tinyobjloader) - OBJ parsing (MIT)
-- [MikkTSpace](http://www.mikktspace.com/) - Tangent space generation (zlib/libpng)
 
-### Platform
-- [Metal Shading Language Specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) - Apple
+- [Intel Embree](https://www.embree.org/)
+  - Optional CPU ray tracing backend.
+- [Dear ImGui](https://github.com/ocornut/imgui)
+  - Immediate-mode UI.
+- [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo)
+  - 3D transform gizmos.
+- [TinyBVH](https://github.com/jbikker/tinybvh)
+  - BVH construction and traversal reference.
+- [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader)
+  - OBJ loading.
+- [tinyply](https://github.com/ddiakopoulos/tinyply)
+  - PLY loading.
+- [stb](https://github.com/nothings/stb)
+  - Image loading utilities.

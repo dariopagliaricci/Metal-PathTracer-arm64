@@ -9,6 +9,7 @@
 #include <simd/simd.h>
 
 #include "MetalShaderTypes.h"
+#include "renderer/RenderSettings.h"
 
 namespace PathTracer {
 
@@ -18,10 +19,26 @@ struct RenderSettings;
 /// Discovers available scene descriptions and loads them into SceneResources.
 class SceneManager {
 public:
+    enum class StagedLoadStatus : uint32_t {
+        InProgress = 0,
+        Complete = 1,
+        Failed = 2,
+    };
+
     struct SceneInfo {
         std::string identifier;                  // File stem, used as unique key
         std::string displayName;                 // Human readable title, fallback to identifier
         std::string filePath;                    // Absolute path to the scene file
+    };
+
+    struct StagedLoadState {
+        std::vector<std::pair<size_t, std::string>> directives;
+        size_t nextDirective = 0;
+        bool sawExplicitCameraDirective = false;
+        std::unordered_map<std::string, uint32_t> materialIndicesByName;
+        RenderSettings parsedSettings{};
+        std::string scenePath;
+        std::string sceneDirectoryOverride;
     };
 
     SceneManager();
@@ -49,6 +66,18 @@ public:
                            RenderSettings& inOutSettings,
                            std::string* errorMessage = nullptr);
 
+    bool beginStagedLoadSceneFromPath(const std::string& path,
+                                      SceneResources& resources,
+                                      RenderSettings& inOutSettings,
+                                      StagedLoadState& state,
+                                      std::string* errorMessage = nullptr);
+
+    StagedLoadStatus continueStagedLoadScene(StagedLoadState& state,
+                                             SceneResources& resources,
+                                             RenderSettings& inOutSettings,
+                                             size_t maxDirectives,
+                                             std::string* errorMessage = nullptr) const;
+
     /// Information about the most recently loaded scene, if any.
     const SceneInfo* currentScene() const;
 
@@ -67,7 +96,8 @@ private:
     static bool parseMaterial(const std::unordered_map<std::string, std::string>& tokens,
                               SceneResources& resources,
                               std::string& errorMessage,
-                              std::unordered_map<std::string, uint32_t>& materialIndicesByName);
+                              std::unordered_map<std::string, uint32_t>& materialIndicesByName,
+                              const std::string& sceneDirectory);
     static bool parseSphere(const std::unordered_map<std::string, std::string>& tokens,
                             SceneResources& resources,
                             std::string& errorMessage);
@@ -77,6 +107,12 @@ private:
     static bool parseRectangle(const std::unordered_map<std::string, std::string>& tokens,
                                SceneResources& resources,
                                std::string& errorMessage);
+    static bool parseDisk(const std::unordered_map<std::string, std::string>& tokens,
+                          SceneResources& resources,
+                          std::string& errorMessage);
+    static bool parseDirectionalLight(const std::unordered_map<std::string, std::string>& tokens,
+                                      SceneResources& resources,
+                                      std::string& errorMessage);
     static bool parseMesh(const std::unordered_map<std::string, std::string>& tokens,
                           SceneResources& resources,
                           std::string& errorMessage,
@@ -93,6 +129,7 @@ private:
     static std::string trim(const std::string& value);
     static bool parseFloat(const std::string& value, float& out);
     static bool parseUInt(const std::string& value, uint32_t& out);
+    static bool parseFloat2(const std::string& value, simd::float2& out);
     static bool parseFloat3(const std::string& value, simd::float3& out);
     static bool parseFloatRange(const std::string& value,
                                 float& outMin,

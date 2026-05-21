@@ -65,6 +65,18 @@ public:
                  MTLTextureHandle colorOutput,
                  FilterType filterType = FilterType::RT);
 
+    /// Execute denoising directly on linear RGB buffers.
+    /// Optional albedo is linear RGB. Optional normal is expected in [0,1] encoding
+    /// matching the accumulation normal buffer; it will be remapped to [-1,1].
+    bool denoiseLinearBuffers(const float* colorInputRGB,
+                              const float* albedoInputRGB,
+                              const float* normalInputRGB,
+                              uint32_t width,
+                              uint32_t height,
+                              std::vector<float>& outDenoisedRGB,
+                              FilterType filterType = FilterType::RT,
+                              bool hdr = true);
+
     /// Shutdown and release all OIDN resources
     void shutdown();
 

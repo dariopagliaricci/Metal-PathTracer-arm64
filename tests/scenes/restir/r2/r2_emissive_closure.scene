@@ -1,0 +1,24 @@
+# Dedicated R2 closure scene: emissive-primitive only, no analytic lights.
+# Designed to make baseline emissive sampling waste work on several weak emitters
+# while RIS can preferentially keep the dominant candidate.
+# expected-emissive-count=10
+
+camera target=0.0,1.0,-0.9 distance=6.6 yaw=1.570796 pitch=-0.16 vfov=32.0 defocusAngle=0.0 focusDist=6.6
+background solid=0.0,0.0,0.0
+renderer maxDepth=4 samplesPerFrame=1 tonemap=1 exposure=0.0 russianRoulette=0
+
+material name=matte_gray type=lambert albedo=0.68,0.68,0.68
+material name=emissive_key type=diffuse_light albedo=0.0,0.0,0.0 emit=4.0,4.0,4.0
+material name=emissive_dim_a type=diffuse_light albedo=0.0,0.0,0.0 emit=0.60,0.60,0.60
+material name=emissive_dim_b type=diffuse_light albedo=0.0,0.0,0.0 emit=0.60,0.60,0.60
+material name=emissive_dim_c type=diffuse_light albedo=0.0,0.0,0.0 emit=0.60,0.60,0.60
+material name=emissive_dim_d type=diffuse_light albedo=0.0,0.0,0.0 emit=0.60,0.60,0.60
+
+mesh name=r2_ground type=plane material=matte_gray position=0.0,0.0,0.0 scale=6.0,1.0,6.0
+mesh name=r2_receiver_plane type=plane material=matte_gray position=0.0,1.0,-1.25 scale=2.2,1.0,2.2 rotate=90.0,0.0,0.0
+
+mesh name=r2_key_plane type=plane material=emissive_key position=0.0,3.25,0.10 scale=1.5,1.0,1.5
+mesh name=r2_dim_left type=plane material=emissive_dim_a position=-3.1,3.25,0.20 scale=1.0,1.0,1.0
+mesh name=r2_dim_right type=plane material=emissive_dim_b position=3.1,3.25,0.20 scale=1.0,1.0,1.0
+mesh name=r2_dim_back_left type=plane material=emissive_dim_c position=-2.2,3.55,2.60 scale=1.0,1.0,1.0
+mesh name=r2_dim_back_right type=plane material=emissive_dim_d position=2.2,3.55,2.60 scale=1.0,1.0,1.0

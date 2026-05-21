@@ -1,0 +1,26 @@
+# Aluminium Glass Gold Hygieia Scene
+camera target=0.00,1.60,0.00 distance=9.50 yaw=1.5 pitch=0.0 vfov=25.50 defocusAngle=0.10 focusDist=1.5
+background env=venice_sunrise_4k.hdr
+renderer maxDepth=16 samplesPerFrame=1 tonemap=2 exposure=0.0 reinhardWhite=1.2 \
+         fireflyClampEnabled=1 fireflyClampFactor=6.0 fireflyClampFloor=0.6 \
+         throughputClamp=10.0 specularTailClampBase=3.0 \
+         specularTailClampRoughnessScale=8.0 minSpecularPdf=0.0005
+
+# Materials
+# 0) “Mirror glass” (dielectric). Note: this reflects strongly but still refracts.
+material type=dielectric albedo=1.00,1.00,1.00 ior=1.52 roughness=0.03
+absorption=0.04,0.015,0.01 thickness=0.12
+
+# If you want a *true* perfect mirror instead of glass, swap 0) with this silver conductor:
+# material type=metal albedo=1.00,1.00,1.00 roughness=0.00 eta=0.155,0.116,0.138 k=4.83,3.12,2.15  # Ag (Johnson & Christy)
+
+# 1) Aluminum (brushed silver look)
+material type=metal albedo=1.00,1.00,1.00 roughness=0.25 eta=1.346,0.965,0.617 k=7.475,6.400,5.303   # Al (Rakić)
+
+# 2) Gold
+material type=metal albedo=1.00,1.00,1.00 roughness=0.25 eta=0.183,0.421,1.373 k=3.424,2.346,1.770   # Au (Johnson & Christy)
+
+# Meshes
+mesh name=hygieia_center path=hygieia.obj material=0 translate=0.00,-0.01,0.00 scale=1.00,1.00,1.00 rotate=0.00,45.00,0.00
+mesh name=hygieia_left   path=hygieia.obj material=1 translate=-2.40,-0.01,0.00 scale=1.00,1.00,1.00 rotate=0.00,45.00,0.00
+mesh name=hygieia_right  path=hygieia.obj material=2 translate=2.40,-0.01,0.00 scale=1.00,1.00,1.00 rotate=0.00,30.00,0.00

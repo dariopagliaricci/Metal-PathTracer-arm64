@@ -1,0 +1,30 @@
+# === Line ending normalization (consistent LF) ===
+* text=auto eol=lf
+
+# === Binary assets (no diff, no CRLF conversion) ===
+*.hdr   binary
+*.exr   binary
+*.pfm   binary
+*.ppm   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.zip   binary
+*.dylib binary
+*.tbb   binary
+
+# === Shader and Metal sources (keep as text) ===
+*.metal text
+*.mm    text
+*.h     text
+*.cpp   text
+*.hpp   text
+
+# === macOS plist / bundle resources ===
+*.plist text
+
+# === Codex and log files (text but local) ===
+PROMPTS/* text
+CONTRACT.md text
+ACCEPTANCE.md text
+CODING.md text

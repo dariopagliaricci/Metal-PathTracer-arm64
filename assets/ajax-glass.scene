@@ -1,0 +1,27 @@
+# Ajax Glass Scene
+
+camera target=0.00,1.60,0.00 distance=9.50 yaw=1.5 pitch=0.0 vfov=25.50 defocusAngle=0.10 focusDist=1.5
+background env=san_giuseppe_bridge_4k.hdr
+renderer maxDepth=16 samplesPerFrame=1 tonemap=2 exposure=1.0 reinhardWhite=1.50 \
+        fireflyClampEnabled=1 fireflyClampFactor=4.0 fireflyClampFloor=0.6 \
+        throughputClamp=10.0 specularTailClampBase=3.0 \
+        specularTailClampRoughnessScale=8.0 minSpecularPdf=0.0005
+
+# Materials
+
+# 0) “Mirror glass” (dielectric). Note: this reflects strongly but still refracts.
+material type=dielectric albedo=1.00,1.00,1.00 ior=1.52 roughness=0.03
+absorption=0.04,0.015,0.01 thickness=0.12
+
+# 1) “Mirror glass” (dielectric). Note: this reflects strongly but still refracts.
+material type=dielectric albedo=1.00,1.00,1.00 ior=1.52 roughness=0.03
+absorption=0.04,0.015,0.01 thickness=0.12
+
+# 2) “Mirror glass” (dielectric). Note: this reflects strongly but still refracts.
+material type=dielectric albedo=1.00,1.00,1.00 ior=1.52 roughness=0.03
+absorption=0.04,0.015,0.01 thickness=0.12
+
+# Meshes (note: no spaces inside tuples, each line ends cleanly)
+mesh name=ajax_left   path=ajax.obj material=0 translate=-2.40,0.0,0.00 scale=3.0,3.0,3.0 rotate=0.00,155.0,0.00
+mesh name=ajax_center path=ajax.obj material=1 translate=0.00,0.0,0.00 scale=3.0,3.0,3.0 rotate=0.00,145.0,0.00
+mesh name=ajax_right  path=ajax.obj material=2 translate=2.40,0.0,0.00 scale=3.0,3.0,3.0 rotate=0.00,140.0,0.00

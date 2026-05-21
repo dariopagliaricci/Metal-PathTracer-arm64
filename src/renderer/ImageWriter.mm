@@ -74,9 +74,9 @@ inline Vec3 clampVec(const Vec3& v, float minValue, float maxValue) {
 
 inline Vec3 applyMatrix(const float m[3][3], const Vec3& v) {
     Vec3 r;
-    r.x = m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z;
-    r.y = m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z;
-    r.z = m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z;
+    r.x = m[0][0] * v.x + m[1][0] * v.y + m[2][0] * v.z;
+    r.y = m[0][1] * v.x + m[1][1] * v.y + m[2][1] * v.z;
+    r.z = m[0][2] * v.x + m[1][2] * v.y + m[2][2] * v.z;
     return r;
 }
 
@@ -522,7 +522,9 @@ bool WritePNG(const std::string& path,
         return false;
     }
 
-    CGBitmapInfo bitmapInfo = kCGImageByteOrder32Big | kCGImageAlphaPremultipliedLast;
+    CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
+        static_cast<uint32_t>(kCGImageByteOrder32Big) |
+        static_cast<uint32_t>(kCGImageAlphaPremultipliedLast));
     CGImageRef image = CGImageCreate(width,
                                      height,
                                      8,

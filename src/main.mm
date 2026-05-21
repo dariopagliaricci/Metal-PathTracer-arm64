@@ -2,6 +2,7 @@
 #import <Carbon/Carbon.h>
 
 #include "MetalRenderer.h"
+#include "imgui.h"
 #include "backends/imgui_impl_osx.h"
 
 #include <cstring>
@@ -10,6 +11,22 @@
 namespace {
 constexpr int kInitialWidth = 1280;
 constexpr int kInitialHeight = 720;
+
+bool ConsumePathTracerKeyEvent(NSEvent* event, NSView* view) {
+    if (!event || !view ||
+        (event.type != NSEventTypeKeyDown && event.type != NSEventTypeKeyUp)) {
+        return false;
+    }
+    if ((event.modifierFlags & NSEventModifierFlagCommand) != 0) {
+        return false;
+    }
+    if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard) {
+        return false;
+    }
+
+    ImGui_ImplOSX_HandleEvent(event, view);
+    return true;
+}
 }
 
 @interface PathTracerAppDelegate : NSObject<NSApplicationDelegate>
@@ -55,12 +72,14 @@ constexpr int kInitialHeight = 720;
 
 int main(int argc, const char** argv) {
     bool presentationMode = false;
+    std::string sceneIdentifier;
     for (int i = 1; i < argc; ++i) {
         if (!argv[i]) {
             continue;
         }
         std::string arg(argv[i]);
         constexpr const char* kPresentationPrefix = "--presentation=";
+        constexpr const char* kScenePrefix = "--scene=";
         if (arg.rfind(kPresentationPrefix, 0) == 0) {
             std::string value = arg.substr(std::strlen(kPresentationPrefix));
             if (value == "1" || value == "true" || value == "on") {
@@ -68,6 +87,10 @@ int main(int argc, const char** argv) {
             } else if (value == "0" || value == "false" || value == "off") {
                 presentationMode = false;
             }
+        } else if (arg.rfind(kScenePrefix, 0) == 0) {
+            sceneIdentifier = arg.substr(std::strlen(kScenePrefix));
+        } else if (arg == "--scene" && i + 1 < argc && argv[i + 1]) {
+            sceneIdentifier = argv[++i];
         }
     }
     @autoreleasepool {
@@ -90,6 +113,7 @@ int main(int argc, const char** argv) {
         options.height = kInitialHeight;
         options.windowTitle = "Path Tracer Metal";
         options.presentationMode = presentationMode;
+        options.initialScene = sceneIdentifier;
         [window setTitle:[NSString stringWithUTF8String:options.windowTitle.c_str()]];
 
         __block bool shouldQuit = false;
@@ -126,6 +150,7 @@ int main(int argc, const char** argv) {
 
             while (!shouldQuit) {
                 @autoreleasepool {
+                    NSView* contentView = window.contentView;
                     NSEvent* event = nil;
                     do {
                         event = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -153,6 +178,10 @@ int main(int argc, const char** argv) {
                                         continue;
                                     }
                                 }
+                            }
+                            if (ConsumePathTracerKeyEvent(event, contentView)) {
+                                event = nil;
+                                continue;
                             }
                             [NSApp sendEvent:event];
                         }

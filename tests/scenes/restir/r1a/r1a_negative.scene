@@ -1,0 +1,9 @@
+# R1A portable negative acceptance scene: mesh present, no emissive primitives expected.
+camera target=0.5,0.5,0.0 distance=4.0 yaw=1.570796 pitch=0.0 vfov=35.0 defocusAngle=0.0 focusDist=4.0
+background solid=0.0,0.0,0.0
+renderer maxDepth=2 samplesPerFrame=1 tonemap=1 exposure=0.0 russianRoulette=0
+
+material name=matte_gray type=lambert albedo=0.7,0.7,0.7
+
+# expected-emissive-count=0
+mesh name=r1a_negative_plane type=plane material=matte_gray

@@ -60,7 +60,7 @@ bool MetalContext::initialize(NSWindowHandle window, bool headless) {
         m_view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         if (m_view.layer && [m_view.layer isKindOfClass:[CAMetalLayer class]]) {
             CAMetalLayer* metalLayer = (CAMetalLayer*)m_view.layer;
-            metalLayer.allowsNextDrawableTimeout = NO;
+            metalLayer.allowsNextDrawableTimeout = YES;
         }
 
         [window setContentView:m_view];

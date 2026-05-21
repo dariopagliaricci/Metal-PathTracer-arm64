@@ -1,41 +1,40 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+## v3.2.1 - Texture Closure Milestone
 
-## [v2.0.0] - 2026-03-01
+- Added importer `schema_version: "1.0"` emission in `import_manifest.json`.
+- Added `--textures=convert` with deterministic `.ktx2` output for Bistro’s DDS set plus common raster image formats.
+- Added explicit non-zero stub diagnostics when `PathTracerImport` is built without Assimp.
+- Added pending Bistro canonical manifest metadata in `assets/canonical/bistro.yaml`.
+- Added runtime `.ktx2` texture loading in the renderer for converted import output.
 
-### Added
-- glTF 2.0 / GLB loader with PBR metallic-roughness material support.
-- Multi-UV texture support (`TEXCOORD_0` / `TEXCOORD_1`) and `KHR_texture_transform` handling.
-- Camera import from glTF camera nodes.
-- MikkTSpace tangent generation for normal-mapped glTF assets.
-- MNEE (Manifold Next Event Estimation) caustics path.
-- Bloom post-processing controls.
-- ACEScg working color-space option.
-- Headless output formats: PNG, PFM, and PPM (in addition to EXR).
-- Optional Embree CPU backend (`PATH_TRACER_ENABLE_EMBREE=ON`) with `EmbreeSmokeTest` target.
-- Presentation Mode for UI-free demos.
-- GUI "Save EXR..." button in the Output/Export panel.
-- Initial GitHub Actions CI workflow for configure/build validation.
+## v3.2.0 - Assimp Import Pipeline + glTF Cache
 
-### Changed
-- Embree is now vendored under `external/embree` for opt-in local builds.
-- `M0_TESTS` now fails fast with an explicit message when internal golden-test scripts are unavailable.
-- Asset handling in CMake now supports public checkouts without a local asset pack by creating empty asset directories instead of failing.
-- Documentation clarified that public repository scope excludes internal golden-image scripts and large non-versioned asset packs.
+- Added `PathTracerImport`, a standalone importer that converts Assimp-supported static scenes into deterministic glTF 2.0 output with `import_manifest.json`.
+- Added optional CMake Assimp discovery with a stub fallback so the project still configures and builds cleanly when Assimp is not installed.
+- Added importer texture policies for copied external textures by default plus experimental embedded and linked texture modes.
+- Documented the Bistro FBX import workflow and importer CLI in `README.md`.
 
-### Notes
-- Internal golden-image scripts (`tests/tools/golden_test.sh`) remain private and are intentionally not distributed in this public repository.
-- Large scene assets/HDRIs are intentionally not versioned in Git and should be provided via the external asset pack.
+## v3.1.0 - Large Scene Pilot Framework (Bistro Readiness)
 
-## [v1.0.0] - 2025-11-19
+- Added stable `bistro_exterior` and `bistro_interior` pilot scene IDs backed by the existing ORCA Bistro asset pack under `assets/canonical/bistro`.
+- Added a pre-build Large Scene Report for headless runs with geometry totals, top meshes, top textures, device budget reporting, and pilot-policy outcome logging.
+- Added `--pilot-mode=<geo_only|albedo_only|full_clamped>` for controlled Bistro bring-up without touching the runtime integrator.
+- Added `--texture-max-dim` and `--max-texture-bytes` with explicit clamp/skip logging integrated into material texture loading.
+- Added pre-build strict fail-fast handling when pilot texture policy or pre-build working-set estimates already exceed the selected budget policy.
 
-### Added
-- Initial public release targeting Apple Silicon (arm64).
-- Metal HWRT + software BVH path tracing backends.
-- Progressive accumulation renderer.
-- HDR environment lighting with MIS and rotation/intensity controls.
-- Core material models (Lambertian, metal, dielectric, plastic, car paint, subsurface, emissive).
-- OBJ/PLY mesh support.
-- OIDN integration.
-- ImGui + ImGuizmo GUI application and headless renderer.
+## v3.0.0 - Infrastructure & Scalability Foundation
+
+- Added headless scene statistics reporting for triangle / mesh / instance / texture counts plus geometry, texture, BLAS, TLAS, and total estimated working-set memory.
+- Added `--budget-policy=<strict|warn|ignore>` to enforce scene memory budgets against `MTLDevice.recommendedMaxWorkingSetSize`.
+- Added BLAS / TLAS build instrumentation and explicit backend logging so Metal HWRT fallback to SWRT is never silent.
+- Added `--stats` plus `--force-hwrt` / `--force-swrt` for explicit runtime/backend control during headless renders.
+- Documented the v3 canonical benchmark commands for `bitterli_staircase` and `sponza` in `README.md`.
+
+## v2.0.4 - Environment Robustness (Sponza)
+
+- Added canonical `sponza` scene discovery via `assets/sponza.scene`.
+- Added fixed Sponza camera and headless baseline settings for deterministic 1280x720 EXR renders.
+- Added `--spp` and `--out` CLI aliases for milestone reproduction commands.
+- Added a dedicated `scripts/v2_0_4_sponza_validate.py` acceptance runner for determinism and HWRT/SWRT parity.
+- Documented the canonical Sponza baseline and HWRT/SWRT parity workflow in `README.md`.

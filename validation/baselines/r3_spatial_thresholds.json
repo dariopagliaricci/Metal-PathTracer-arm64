@@ -1,0 +1,17 @@
+{
+  "status": "R3_CLOSEOUT_HARNESS",
+  "scene": "tests/scenes/restir/r2/r2_emissive_closure.scene",
+  "positive_debug_pixel": "64,36",
+  "rejection_debug_pixel": "64,53",
+  "seeds": [42, 123, 321],
+  "width": 128,
+  "height": 72,
+  "spp": 1,
+  "ris_m": 8,
+  "spatial_reuse_k": 4,
+  "min_variance_improvement_fraction": 0.0,
+  "max_spatial_over_ris_gpu_time_ratio": 1.5,
+  "require_rejection_per_seed": true,
+  "require_finite_outputs": true,
+  "note": "Narrow Metal-only R3 same-frame spatial-reuse closeout harness threshold record. This is not full R3 closure and does not cover temporal reuse or ReGIR."
+}

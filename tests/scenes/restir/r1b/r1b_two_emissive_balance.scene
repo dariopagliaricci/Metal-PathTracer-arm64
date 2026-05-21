@@ -1,0 +1,15 @@
+# R1B bootstrap placeholder: two emissive mesh planes with unequal emitted power over a diffuse receiver plane.
+# This scene is for future non-degenerate light-selection validation, not R1A acceptance.
+# expected-emissive-count=4
+camera target=0.0,1.0,0.0 distance=7.0 yaw=1.570796 pitch=-0.18 vfov=35.0 defocusAngle=0.0 focusDist=7.0
+background solid=0.0,0.0,0.0
+renderer maxDepth=4 samplesPerFrame=1 tonemap=1 exposure=0.0 russianRoulette=0
+
+material name=matte_gray type=lambert albedo=0.7,0.7,0.7
+material name=emissive_dim type=diffuse_light albedo=0.0,0.0,0.0 emit=1.0,1.0,1.0
+material name=emissive_bright type=diffuse_light albedo=0.0,0.0,0.0 emit=4.0,4.0,4.0
+
+mesh name=r1b_ground type=plane material=matte_gray position=0.0,0.0,0.0 scale=5.0,1.0,5.0
+mesh name=r1b_receiver_plane type=plane material=matte_gray position=0.0,1.0,-1.25 scale=1.75,1.0,1.75 rotate=90.0,0.0,0.0
+mesh name=r1b_fill_plane type=plane material=emissive_dim position=-1.75,3.2,0.0 scale=1.0,1.0,1.0
+mesh name=r1b_key_plane type=plane material=emissive_bright position=1.75,3.2,0.0 scale=1.0,1.0,1.0

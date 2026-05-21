@@ -62,7 +62,17 @@ public:
     MTLTextureHandle present() const { return m_presentTexture; }
     MTLTextureHandle albedoBuffer() const { return m_albedoTexture; }
     MTLTextureHandle normalBuffer() const { return m_normalTexture; }
+    MTLTextureHandle positionBuffer() const { return m_positionTexture; }
+    MTLTextureHandle materialFeatureBuffer() const { return m_materialFeatureTexture; }
+    MTLTextureHandle motionVectorBuffer() const { return m_motionVectorTexture; }
     MTLTextureHandle denoisedBuffer() const { return m_denoisedTexture; }
+    MTLTextureHandle svgfScratchBuffer() const { return m_svgfScratchTexture; }
+    MTLTextureHandle svgfMomentsBufferA() const { return m_svgfMomentsTextureA; }
+    MTLTextureHandle svgfMomentsBufferB() const { return m_svgfMomentsTextureB; }
+    MTLTextureHandle svgfGuideBufferA() const { return m_svgfGuideTextureA; }
+    MTLTextureHandle svgfGuideBufferB() const { return m_svgfGuideTextureB; }
+    MTLTextureHandle svgfColorBufferA() const { return m_svgfColorTextureA; }
+    MTLTextureHandle svgfColorBufferB() const { return m_svgfColorTextureB; }
     
     // State accessors
     uint32_t frameIndex() const { return m_frameIndex; }
@@ -78,7 +88,17 @@ private:
     MTLTextureHandle m_presentTexture = nullptr;
     MTLTextureHandle m_albedoTexture = nullptr;
     MTLTextureHandle m_normalTexture = nullptr;
+    MTLTextureHandle m_positionTexture = nullptr;
+    MTLTextureHandle m_materialFeatureTexture = nullptr;
+    MTLTextureHandle m_motionVectorTexture = nullptr;
     MTLTextureHandle m_denoisedTexture = nullptr;
+    MTLTextureHandle m_svgfScratchTexture = nullptr;
+    MTLTextureHandle m_svgfMomentsTextureA = nullptr;
+    MTLTextureHandle m_svgfMomentsTextureB = nullptr;
+    MTLTextureHandle m_svgfGuideTextureA = nullptr;
+    MTLTextureHandle m_svgfGuideTextureB = nullptr;
+    MTLTextureHandle m_svgfColorTextureA = nullptr;
+    MTLTextureHandle m_svgfColorTextureB = nullptr;
 
     // Accumulation state
     uint32_t m_frameIndex = 0;

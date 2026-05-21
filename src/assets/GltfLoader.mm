@@ -1,5 +1,6 @@
 #import "assets/GltfLoader.h"
 
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
@@ -30,6 +31,40 @@ using PathTracerShaderTypes::MaterialType;
 using PathTracerShaderTypes::MaterialData;
 
 constexpr uint32_t kInvalidTextureIndex = 0xFFFFFFFFu;
+
+void PumpMainThreadEventsBriefly() {
+    if (![NSThread isMainThread]) {
+        return;
+    }
+    NSApplication* app = [NSApplication sharedApplication];
+    if (!app) {
+        return;
+    }
+    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:0.001];
+    NSArray<NSString*>* modes = @[
+        NSDefaultRunLoopMode,
+        NSEventTrackingRunLoopMode,
+        NSModalPanelRunLoopMode
+    ];
+    for (NSString* mode in modes) {
+        while (true) {
+            NSEvent* event = [app nextEventMatchingMask:NSEventMaskAny
+                                              untilDate:deadline
+                                                 inMode:mode
+                                                dequeue:YES];
+            if (!event) {
+                break;
+            }
+            [app sendEvent:event];
+        }
+    }
+}
+
+inline void PumpEventsEvery(size_t counter, size_t interval = 16384u) {
+    if (counter > 0u && (counter % interval) == 0u) {
+        PumpMainThreadEventsBriefly();
+    }
+}
 
 struct GltfBuffer {
     std::vector<uint8_t> data;
@@ -105,6 +140,7 @@ struct GltfMaterial {
     bool hasIor = false;
     float ior = 1.5f;
     bool disableOrmTexture = false;
+    bool forceBaseColorAlphaMask = false;
 };
 
 struct GltfPrimitive {
@@ -141,6 +177,14 @@ struct GltfNode {
     simd::float3 scale = simd_make_float3(1.0f, 1.0f, 1.0f);
     bool hasMatrix = false;
     simd::float4x4 matrix = matrix_identity_float4x4;
+};
+
+struct PrimitiveTask {
+    uint32_t meshIndex = 0u;
+    uint32_t primitiveIndex = 0u;
+    simd::float4x4 localToWorld = matrix_identity_float4x4;
+    simd::float4x4 sourceLocalTransform = matrix_identity_float4x4;
+    std::string baseName;
 };
 
 bool ReadFileBytes(const fs::path& path, std::vector<uint8_t>& outBytes, std::string& error) {
@@ -214,6 +258,219 @@ bool ContainsCaseInsensitive(const std::string& text, const std::string& needle)
     const std::string lowerText = ToLowerAscii(text);
     const std::string lowerNeedle = ToLowerAscii(needle);
     return lowerText.find(lowerNeedle) != std::string::npos;
+}
+
+bool MaterialNameSuggestsDoubleSided(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, ".doublesided") ||
+           ContainsCaseInsensitive(materialName, "_doublesided");
+}
+
+bool MaterialNameSuggestsMaskedFoliage(const std::string& materialName) {
+    if (!(ContainsCaseInsensitive(materialName, "foliage") ||
+          ContainsCaseInsensitive(materialName, "leaf") ||
+          ContainsCaseInsensitive(materialName, "leaves") ||
+          ContainsCaseInsensitive(materialName, "ivy") ||
+          ContainsCaseInsensitive(materialName, "flower") ||
+          ContainsCaseInsensitive(materialName, "flowers") ||
+          ContainsCaseInsensitive(materialName, "bux"))) {
+        return false;
+    }
+    return MaterialNameSuggestsDoubleSided(materialName) ||
+           ContainsCaseInsensitive(materialName, "masked");
+}
+
+bool MaterialNameSuggestsMaskedSignage(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "sign") ||
+           ContainsCaseInsensitive(materialName, "logo") ||
+           ContainsCaseInsensitive(materialName, "shop") ||
+           ContainsCaseInsensitive(materialName, "cafe") ||
+           ContainsCaseInsensitive(materialName, "coin") ||
+           ContainsCaseInsensitive(materialName, "petit") ||
+           ContainsCaseInsensitive(materialName, "decal");
+}
+
+bool MaterialNameSuggestsSparseAtlasSignage(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "sign") ||
+           ContainsCaseInsensitive(materialName, "banner") ||
+           ContainsCaseInsensitive(materialName, "menu") ||
+           ContainsCaseInsensitive(materialName, "shop") ||
+           ContainsCaseInsensitive(materialName, "letters") ||
+           ContainsCaseInsensitive(materialName, "text") ||
+           ContainsCaseInsensitive(materialName, "coin") ||
+           ContainsCaseInsensitive(materialName, "petit");
+}
+
+bool MaterialNameLooksLikeBulkF1LiveryAtlas(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "_badges") ||
+           ContainsCaseInsensitive(materialName, "_ext_");
+}
+
+bool MaterialNameNeedsBlackKeyMask(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "master_side_letters");
+}
+
+bool MaterialNameNeedsUv1Override(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "master_wood_painted3.002");
+}
+
+bool MaterialNameLooksLikeBistroPlaceholderOverlay(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "bistro_sign_letters");
+}
+
+bool MaterialNameShouldHideBistroSideLetters(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "master_side_letters");
+}
+
+struct BistroPracticalEmission {
+    simd::float3 emission;
+    simd::float3 baseColor;
+};
+
+std::optional<BistroPracticalEmission> BistroPracticalEmissionForMaterial(const std::string& materialName) {
+    if (ContainsCaseInsensitive(materialName, "master_light_bulb")) {
+        return BistroPracticalEmission{simd_make_float3(12.0f, 7.2f, 3.8f),
+                                       simd_make_float3(1.0f, 1.0f, 1.0f)};
+    }
+    if (ContainsCaseInsensitive(materialName, "paris_stringlights_01_") &&
+        ContainsCaseInsensitive(materialName, "color_emissive")) {
+        if (ContainsCaseInsensitive(materialName, "orange")) {
+            return BistroPracticalEmission{simd_make_float3(310.0f, 46.0f, 3.2f),
+                                           simd_make_float3(1.0f, 0.22f, 0.03f)};
+        }
+        if (ContainsCaseInsensitive(materialName, "blue")) {
+            return BistroPracticalEmission{simd_make_float3(0.28f, 2.0f, 32.0f),
+                                           simd_make_float3(0.03f, 0.12f, 1.0f)};
+        }
+        if (ContainsCaseInsensitive(materialName, "pink") ||
+            ContainsCaseInsensitive(materialName, "violet")) {
+            return BistroPracticalEmission{simd_make_float3(58.0f, 0.75f, 58.0f),
+                                           simd_make_float3(0.95f, 0.04f, 1.0f)};
+        }
+        if (ContainsCaseInsensitive(materialName, "red")) {
+            return BistroPracticalEmission{simd_make_float3(340.0f, 1.4f, 0.28f),
+                                           simd_make_float3(1.0f, 0.03f, 0.015f)};
+        }
+        if (ContainsCaseInsensitive(materialName, "green")) {
+            return BistroPracticalEmission{simd_make_float3(0.18f, 34.0f, 1.3f),
+                                           simd_make_float3(0.02f, 1.0f, 0.08f)};
+        }
+        if (ContainsCaseInsensitive(materialName, "white")) {
+            return BistroPracticalEmission{simd_make_float3(0.0f, 0.0f, 0.0f),
+                                           simd_make_float3(0.015f, 0.015f, 0.012f)};
+        }
+    }
+    if (ContainsCaseInsensitive(materialName, "spotlight_glass_emissive") ||
+        ContainsCaseInsensitive(materialName, "spotlight_emissive")) {
+        return BistroPracticalEmission{simd_make_float3(8.0f, 4.8f, 2.5f),
+                                       simd_make_float3(1.0f, 1.0f, 1.0f)};
+    }
+    if (ContainsCaseInsensitive(materialName, "paris_wall_light_interior") ||
+        ContainsCaseInsensitive(materialName, "paris_wall_bulb_light")) {
+        return BistroPracticalEmission{simd_make_float3(8.5f, 5.0f, 2.6f),
+                                       simd_make_float3(1.0f, 1.0f, 1.0f)};
+    }
+    if (ContainsCaseInsensitive(materialName, "emissive_streetlight") ||
+        ContainsCaseInsensitive(materialName, "streetlight_support_bulb")) {
+        return BistroPracticalEmission{simd_make_float3(13.0f, 7.6f, 3.9f),
+                                       simd_make_float3(1.0f, 1.0f, 1.0f)};
+    }
+    return std::nullopt;
+}
+
+bool BistroStringLightCableMaterial(const std::string& materialName) {
+    if (ContainsCaseInsensitive(materialName, "stringlights") &&
+        !ContainsCaseInsensitive(materialName, "paris_stringlights_01_")) {
+        return true;
+    }
+    if (ContainsCaseInsensitive(materialName, "lanternemissive") ||
+        ContainsCaseInsensitive(materialName, "lantern_cord_dark_nonemissive")) {
+        return true;
+    }
+    return ContainsCaseInsensitive(materialName, "paris_stringlights_01_white_color") &&
+           !ContainsCaseInsensitive(materialName, "emissive");
+}
+
+bool BistroColoredStringLightEmitterMaterial(const std::string& materialName) {
+    return ContainsCaseInsensitive(materialName, "paris_stringlights_01_") &&
+           ContainsCaseInsensitive(materialName, "color_emissive") &&
+           !ContainsCaseInsensitive(materialName, "white");
+}
+
+bool PathLooksLikeBistroAsset(const std::string& path) {
+    return ContainsCaseInsensitive(path, "canonical/bistro") ||
+           ContainsCaseInsensitive(path, "bistro_openfront") ||
+           ContainsCaseInsensitive(path, "/bistro/");
+}
+
+bool PathLooksLikeSponzaAsset(const std::string& path) {
+    return ContainsCaseInsensitive(path, "canonical/khronos/gltf/sponza") ||
+           ContainsCaseInsensitive(path, "/sponza/");
+}
+
+bool PathLooksLikeBulkF1Asset(const std::string& path) {
+    return ContainsCaseInsensitive(path, "/f1_bulk_15/") ||
+           ContainsCaseInsensitive(path, "\\f1_bulk_15\\");
+}
+
+bool TextureBindingLooksLikeBistroSpecularWorkflowFallback(const std::string& gltfPath,
+                                                           const GltfTextureBinding& binding,
+                                                           const std::vector<GltfTexture>& textures,
+                                                           const std::vector<GltfImage>& images) {
+    if (!PathLooksLikeBistroAsset(gltfPath) || binding.index < 0 ||
+        binding.index >= static_cast<int>(textures.size())) {
+        return false;
+    }
+    const GltfTexture& texture = textures[static_cast<size_t>(binding.index)];
+    if (texture.source < 0 || texture.source >= static_cast<int>(images.size())) {
+        return false;
+    }
+    const GltfImage& image = images[static_cast<size_t>(texture.source)];
+    return ContainsCaseInsensitive(image.uri, "specular") ||
+           ContainsCaseInsensitive(image.name, "specular");
+}
+
+bool TextureBindingLooksLikeSponzaBlackKeyCutout(const std::string& gltfPath,
+                                                 const GltfTextureBinding& binding,
+                                                 const std::vector<GltfTexture>& textures,
+                                                 const std::vector<GltfImage>& images) {
+    if (!PathLooksLikeSponzaAsset(gltfPath) || binding.index < 0 ||
+        binding.index >= static_cast<int>(textures.size())) {
+        return false;
+    }
+    const GltfTexture& texture = textures[static_cast<size_t>(binding.index)];
+    if (texture.source < 0 || texture.source >= static_cast<int>(images.size())) {
+        return false;
+    }
+    const GltfImage& image = images[static_cast<size_t>(texture.source)];
+    const std::string label = image.uri + " " + image.name;
+    // Khronos Sponza stores these cutout decals as opaque JPGs with black-key
+    // borders. Treat only the known decorative shield/lion base-color atlases
+    // as masked so internal dark sculpting detail remains intact.
+    return ContainsCaseInsensitive(label, "8750083169368950601") ||
+           ContainsCaseInsensitive(label, "6772804448157695701");
+}
+
+bool TextureBindingImageSuggestsMaskedFoliage(const GltfTextureBinding& binding,
+                                              const std::vector<GltfTexture>& textures,
+                                              const std::vector<GltfImage>& images) {
+    if (binding.index < 0 || binding.index >= static_cast<int>(textures.size())) {
+        return false;
+    }
+    const GltfTexture& texture = textures[static_cast<size_t>(binding.index)];
+    if (texture.source < 0 || texture.source >= static_cast<int>(images.size())) {
+        return false;
+    }
+    const GltfImage& image = images[static_cast<size_t>(texture.source)];
+    const std::string label = image.uri + " " + image.name;
+    return ContainsCaseInsensitive(label, "foliage") ||
+           ContainsCaseInsensitive(label, "leaf") ||
+           ContainsCaseInsensitive(label, "leaves") ||
+           ContainsCaseInsensitive(label, "hoja") ||
+           ContainsCaseInsensitive(label, "ivy") ||
+           ContainsCaseInsensitive(label, "petal") ||
+           ContainsCaseInsensitive(label, "flower") ||
+           ContainsCaseInsensitive(label, "flowers") ||
+           ContainsCaseInsensitive(label, "lef");
 }
 
 simd::float4x4 MakeTranslation(const simd::float3& t) {
@@ -318,6 +575,120 @@ int ClampTexCoordSet(int texCoord) {
         return 0;
     }
     return std::min(texCoord, 1);
+}
+
+const char* AssetTextureSemanticLabel(MaterialTextureSemantic semantic) {
+    switch (semantic) {
+        case MaterialTextureSemantic::BaseColor: return "baseColor";
+        case MaterialTextureSemantic::Orm: return "orm";
+        case MaterialTextureSemantic::Normal: return "normal";
+        case MaterialTextureSemantic::Occlusion: return "occlusion";
+        case MaterialTextureSemantic::Emissive: return "emissive";
+        case MaterialTextureSemantic::Transmission: return "transmission";
+        case MaterialTextureSemantic::Generic:
+        default: return "generic";
+    }
+}
+
+void AddAssetDiagnostic(AssetPipelineReport& report,
+                        std::string severity,
+                        std::string category,
+                        std::string message,
+                        std::string assetPath = {},
+                        std::string objectType = {},
+                        std::string objectName = {},
+                        int32_t objectIndex = -1) {
+    AssetPipelineDiagnostic diagnostic{};
+    diagnostic.severity = std::move(severity);
+    diagnostic.category = std::move(category);
+    diagnostic.message = std::move(message);
+    diagnostic.assetPath = std::move(assetPath);
+    diagnostic.objectType = std::move(objectType);
+    diagnostic.objectName = std::move(objectName);
+    diagnostic.objectIndex = objectIndex;
+    if (diagnostic.severity == "error") {
+        ++report.stats.errorCount;
+    } else if (diagnostic.severity == "warning") {
+        ++report.stats.warningCount;
+    }
+    report.diagnostics.push_back(std::move(diagnostic));
+}
+
+bool GltfExtensionSupportedForImport(const std::string& extension) {
+    return extension == "KHR_texture_transform" ||
+           extension == "KHR_materials_transmission" ||
+           extension == "KHR_materials_volume" ||
+           extension == "KHR_materials_ior" ||
+           extension == "KHR_materials_emissive_strength";
+}
+
+void RecordUnsupportedExtensions(NSDictionary* root,
+                                 AssetPipelineReport& report,
+                                 const std::string& path) {
+    auto inspect = [&](NSString* key, bool required) {
+        NSArray* extensions = root[key];
+        if (![extensions isKindOfClass:[NSArray class]]) {
+            return;
+        }
+        for (id value in extensions) {
+            if (![value isKindOfClass:[NSString class]]) {
+                continue;
+            }
+            std::string extension([(NSString*)value UTF8String]);
+            if (GltfExtensionSupportedForImport(extension)) {
+                continue;
+            }
+            ++report.stats.unsupportedExtensionCount;
+            AddAssetDiagnostic(report,
+                               required ? "error" : "warning",
+                               "unsupported_extension",
+                               std::string(required ? "Required" : "Used") +
+                                   " glTF extension is not mapped by the importer: " + extension,
+                               path,
+                               "extension",
+                               extension);
+        }
+    };
+    inspect(@"extensionsRequired", true);
+    inspect(@"extensionsUsed", false);
+}
+
+std::string GltfImageSourceLabel(const std::string& gltfPath,
+                                 int imageIndex,
+                                 const GltfImage& image) {
+    if (!image.uri.empty()) {
+        if (image.uri.rfind("data:", 0) == 0) {
+            return gltfPath + ":image:" + std::to_string(imageIndex);
+        }
+        return (fs::path(gltfPath).parent_path() / image.uri).string();
+    }
+    if (image.bufferView >= 0) {
+        return gltfPath + ":bufferView:" + std::to_string(image.bufferView);
+    }
+    return gltfPath + ":image:" + std::to_string(imageIndex);
+}
+
+void RecordTextureColorSpace(AssetPipelineReport* report,
+                             const std::string& gltfPath,
+                             int textureIndex,
+                             int imageIndex,
+                             const GltfImage* image,
+                             bool srgb,
+                             MaterialTextureSemantic semantic,
+                             std::string status) {
+    if (!report) {
+        return;
+    }
+    AssetTextureColorSpace entry{};
+    entry.textureIndex = textureIndex;
+    entry.imageIndex = imageIndex;
+    entry.semantic = AssetTextureSemanticLabel(semantic);
+    entry.colorSpace = srgb ? "srgb" : "linear";
+    entry.status = std::move(status);
+    if (image) {
+        entry.source = GltfImageSourceLabel(gltfPath, imageIndex, *image);
+    }
+    report->textureColorSpaces.push_back(std::move(entry));
 }
 
 void ParseTextureBinding(NSDictionary* textureInfo, GltfTextureBinding& out) {
@@ -453,6 +824,7 @@ bool ReadAccessorFloatN(const std::vector<GltfBuffer>& buffers,
     }
     out.resize(accessor.count * components);
     for (size_t i = 0; i < accessor.count; ++i) {
+        PumpEventsEvery(i);
         const uint8_t* ptr = base + i * stride;
         for (size_t c = 0; c < components; ++c) {
             size_t offset = 0;
@@ -484,6 +856,7 @@ bool ReadAccessorIndices(const std::vector<GltfBuffer>& buffers,
     }
     out.resize(accessor.count);
     for (size_t i = 0; i < accessor.count; ++i) {
+        PumpEventsEvery(i);
         const uint8_t* ptr = base + i * stride;
         switch (accessor.componentType) {
             case 5125: {
@@ -511,6 +884,191 @@ bool ReadAccessorIndices(const std::vector<GltfBuffer>& buffers,
     return true;
 }
 
+bool LoadPrimitiveTask(const GltfPrimitive& prim,
+                       const simd::float4x4& localToWorld,
+                       const simd::float4x4& sourceLocalTransform,
+                       const std::string& baseName,
+                       const std::vector<GltfAccessor>& accessors,
+                       const std::vector<GltfBuffer>& buffers,
+                       const std::vector<GltfBufferView>& views,
+                       const std::vector<uint32_t>& materialMap,
+                       SceneResources& resources,
+                       std::string& errorMessage,
+                       GltfCameraInfo* outCamera) {
+    if (prim.mode != 4) {
+        return true;
+    }
+    if (prim.positionAccessor < 0 ||
+        prim.positionAccessor >= static_cast<int>(accessors.size())) {
+        errorMessage = "glTF primitive missing POSITION accessor";
+        return false;
+    }
+
+    const GltfAccessor& posAcc = accessors[prim.positionAccessor];
+    std::vector<float> positions;
+    if (!ReadAccessorFloatN(buffers, views, posAcc, 3, positions)) {
+        errorMessage = "Failed reading POSITION accessor";
+        return false;
+    }
+    const size_t vertexCount = posAcc.count;
+    if (vertexCount == 0) {
+        return true;
+    }
+
+    if (outCamera) {
+        simd::float3 sceneMin = simd_make_float3(0.0f, 0.0f, 0.0f);
+        simd::float3 sceneMax = simd_make_float3(0.0f, 0.0f, 0.0f);
+        bool hasBounds = false;
+        for (size_t i = 0; i < vertexCount; ++i) {
+            PumpEventsEvery(i);
+            simd::float3 localPos = simd_make_float3(positions[i * 3 + 0],
+                                                     positions[i * 3 + 1],
+                                                     positions[i * 3 + 2]);
+            simd::float4 worldPos4 = simd_mul(localToWorld, simd_make_float4(localPos, 1.0f));
+            simd::float3 worldPos = simd_make_float3(worldPos4.x, worldPos4.y, worldPos4.z);
+            if (!hasBounds) {
+                sceneMin = worldPos;
+                sceneMax = worldPos;
+                hasBounds = true;
+            } else {
+                sceneMin = simd_min(sceneMin, worldPos);
+                sceneMax = simd_max(sceneMax, worldPos);
+            }
+        }
+        if (hasBounds) {
+            if (!outCamera->hasSceneBounds) {
+                outCamera->sceneCenter = (sceneMin + sceneMax) * 0.5f;
+                simd::float3 ext = sceneMax - sceneMin;
+                outCamera->sceneRadius = simd::length(ext) * 0.5f;
+                outCamera->hasSceneBounds = true;
+            } else {
+                simd::float3 minC = outCamera->sceneCenter - simd_make_float3(outCamera->sceneRadius);
+                simd::float3 maxC = outCamera->sceneCenter + simd_make_float3(outCamera->sceneRadius);
+                minC = simd_min(minC, sceneMin);
+                maxC = simd_max(maxC, sceneMax);
+                outCamera->sceneCenter = (minC + maxC) * 0.5f;
+                simd::float3 ext = maxC - minC;
+                outCamera->sceneRadius = simd::length(ext) * 0.5f;
+            }
+        }
+    }
+
+    std::vector<float> normals;
+    bool hasNormals = false;
+    if (prim.normalAccessor >= 0 && prim.normalAccessor < static_cast<int>(accessors.size())) {
+        hasNormals = ReadAccessorFloatN(buffers, views, accessors[prim.normalAccessor], 3, normals);
+    }
+
+    std::vector<float> uvs;
+    bool hasUvs = false;
+    if (prim.texcoordAccessor >= 0 && prim.texcoordAccessor < static_cast<int>(accessors.size())) {
+        hasUvs = ReadAccessorFloatN(buffers, views, accessors[prim.texcoordAccessor], 2, uvs);
+    }
+    std::vector<float> uvs1;
+    bool hasUvs1 = false;
+    if (prim.texcoord1Accessor >= 0 && prim.texcoord1Accessor < static_cast<int>(accessors.size())) {
+        hasUvs1 = ReadAccessorFloatN(buffers, views, accessors[prim.texcoord1Accessor], 2, uvs1);
+    }
+
+    std::vector<float> tangents;
+    bool hasTangents = false;
+    if (prim.tangentAccessor >= 0 && prim.tangentAccessor < static_cast<int>(accessors.size())) {
+        hasTangents = ReadAccessorFloatN(buffers, views, accessors[prim.tangentAccessor], 4, tangents);
+    }
+
+    std::vector<uint32_t> indices;
+    if (prim.indexAccessor >= 0 && prim.indexAccessor < static_cast<int>(accessors.size())) {
+        if (!ReadAccessorIndices(buffers, views, accessors[prim.indexAccessor], indices)) {
+            errorMessage = "Failed reading indices accessor";
+            return false;
+        }
+    } else {
+        indices.resize(vertexCount);
+        for (size_t i = 0; i < vertexCount; ++i) {
+            indices[i] = static_cast<uint32_t>(i);
+        }
+    }
+
+    const bool flipTexcoordV = false;
+    std::vector<SceneResources::MeshVertex> vertices(vertexCount);
+    for (size_t i = 0; i < vertexCount; ++i) {
+        PumpEventsEvery(i);
+        SceneResources::MeshVertex v{};
+        v.position = simd_make_float3(positions[i * 3 + 0],
+                                      positions[i * 3 + 1],
+                                      positions[i * 3 + 2]);
+        if (hasNormals) {
+            v.normal = simd_make_float3(normals[i * 3 + 0],
+                                        normals[i * 3 + 1],
+                                        normals[i * 3 + 2]);
+        }
+        if (hasUvs) {
+            v.uv = simd_make_float2(uvs[i * 2 + 0],
+                                    flipTexcoordV ? (1.0f - uvs[i * 2 + 1]) : uvs[i * 2 + 1]);
+        }
+        if (hasUvs1) {
+            v.uv1 = simd_make_float2(uvs1[i * 2 + 0],
+                                     flipTexcoordV ? (1.0f - uvs1[i * 2 + 1]) : uvs1[i * 2 + 1]);
+        } else {
+            v.uv1 = v.uv;
+        }
+        if (hasTangents) {
+            v.tangent = simd_make_float4(tangents[i * 4 + 0],
+                                         tangents[i * 4 + 1],
+                                         tangents[i * 4 + 2],
+                                         tangents[i * 4 + 3]);
+        }
+        vertices[i] = v;
+    }
+
+    if (!hasNormals) {
+        std::vector<simd::float3> normalAccum(vertexCount, simd_make_float3(0.0f, 0.0f, 0.0f));
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            PumpEventsEvery(i, 8192u);
+            uint32_t i0 = indices[i + 0];
+            uint32_t i1 = indices[i + 1];
+            uint32_t i2 = indices[i + 2];
+            if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+                continue;
+            }
+            simd::float3 p0 = vertices[i0].position;
+            simd::float3 p1 = vertices[i1].position;
+            simd::float3 p2 = vertices[i2].position;
+            simd::float3 n = simd::cross(p1 - p0, p2 - p0);
+            if (simd::length(n) > 0.0f) {
+                normalAccum[i0] += n;
+                normalAccum[i1] += n;
+                normalAccum[i2] += n;
+            }
+        }
+        for (size_t i = 0; i < vertexCount; ++i) {
+            PumpEventsEvery(i);
+            if (simd::length(normalAccum[i]) > 0.0f) {
+                vertices[i].normal = simd::normalize(normalAccum[i]);
+            }
+        }
+    }
+
+    if (!hasTangents && hasUvs) {
+        GenerateTangents(vertices, indices);
+    }
+
+    uint32_t materialIndex = 0u;
+    if (prim.material >= 0 && prim.material < static_cast<int>(materialMap.size())) {
+        materialIndex = materialMap[prim.material];
+    }
+
+    resources.addMesh(vertices.data(),
+                      static_cast<uint32_t>(vertices.size()),
+                      indices.data(),
+                      static_cast<uint32_t>(indices.size()),
+                      localToWorld,
+                      sourceLocalTransform,
+                      materialIndex,
+                      baseName);
+    return true;
+}
+
 uint32_t ResolveTextureIndex(const std::string& gltfPath,
                              const std::vector<GltfTexture>& textures,
                              const std::vector<GltfSampler>& samplers,
@@ -520,12 +1078,35 @@ uint32_t ResolveTextureIndex(const std::string& gltfPath,
                              int textureIndex,
                              bool srgb,
                              MaterialTextureSemantic semantic,
-                             SceneResources& resources) {
+                             SceneResources& resources,
+                             AssetPipelineReport* report,
+                             const std::string& materialName) {
     if (textureIndex < 0 || textureIndex >= static_cast<int>(textures.size())) {
+        if (textureIndex >= 0 && report) {
+            RecordTextureColorSpace(report, gltfPath, textureIndex, -1, nullptr, srgb, semantic, "invalid_texture_index");
+            AddAssetDiagnostic(*report,
+                               "warning",
+                               "missing_texture",
+                               "Material references a texture index outside the glTF texture table",
+                               gltfPath,
+                               "material",
+                               materialName);
+        }
         return kInvalidTextureIndex;
     }
     int imageIndex = textures[textureIndex].source;
     if (imageIndex < 0 || imageIndex >= static_cast<int>(images.size())) {
+        RecordTextureColorSpace(report, gltfPath, textureIndex, imageIndex, nullptr, srgb, semantic, "invalid_image_index");
+        if (report) {
+            AddAssetDiagnostic(*report,
+                               "warning",
+                               "missing_texture",
+                               "Texture references a missing image source",
+                               gltfPath,
+                               "texture",
+                               std::to_string(textureIndex),
+                               textureIndex);
+        }
         return kInvalidTextureIndex;
     }
     const GltfTexture& texture = textures[textureIndex];
@@ -552,26 +1133,50 @@ uint32_t ResolveTextureIndex(const std::string& gltfPath,
     }
     const auto& image = images[imageIndex];
     std::string error;
+    RecordTextureColorSpace(report, gltfPath, textureIndex, imageIndex, &image, srgb, semantic, "classified");
 
     if (!image.uri.empty()) {
         std::vector<uint8_t> data;
         std::string mime;
         if (DecodeDataUri(image.uri, data, mime)) {
             std::string label = gltfPath + ":image:" + std::to_string(imageIndex);
-            return resources.addMaterialTextureFromData(data.data(),
-                                                        data.size(),
-                                                        label,
-                                                        srgb,
-                                                        &error,
-                                                        samplerDescPtr,
-                                                        semantic);
+            if (!image.name.empty()) {
+                label += ":" + image.name;
+            }
+            const uint32_t resolved = resources.addMaterialTextureFromData(data.data(),
+                                                                           data.size(),
+                                                                           label,
+                                                                           srgb,
+                                                                           &error,
+                                                                           samplerDescPtr,
+                                                                           semantic);
+            if (resolved == kInvalidTextureIndex && report) {
+                AddAssetDiagnostic(*report,
+                                   "warning",
+                                   "missing_texture",
+                                   error.empty() ? ("Failed to load embedded texture: " + label) : error,
+                                   gltfPath,
+                                   "material",
+                                   materialName);
+            }
+            return resolved;
         }
         fs::path imagePath = fs::path(gltfPath).parent_path() / image.uri;
-        return resources.addMaterialTextureFromFile(imagePath.string(),
-                                                    srgb,
-                                                    &error,
-                                                    samplerDescPtr,
-                                                    semantic);
+        const uint32_t resolved = resources.addMaterialTextureFromFile(imagePath.string(),
+                                                                       srgb,
+                                                                       &error,
+                                                                       samplerDescPtr,
+                                                                       semantic);
+        if (resolved == kInvalidTextureIndex && report) {
+            AddAssetDiagnostic(*report,
+                               "warning",
+                               "missing_texture",
+                               error.empty() ? ("Failed to load texture: " + imagePath.string()) : error,
+                               imagePath.string(),
+                               "material",
+                               materialName);
+        }
+        return resolved;
     }
 
     if (image.bufferView >= 0 && image.bufferView < static_cast<int>(views.size())) {
@@ -582,17 +1187,40 @@ uint32_t ResolveTextureIndex(const std::string& gltfPath,
             size_t length = view.length;
             if (offset + length <= buffer.data.size() && length > 0) {
                 std::string label = gltfPath + ":image:" + std::to_string(imageIndex);
-                return resources.addMaterialTextureFromData(buffer.data.data() + offset,
-                                                           length,
-                                                           label,
-                                                           srgb,
-                                                           &error,
-                                                           samplerDescPtr,
-                                                           semantic);
+                if (!image.name.empty()) {
+                    label += ":" + image.name;
+                }
+                const uint32_t resolved = resources.addMaterialTextureFromData(buffer.data.data() + offset,
+                                                                              length,
+                                                                              label,
+                                                                              srgb,
+                                                                              &error,
+                                                                              samplerDescPtr,
+                                                                              semantic);
+                if (resolved == kInvalidTextureIndex && report) {
+                    AddAssetDiagnostic(*report,
+                                       "warning",
+                                       "missing_texture",
+                                       error.empty() ? ("Failed to load bufferView texture: " + label) : error,
+                                       gltfPath,
+                                       "material",
+                                       materialName);
+                }
+                return resolved;
             }
         }
     }
 
+    if (report) {
+        AddAssetDiagnostic(*report,
+                           "warning",
+                           "missing_texture",
+                           "Texture image has no loadable URI or bufferView payload",
+                           gltfPath,
+                           "image",
+                           image.name,
+                           imageIndex);
+    }
     return kInvalidTextureIndex;
 }
 
@@ -655,7 +1283,8 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
                                const std::vector<GltfBuffer>& buffers,
                                const std::vector<GltfBufferView>& views,
                                const GltfLoadOptions& loadOptions,
-                               SceneResources& resources) {
+                               SceneResources& resources,
+                               AssetPipelineReport* report) {
     const float roughnessScale = 1.0f;
     const float normalScale = 1.0f;
     const float pbrIor = std::clamp(src.hasIor ? src.ior : 1.5f, 1.0f, 3.0f);
@@ -697,27 +1326,66 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
     const bool emissiveSrgb = !loadOptions.forceLinearEmissive;
     uint32_t baseColorIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                                 src.baseColorTexture.index, baseColorSrgb,
-                                                MaterialTextureSemantic::Generic, resources);
+                                                MaterialTextureSemantic::BaseColor,
+                                                resources,
+                                                report,
+                                                src.name);
     uint32_t mrIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                          src.metallicRoughnessTexture.index, false,
-                                         MaterialTextureSemantic::Orm, resources);
+                                         MaterialTextureSemantic::Orm,
+                                         resources,
+                                         report,
+                                         src.name);
     uint32_t normalIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                              src.normalTexture.index, false,
-                                             MaterialTextureSemantic::Generic, resources);
-    MaterialTextureSemantic occlusionSemantic = MaterialTextureSemantic::Generic;
+                                             MaterialTextureSemantic::Normal,
+                                             resources,
+                                             report,
+                                             src.name);
+    MaterialTextureSemantic occlusionSemantic = MaterialTextureSemantic::Occlusion;
     if (src.occlusionTexture.index >= 0 &&
         src.occlusionTexture.index == src.metallicRoughnessTexture.index) {
         occlusionSemantic = MaterialTextureSemantic::Orm;
     }
     uint32_t occlusionIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                                 src.occlusionTexture.index, false,
-                                                occlusionSemantic, resources);
+                                                occlusionSemantic,
+                                                resources,
+                                                report,
+                                                src.name);
     uint32_t emissiveIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                                src.emissiveTexture.index, emissiveSrgb,
-                                               MaterialTextureSemantic::Generic, resources);
+                                               MaterialTextureSemantic::Emissive,
+                                               resources,
+                                               report,
+                                               src.name);
     uint32_t transmissionIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                                    src.transmissionTexture.index, false,
-                                                   MaterialTextureSemantic::Generic, resources);
+                                                   MaterialTextureSemantic::Transmission,
+                                                   resources,
+                                                   report,
+                                                   src.name);
+    const bool disableOrmBySpecularWorkflowFallback =
+        TextureBindingLooksLikeBistroSpecularWorkflowFallback(gltfPath,
+                                                              src.metallicRoughnessTexture,
+                                                              textures,
+                                                              images);
+    if (disableOrmBySpecularWorkflowFallback) {
+        mrIdx = kInvalidTextureIndex;
+        if (src.occlusionTexture.index >= 0 &&
+            src.occlusionTexture.index == src.metallicRoughnessTexture.index) {
+            occlusionIdx = kInvalidTextureIndex;
+        }
+        if (report) {
+            AddAssetDiagnostic(*report,
+                               "warning",
+                               "material_fallback",
+                               "Specular-workflow ORM fallback disabled metallic-roughness texture for this material",
+                               gltfPath,
+                               "material",
+                               src.name);
+        }
+    }
     if (mrIdx != kInvalidTextureIndex) {
         const auto& loadedTextures = resources.materialTextures();
         if (mrIdx < loadedTextures.size()) {
@@ -738,6 +1406,24 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
     material.textureIndices0 = simd_make_uint4(baseColorIdx, mrIdx, normalIdx, occlusionIdx);
     material.textureIndices1 =
         simd_make_uint4(emissiveIdx, transmissionIdx, kInvalidTextureIndex, kInvalidTextureIndex);
+    if (PathLooksLikeBistroAsset(gltfPath)) {
+        if (BistroStringLightCableMaterial(src.name)) {
+            material.baseColorRoughness.x = 0.015f;
+            material.baseColorRoughness.y = 0.015f;
+            material.baseColorRoughness.z = 0.012f;
+            material.emission = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            material.textureIndices0.x = kInvalidTextureIndex;
+            material.textureIndices1.x = kInvalidTextureIndex;
+        }
+        if (std::optional<BistroPracticalEmission> practicalEmission = BistroPracticalEmissionForMaterial(src.name)) {
+            material.baseColorRoughness.x = practicalEmission->baseColor.x;
+            material.baseColorRoughness.y = practicalEmission->baseColor.y;
+            material.baseColorRoughness.z = practicalEmission->baseColor.z;
+            material.emission = simd_make_float4(practicalEmission->emission, 0.0f);
+            material.textureIndices0.x = kInvalidTextureIndex;
+            material.textureIndices1.x = kInvalidTextureIndex;
+        }
+    }
     material.textureUvSet0 = simd_make_uint4(static_cast<uint32_t>(ClampTexCoordSet(src.baseColorTexture.texCoord)),
                                              static_cast<uint32_t>(ClampTexCoordSet(src.metallicRoughnessTexture.texCoord)),
                                              static_cast<uint32_t>(ClampTexCoordSet(src.normalTexture.texCoord)),
@@ -763,21 +1449,48 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
                                           std::clamp(src.roughnessFactor * roughnessScale, 0.0f, 1.0f),
                                           occlusionStrength,
                                           std::max(src.normalScale * normalScale, 0.0f));
-    material.materialFlags = src.disableOrmTexture ? PathTracerShaderTypes::kMaterialFlagDisableOrm : 0u;
-    if (src.disableOrmTexture && loadOptions.disableOrmRoughnessOverride >= 0.0f) {
+    const bool disableOrmTexture =
+        src.disableOrmTexture || disableOrmBySpecularWorkflowFallback;
+    material.materialFlags = disableOrmTexture ? PathTracerShaderTypes::kMaterialFlagDisableOrm : 0u;
+    const bool forceBaseColorMip0 =
+        (PathLooksLikeBistroAsset(gltfPath) &&
+         MaterialNameSuggestsSparseAtlasSignage(src.name) &&
+         !ContainsCaseInsensitive(src.name, "glass")) ||
+        (PathLooksLikeBulkF1Asset(gltfPath) &&
+         MaterialNameLooksLikeBulkF1LiveryAtlas(src.name)) ||
+        (ContainsCaseInsensitive(gltfPath, "ferrari_f14_t_2014") &&
+         src.name == "Vehicle_Exterior_mm_ext");
+    if (forceBaseColorMip0) {
+        material.materialFlags |= PathTracerShaderTypes::kMaterialFlagForceBaseColorMip0;
+    }
+    if (PathLooksLikeBistroAsset(gltfPath) && MaterialNameNeedsBlackKeyMask(src.name)) {
+        material.materialFlags |= PathTracerShaderTypes::kMaterialFlagBlackKeyAlphaFromRgb;
+    }
+    if (PathLooksLikeBistroAsset(gltfPath) && BistroColoredStringLightEmitterMaterial(src.name)) {
+        material.materialFlags |= PathTracerShaderTypes::kMaterialFlagCameraVisibleEmissionTint;
+    }
+    if (disableOrmBySpecularWorkflowFallback) {
+        material.pbrParams.x = 0.0f;
+    }
+    if (disableOrmTexture && loadOptions.disableOrmRoughnessOverride >= 0.0f) {
         material.pbrParams.y = std::clamp(loadOptions.disableOrmRoughnessOverride, 0.0f, 1.0f);
     }
-    material.materialPad0 = 0u;
-    material.materialPad1 = 0u;
+    material.interiorMediumId = 0u;
+    material.exteriorMediumId = 0u;
     material.materialPad2 = 0u;
+    material.spectralParams = simd_make_float4(0.0f, 1.0f, 0.0f, 0.0f);
     int alphaMode = 0;
-    if (src.alphaMode == "MASK") {
+    const bool forceBlackKeyMask =
+        PathLooksLikeBistroAsset(gltfPath) && MaterialNameNeedsBlackKeyMask(src.name);
+    if (forceBlackKeyMask || src.forceBaseColorAlphaMask || src.alphaMode == "MASK") {
         alphaMode = 1;
     } else if (src.alphaMode == "BLEND") {
         alphaMode = 2;
     }
     float alphaFactor = std::clamp(src.baseColorFactor.w, 0.0f, 1.0f);
-    float alphaCutoff = std::clamp(src.alphaCutoff, 0.0f, 1.0f);
+    float alphaCutoff = (forceBlackKeyMask || src.forceBaseColorAlphaMask)
+        ? 0.5f
+        : std::clamp(src.alphaCutoff, 0.0f, 1.0f);
     float transmissionFactor = std::clamp(src.transmissionFactor, 0.0f, 1.0f);
     material.pbrExtras = simd_make_float4(alphaFactor,
                                           alphaCutoff,
@@ -864,6 +1577,27 @@ bool LoadGltfScene(const std::string& path,
     }
     NSDictionary* root = (NSDictionary*)jsonObj;
 
+    AssetPipelineReport assetReport{};
+    assetReport.manifest.sourcePath = path;
+    assetReport.manifest.sourceFormat = ToLowerAscii(gltfPath.extension().string());
+    assetReport.manifest.importer = "PathTracer glTF 2.0 loader";
+    assetReport.manifest.importerVersion = "runtime";
+    NSDictionary* assetObject = root[@"asset"];
+    if ([assetObject isKindOfClass:[NSDictionary class]]) {
+        assetReport.manifest.generator = GetString(assetObject, @"generator");
+    }
+    assetReport.manifest.unitPolicy =
+        "glTF scene units are treated as meters by convention; no automatic unit conversion is applied";
+    assetReport.manifest.maturityLabel = "production_diagnostics";
+    assetReport.manifest.sceneUnitMeters = 1.0f;
+    AddAssetDiagnostic(assetReport,
+                       "info",
+                       "unit_scale_assumption",
+                       "Importer assumes 1 glTF unit equals 1 meter and preserves authored transforms",
+                       path,
+                       "scene");
+    RecordUnsupportedExtensions(root, assetReport, path);
+
     std::vector<GltfBuffer> buffers;
     std::vector<GltfBufferView> views;
     std::vector<GltfAccessor> accessors;
@@ -907,6 +1641,7 @@ bool LoadGltfScene(const std::string& path,
     if (viewArray && [viewArray isKindOfClass:[NSArray class]]) {
         views.resize(viewArray.count);
         for (NSUInteger i = 0; i < viewArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 64u);
             NSDictionary* view = viewArray[i];
             views[i].buffer = GetInt(view, @"buffer", -1);
             views[i].offset = static_cast<size_t>(GetInt(view, @"byteOffset", 0));
@@ -919,6 +1654,7 @@ bool LoadGltfScene(const std::string& path,
     if (accessorArray && [accessorArray isKindOfClass:[NSArray class]]) {
         accessors.resize(accessorArray.count);
         for (NSUInteger i = 0; i < accessorArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 64u);
             NSDictionary* acc = accessorArray[i];
             accessors[i].bufferView = GetInt(acc, @"bufferView", -1);
             accessors[i].offset = static_cast<size_t>(GetInt(acc, @"byteOffset", 0));
@@ -933,6 +1669,7 @@ bool LoadGltfScene(const std::string& path,
     if (imageArray && [imageArray isKindOfClass:[NSArray class]]) {
         images.resize(imageArray.count);
         for (NSUInteger i = 0; i < imageArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 64u);
             NSDictionary* img = imageArray[i];
             images[i].name = GetString(img, @"name");
             images[i].uri = GetString(img, @"uri");
@@ -940,11 +1677,13 @@ bool LoadGltfScene(const std::string& path,
             images[i].bufferView = GetInt(img, @"bufferView", -1);
         }
     }
+    assetReport.stats.imageCount = static_cast<uint32_t>(images.size());
 
     NSArray* samplerArray = root[@"samplers"];
     if (samplerArray && [samplerArray isKindOfClass:[NSArray class]]) {
         samplers.resize(samplerArray.count);
         for (NSUInteger i = 0; i < samplerArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 64u);
             NSDictionary* sampler = samplerArray[i];
             samplers[i].magFilter = GetInt(sampler, @"magFilter", -1);
             samplers[i].minFilter = GetInt(sampler, @"minFilter", -1);
@@ -952,21 +1691,31 @@ bool LoadGltfScene(const std::string& path,
             samplers[i].wrapT = GetInt(sampler, @"wrapT", 10497);
         }
     }
-
     NSArray* textureArray = root[@"textures"];
     if (textureArray && [textureArray isKindOfClass:[NSArray class]]) {
         textures.resize(textureArray.count);
         for (NSUInteger i = 0; i < textureArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 64u);
             NSDictionary* tex = textureArray[i];
             textures[i].source = GetInt(tex, @"source", -1);
             textures[i].sampler = GetInt(tex, @"sampler", -1);
         }
+    }
+    assetReport.stats.textureCount = static_cast<uint32_t>(textures.size());
+    if (textures.size() > PathTracerShaderTypes::kMaxMaterialTextures) {
+        AddAssetDiagnostic(assetReport,
+                           "warning",
+                           "excessive_texture_count",
+                           "glTF declares more textures than the renderer material texture table can bind",
+                           path,
+                           "scene");
     }
 
     NSArray* materialArray = root[@"materials"];
     if (materialArray && [materialArray isKindOfClass:[NSArray class]]) {
         materials.resize(materialArray.count);
         for (NSUInteger i = 0; i < materialArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 32u);
             NSDictionary* mat = materialArray[i];
             GltfMaterial& dst = materials[i];
             dst.name = GetString(mat, @"name");
@@ -976,7 +1725,25 @@ bool LoadGltfScene(const std::string& path,
             }
             dst.alphaCutoff = GetFloat(mat, @"alphaCutoff", 0.5f);
             dst.doubleSided = GetBool(mat, @"doubleSided", false);
-
+            if (MaterialNameSuggestsDoubleSided(dst.name)) {
+                dst.doubleSided = true;
+            }
+            if (dst.alphaMode == "OPAQUE" && MaterialNameSuggestsMaskedFoliage(dst.name)) {
+                dst.alphaMode = "MASK";
+                dst.alphaCutoff = std::clamp(dst.alphaCutoff, 0.1f, 0.9f);
+            } else if (dst.alphaMode == "OPAQUE" &&
+                       PathLooksLikeBistroAsset(gltfPath) &&
+                       MaterialNameSuggestsMaskedSignage(dst.name)) {
+                dst.alphaMode = "MASK";
+                dst.alphaCutoff = std::clamp(dst.alphaCutoff, 0.1f, 0.9f);
+            }
+            if (PathLooksLikeBistroAsset(gltfPath) &&
+                MaterialNameNeedsUv1Override(dst.name)) {
+                dst.baseColorTexture.texCoord = 1;
+                dst.normalTexture.texCoord = 1;
+                dst.metallicRoughnessTexture.texCoord = 1;
+                dst.occlusionTexture.texCoord = 1;
+            }
             NSDictionary* pbr = mat[@"pbrMetallicRoughness"];
             if ([pbr isKindOfClass:[NSDictionary class]]) {
                 std::vector<float> baseColor;
@@ -988,6 +1755,20 @@ bool LoadGltfScene(const std::string& path,
                 NSDictionary* baseTex = pbr[@"baseColorTexture"];
                 if ([baseTex isKindOfClass:[NSDictionary class]]) {
                     ParseTextureBinding(baseTex, dst.baseColorTexture);
+                }
+                if (TextureBindingLooksLikeSponzaBlackKeyCutout(path,
+                                                                dst.baseColorTexture,
+                                                                textures,
+                                                                images)) {
+                    dst.forceBaseColorAlphaMask = true;
+                    dst.alphaMode = "MASK";
+                    dst.alphaCutoff = 0.5f;
+                }
+                if (dst.alphaMode == "OPAQUE" &&
+                    TextureBindingImageSuggestsMaskedFoliage(dst.baseColorTexture, textures, images)) {
+                    dst.alphaMode = "MASK";
+                    dst.alphaCutoff = std::clamp(dst.alphaCutoff, 0.1f, 0.9f);
+                    dst.doubleSided = true;
                 }
                 NSDictionary* mrTex = pbr[@"metallicRoughnessTexture"];
                 if ([mrTex isKindOfClass:[NSDictionary class]]) {
@@ -1057,14 +1838,31 @@ bool LoadGltfScene(const std::string& path,
                         std::max(GetFloat(emissiveStrength, @"emissiveStrength", 1.0f), 0.0f);
                 }
             }
+
+            if (PathLooksLikeBistroAsset(gltfPath) &&
+                (MaterialNameLooksLikeBistroPlaceholderOverlay(dst.name) ||
+                 ContainsCaseInsensitive(dst.name, "master_focus"))) {
+                // Bistro includes MASTER_Focus overlay quads on Paris_Building_01 that
+                // show up as dark plaques under the lateral sign in path-traced shading.
+                // Treat this overlay family as fully transparent.
+                dst.alphaMode = "BLEND";
+                dst.baseColorFactor.w = 0.0f;
+            }
         }
     }
 
     if (materials.empty()) {
         materials.emplace_back();
+        AddAssetDiagnostic(assetReport,
+                           "warning",
+                           "material_fallback",
+                           "glTF contains no materials; importer created a default renderer material",
+                           path,
+                           "material");
     }
 
     for (size_t i = 0; i < materials.size(); ++i) {
+        PumpEventsEvery(i, 32u);
         bool disableOrm = ContainsCaseInsensitive(materials[i].name, "visor");
         if (!disableOrm) {
             for (const std::string& pattern : loadOptions.disableOrmMaterialNameSubstrings) {
@@ -1077,11 +1875,21 @@ bool LoadGltfScene(const std::string& path,
         materials[i].disableOrmTexture = disableOrm;
         if (disableOrm) {
             NSLog(@"[glTF] ORM bypass enabled for material '%s'", materials[i].name.c_str());
+            AddAssetDiagnostic(assetReport,
+                               "warning",
+                               "material_fallback",
+                               "Material ORM texture was disabled by import compatibility policy",
+                               path,
+                               "material",
+                               materials[i].name,
+                               static_cast<int32_t>(i));
         }
     }
+    assetReport.stats.materialCount = static_cast<uint32_t>(materials.size());
 
     std::vector<uint32_t> materialMap(materials.size(), 0u);
     for (size_t i = 0; i < materials.size(); ++i) {
+        PumpEventsEvery(i, 16u);
         MaterialData material = BuildGltfMaterial(materials[i],
                                                  path,
                                                  textures,
@@ -1090,14 +1898,15 @@ bool LoadGltfScene(const std::string& path,
                                                  buffers,
                                                  views,
                                                  loadOptions,
-                                                 resources);
+                                                 resources,
+                                                 &assetReport);
         materialMap[i] = resources.addMaterialData(material, materials[i].name);
     }
-
     NSArray* meshArray = root[@"meshes"];
     if (meshArray && [meshArray isKindOfClass:[NSArray class]]) {
         meshes.resize(meshArray.count);
         for (NSUInteger i = 0; i < meshArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 16u);
             NSDictionary* mesh = meshArray[i];
             meshes[i].name = GetString(mesh, @"name");
             NSArray* prims = mesh[@"primitives"];
@@ -1105,6 +1914,7 @@ bool LoadGltfScene(const std::string& path,
                 continue;
             }
             for (NSDictionary* prim in prims) {
+                PumpEventsEvery(meshes[i].primitives.size(), 8u);
                 GltfPrimitive p{};
                 p.material = GetInt(prim, @"material", -1);
                 p.indexAccessor = GetInt(prim, @"indices", -1);
@@ -1142,6 +1952,7 @@ bool LoadGltfScene(const std::string& path,
     if (cameraArray && [cameraArray isKindOfClass:[NSArray class]]) {
         cameras.resize(cameraArray.count);
         for (NSUInteger i = 0; i < cameraArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 16u);
             NSDictionary* cam = cameraArray[i];
             NSString* typeStr = cam[@"type"];
             if (![typeStr isKindOfClass:[NSString class]]) {
@@ -1189,6 +2000,7 @@ bool LoadGltfScene(const std::string& path,
     if (nodeArray && [nodeArray isKindOfClass:[NSArray class]]) {
         nodes.resize(nodeArray.count);
         for (NSUInteger i = 0; i < nodeArray.count; ++i) {
+            PumpEventsEvery(static_cast<size_t>(i), 16u);
             NSDictionary* node = nodeArray[i];
             nodes[i].name = GetString(node, @"name");
             nodes[i].mesh = GetInt(node, @"mesh", -1);
@@ -1242,16 +2054,41 @@ bool LoadGltfScene(const std::string& path,
         }
     }
 
+    simd::float3 importedBoundsMin = simd_make_float3(0.0f, 0.0f, 0.0f);
+    simd::float3 importedBoundsMax = simd_make_float3(0.0f, 0.0f, 0.0f);
+    bool importedBoundsValid = false;
+
     auto loadPrimitive = [&](const GltfPrimitive& prim,
                              const simd::float4x4& localToWorld,
+                             const simd::float4x4& sourceLocalTransform,
                              const std::string& baseName) -> bool {
         if (prim.mode != 4) {
+            AddAssetDiagnostic(assetReport,
+                               "warning",
+                               "unsupported_feature",
+                               "glTF primitive mode is not TRIANGLES and was skipped",
+                               path,
+                               "mesh",
+                               baseName,
+                               prim.mode);
             return true;
         }
         if (prim.positionAccessor < 0 ||
             prim.positionAccessor >= static_cast<int>(accessors.size())) {
             errorMessage = "glTF primitive missing POSITION accessor";
             return false;
+        }
+
+        if (PathLooksLikeBistroAsset(gltfPath) &&
+            prim.material >= 0 &&
+            prim.material < static_cast<int>(materials.size())) {
+            const GltfMaterial& sourceMaterial = materials[prim.material];
+            if (MaterialNameShouldHideBistroSideLetters(sourceMaterial.name)) {
+                NSLog(@"[SignLettersDiag] skipSideLettersPrimitive mesh='%s' source='%s'",
+                      baseName.c_str(),
+                      sourceMaterial.name.c_str());
+                return true;
+            }
         }
 
         const GltfAccessor& posAcc = accessors[prim.positionAccessor];
@@ -1264,17 +2101,28 @@ bool LoadGltfScene(const std::string& path,
         if (vertexCount == 0) {
             return true;
         }
+        ++assetReport.stats.primitiveCount;
+        assetReport.stats.vertexCount += static_cast<uint64_t>(vertexCount);
 
         if (outCamera) {
             simd::float3 sceneMin = simd_make_float3(0.0f, 0.0f, 0.0f);
             simd::float3 sceneMax = simd_make_float3(0.0f, 0.0f, 0.0f);
             bool hasBounds = false;
             for (size_t i = 0; i < vertexCount; ++i) {
+                PumpEventsEvery(i);
                 simd::float3 localPos = simd_make_float3(positions[i * 3 + 0],
                                                         positions[i * 3 + 1],
                                                         positions[i * 3 + 2]);
                 simd::float4 worldPos4 = simd_mul(localToWorld, simd_make_float4(localPos, 1.0f));
                 simd::float3 worldPos = simd_make_float3(worldPos4.x, worldPos4.y, worldPos4.z);
+                if (!importedBoundsValid) {
+                    importedBoundsMin = worldPos;
+                    importedBoundsMax = worldPos;
+                    importedBoundsValid = true;
+                } else {
+                    importedBoundsMin = simd_min(importedBoundsMin, worldPos);
+                    importedBoundsMax = simd_max(importedBoundsMax, worldPos);
+                }
                 if (!hasBounds) {
                     sceneMin = worldPos;
                     sceneMax = worldPos;
@@ -1307,6 +2155,16 @@ bool LoadGltfScene(const std::string& path,
         if (prim.normalAccessor >= 0 && prim.normalAccessor < static_cast<int>(accessors.size())) {
             const GltfAccessor& nAcc = accessors[prim.normalAccessor];
             hasNormals = ReadAccessorFloatN(buffers, views, nAcc, 3, normals);
+        }
+        if (!hasNormals) {
+            ++assetReport.stats.missingNormalPrimitiveCount;
+            AddAssetDiagnostic(assetReport,
+                               "warning",
+                               "missing_normals",
+                               "Primitive has no readable normals; importer generated face-weighted fallback normals",
+                               path,
+                               "mesh",
+                               baseName);
         }
 
         std::vector<float> uvs;
@@ -1373,6 +2231,16 @@ bool LoadGltfScene(const std::string& path,
             const GltfAccessor& tAcc = accessors[prim.tangentAccessor];
             hasTangents = ReadAccessorFloatN(buffers, views, tAcc, 4, tangents);
         }
+        if (!hasTangents && hasUvs) {
+            ++assetReport.stats.missingTangentPrimitiveCount;
+            AddAssetDiagnostic(assetReport,
+                               "info",
+                               "missing_tangents",
+                               "Primitive has UVs but no readable tangents; importer generated tangent frames",
+                               path,
+                               "mesh",
+                               baseName);
+        }
 
         std::vector<uint32_t> indices;
         if (prim.indexAccessor >= 0 && prim.indexAccessor < static_cast<int>(accessors.size())) {
@@ -1387,9 +2255,12 @@ bool LoadGltfScene(const std::string& path,
                 indices[i] = static_cast<uint32_t>(i);
             }
         }
+        assetReport.stats.indexCount += static_cast<uint64_t>(indices.size());
+        assetReport.stats.triangleCount += static_cast<uint64_t>(indices.size() / 3u);
 
         std::vector<SceneResources::MeshVertex> vertices(vertexCount);
         for (size_t i = 0; i < vertexCount; ++i) {
+            PumpEventsEvery(i);
             SceneResources::MeshVertex v{};
             v.position = simd_make_float3(positions[i * 3 + 0],
                                           positions[i * 3 + 1],
@@ -1401,11 +2272,11 @@ bool LoadGltfScene(const std::string& path,
             }
             if (hasUvs) {
                 v.uv = simd_make_float2(uvs[i * 2 + 0],
-                                        uvs[i * 2 + 1]);
+                                        loadOptions.flipTexcoordV ? (1.0f - uvs[i * 2 + 1]) : uvs[i * 2 + 1]);
             }
             if (hasUvs1) {
                 v.uv1 = simd_make_float2(uvs1[i * 2 + 0],
-                                         uvs1[i * 2 + 1]);
+                                         loadOptions.flipTexcoordV ? (1.0f - uvs1[i * 2 + 1]) : uvs1[i * 2 + 1]);
             } else {
                 v.uv1 = v.uv;
             }
@@ -1418,9 +2289,40 @@ bool LoadGltfScene(const std::string& path,
             vertices[i] = v;
         }
 
+        if (hasNormals) {
+            uint64_t degenerateTriangles = 0u;
+            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                uint32_t i0 = indices[i + 0];
+                uint32_t i1 = indices[i + 1];
+                uint32_t i2 = indices[i + 2];
+                if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+                    continue;
+                }
+                const simd::float3 p0 = vertices[i0].position;
+                const simd::float3 p1 = vertices[i1].position;
+                const simd::float3 p2 = vertices[i2].position;
+                if (simd::length(simd::cross(p1 - p0, p2 - p0)) <= 0.0f) {
+                    ++degenerateTriangles;
+                }
+            }
+            if (degenerateTriangles > 0u) {
+                assetReport.stats.degenerateTriangleCount += degenerateTriangles;
+                AddAssetDiagnostic(assetReport,
+                                   "warning",
+                                   "degenerate_geometry",
+                                   "Primitive contains degenerate triangles: " +
+                                       std::to_string(degenerateTriangles),
+                                   path,
+                                   "mesh",
+                                   baseName);
+            }
+        }
+
         if (!hasNormals) {
             std::vector<simd::float3> normalAccum(vertexCount, simd_make_float3(0.0f, 0.0f, 0.0f));
+            uint64_t degenerateTriangles = 0u;
             for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                PumpEventsEvery(i, 8192u);
                 uint32_t i0 = indices[i + 0];
                 uint32_t i1 = indices[i + 1];
                 uint32_t i2 = indices[i + 2];
@@ -1435,9 +2337,23 @@ bool LoadGltfScene(const std::string& path,
                     normalAccum[i0] += n;
                     normalAccum[i1] += n;
                     normalAccum[i2] += n;
+                } else {
+                    ++degenerateTriangles;
                 }
             }
+            if (degenerateTriangles > 0u) {
+                assetReport.stats.degenerateTriangleCount += degenerateTriangles;
+                AddAssetDiagnostic(assetReport,
+                                   "warning",
+                                   "degenerate_geometry",
+                                   "Primitive contains degenerate triangles while generating normals: " +
+                                       std::to_string(degenerateTriangles),
+                                   path,
+                                   "mesh",
+                                   baseName);
+            }
             for (size_t i = 0; i < vertexCount; ++i) {
+                PumpEventsEvery(i);
                 if (simd::length(normalAccum[i]) > 0.0f) {
                     vertices[i].normal = simd::normalize(normalAccum[i]);
                 }
@@ -1459,6 +2375,7 @@ bool LoadGltfScene(const std::string& path,
                           indices.data(),
                           static_cast<uint32_t>(indices.size()),
                           localToWorld,
+                          sourceLocalTransform,
                           materialIndex,
                           baseName);
         return true;
@@ -1501,6 +2418,7 @@ bool LoadGltfScene(const std::string& path,
         if (node.mesh >= 0 && node.mesh < static_cast<int>(meshes.size())) {
             const GltfMesh& mesh = meshes[node.mesh];
             for (size_t primIndex = 0; primIndex < mesh.primitives.size(); ++primIndex) {
+                PumpEventsEvery(primIndex, 1u);
                 std::string meshName = nodeName;
                 if (!mesh.name.empty()) {
                     if (!meshName.empty()) {
@@ -1511,7 +2429,7 @@ bool LoadGltfScene(const std::string& path,
                 if (mesh.primitives.size() > 1) {
                     meshName += ".prim" + std::to_string(primIndex);
                 }
-                if (!loadPrimitive(mesh.primitives[primIndex], world, meshName)) {
+                if (!loadPrimitive(mesh.primitives[primIndex], world, local, meshName)) {
                     return false;
                 }
             }
@@ -1530,6 +2448,24 @@ bool LoadGltfScene(const std::string& path,
             return false;
         }
     }
+
+    assetReport.stats.meshCount = static_cast<uint32_t>(meshes.size());
+    assetReport.stats.meshInstanceCount = static_cast<uint32_t>(resources.meshes().size());
+    assetReport.stats.loadedTextureCount = resources.materialTextureCount();
+    if (importedBoundsValid) {
+        const simd::float3 extent = importedBoundsMax - importedBoundsMin;
+        const float radius = simd::length(extent) * 0.5f;
+        if (std::isfinite(radius) && (radius > 10000.0f || (radius > 0.0f && radius < 0.001f))) {
+            AddAssetDiagnostic(assetReport,
+                               "warning",
+                               "unit_scale_assumption",
+                               "Imported scene bounds look unusually scaled for meter-based glTF units; radius=" +
+                                   std::to_string(radius),
+                               path,
+                               "scene");
+        }
+    }
+    resources.setAssetPipelineReport(std::move(assetReport));
 
     return true;
 }

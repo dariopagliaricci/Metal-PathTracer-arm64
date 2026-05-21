@@ -10,17 +10,30 @@ namespace PathTracer {
 
 /// Performance statistics for display in UI
 struct PerformanceStats {
+    static constexpr uint32_t kWavefrontQueueMetricCount = 12;
+
     // Timing
     double frameTimeMs = 0.0;
     double gpuTimeMs = 0.0;
     double cpuEncodeMs = 0.0;
     double drawableWaitMs = 0.0;
     double samplesPerMinute = 0.0;
+    bool gpuBucketTimingAvailable = false;
+    double gpuBucketIntersectMs = 0.0;
+    double gpuBucketShadeMs = 0.0;
+    double gpuBucketShadowQueueMs = 0.0;
+    double gpuBucketFusedIntegrateMs = 0.0;
+    double gpuBucketPresentationMs = 0.0;
+    uint64_t currentAllocatedBytes = 0;
+    uint64_t recommendedMaxWorkingSetBytes = 0;
     
     // Progress
     uint32_t sampleCount = 0;
     uint32_t activeSamplesPerFrame = 0;
-    
+    uint32_t renderExecutionMode = 0;
+    uint32_t wavefrontSchedulingPolicy = 0;
+    uint32_t wavefrontCompactionEnabled = 0;
+
     // Scene stats
     uint32_t sphereCount = 0;
     uint32_t triangleCount = 0;
@@ -73,6 +86,50 @@ struct PerformanceStats {
     uint32_t hardwareMissLastPrimitiveId = 0;
     uint64_t hardwareFallbackHitCount = 0;
     uint64_t hardwareFirstHitFallbackCount = 0;
+    uint64_t hardwareShadowTMinRetryCount = 0;
+    uint64_t hardwareShadowNearForeignHitCount = 0;
+    uint64_t throughputNanInfCount = 0;
+    uint64_t radianceNanInfCount = 0;
+    uint64_t clampEventCount = 0;
+    uint64_t restirGiCandidateCount = 0;
+    uint64_t restirGiReservoirUpdateCount = 0;
+    uint64_t restirGiAcceptCount = 0;
+    uint64_t restirGiRejectCount = 0;
+    uint64_t restirGiFallbackCount = 0;
+    uint64_t pathGuidingCandidateCount = 0;
+    uint64_t pathGuidingUsedCount = 0;
+    uint64_t pathGuidingFallbackCount = 0;
+    uint64_t pathGuidingInvalidCount = 0;
+    uint64_t restirPtCandidateCount = 0;
+    uint64_t restirPtReservoirUpdateCount = 0;
+    uint64_t restirPtRejectedInvalidCount = 0;
+    uint64_t restirPtRejectedUnsupportedCount = 0;
+    uint64_t restirPtDebugRecordCount = 0;
+    uint64_t restirPtReuseCandidateCount = 0;
+    uint64_t restirPtReuseAppliedCount = 0;
+    uint64_t restirPtReuseRejectedInvalidCount = 0;
+    uint64_t restirPtReuseFallbackCount = 0;
+    uint64_t radianceCacheQueryCount = 0;
+    uint64_t radianceCacheHitCount = 0;
+    uint64_t radianceCacheMissCount = 0;
+    uint64_t radianceCacheTrainCount = 0;
+    uint64_t radianceCacheFallbackCount = 0;
+    uint64_t radianceCacheInvalidCount = 0;
+    uint64_t causticEyeVertexCount = 0;
+    uint64_t causticLightVertexCount = 0;
+    uint64_t causticConnectionCandidateCount = 0;
+    uint64_t causticDeltaChainCount = 0;
+    uint64_t causticDebugClassificationCount = 0;
+    uint64_t volumeTransmittanceQueryCount = 0;
+    uint64_t volumeScatterEventCount = 0;
+    uint64_t volumeNeeRayCount = 0;
+    uint64_t volumePhaseSampleCount = 0;
+    uint64_t volumeMediumBoundaryEventCount = 0;
+    uint64_t volumeFallbackCount = 0;
+    uint64_t spectralWavelengthSampleCount = 0;
+    uint64_t spectralMaterialLookupCount = 0;
+    uint64_t spectralDispersionEventCount = 0;
+    uint64_t spectralFallbackCount = 0;
     uint32_t debugPathEntryCount = 0;
     uint32_t debugPathMaxEntries = 0;
     uint32_t parityEntryCount = 0;
@@ -99,7 +156,72 @@ struct PerformanceStats {
     uint32_t hardwareLastInstanceId = 0;
     uint32_t hardwareLastPrimitiveId = 0;
     float hardwareLastDistance = 0.0f;
-    
+    uint32_t wavefrontActiveRayCount = 0;
+    uint32_t wavefrontNextRayCount = 0;
+    uint32_t wavefrontShadowRayCount = 0;
+    uint32_t wavefrontTerminatedCount = 0;
+    uint32_t wavefrontOverflowFlag = 0;
+    uint64_t wavefrontTerminateMissCount = 0;
+    uint64_t wavefrontTerminateEmissiveCount = 0;
+    uint64_t wavefrontTerminateMaxDepthCount = 0;
+    uint64_t wavefrontTerminateOverflowCount = 0;
+    uint32_t wavefrontEnvShadowRayCount = 0;
+    uint32_t wavefrontAovAlbedoValidCount = 0;
+    uint32_t wavefrontAovNormalValidCount = 0;
+    uint64_t wavefrontQueueBytesActive = 0;
+    uint64_t wavefrontQueueBytesNext = 0;
+    uint64_t wavefrontQueueBytesHit = 0;
+    uint64_t wavefrontQueueBytesShadow = 0;
+    uint64_t wavefrontQueueBytesPathState = 0;
+    uint64_t wavefrontQueueBytesTotal = 0;
+    uint64_t wavefrontBudgetBytes = 0;
+    double wavefrontBudgetUsagePercent = 0.0;
+    uint64_t transportMemoryBytesTotal = 0;
+    uint64_t transportMemoryBytesPrivate = 0;
+    uint64_t transportMemoryBytesShared = 0;
+    uint64_t transportMemoryBytesStaging = 0;
+    uint32_t transportMemoryRecordCount = 0;
+    uint32_t transportMemoryInvalidatedRecordCount = 0;
+    uint32_t transportMemoryLastInvalidationReason = 0;
+    uint64_t primaryRayCount = 0;
+    uint64_t shadowRayCount = 0;
+    uint64_t pathSegmentCount = 0;
+    uint64_t tracedRayCount = 0;
+    uint64_t totalComputeDispatchCount = 0;
+    uint64_t restirDiInitializeDispatchCount = 0;
+    uint64_t restirDiInitialCandidateDispatchCount = 0;
+    uint64_t restirDiTemporalReuseDispatchCount = 0;
+    uint64_t restirDiSpatialReuseDispatchCount = 0;
+    uint64_t restirDiVisibilityDispatchCount = 0;
+    uint64_t restirDiApplyLightingDispatchCount = 0;
+    uint64_t restirDiDebugAovDispatchCount = 0;
+    bool restirDiHardwareTraceActive = false;
+    uint64_t integrationDispatchCount = 0;
+    uint64_t presentationDispatchCount = 0;
+    uint64_t wavefrontResetDispatchCount = 0;
+    uint64_t wavefrontGenerateDispatchCount = 0;
+    uint64_t wavefrontBuildDispatchArgsDispatchCount = 0;
+    uint64_t wavefrontCompactQueueDispatchCount = 0;
+    uint64_t wavefrontPrepareDispatchCount = 0;
+    uint64_t wavefrontIntersectDispatchCount = 0;
+    uint64_t wavefrontShadeDispatchCount = 0;
+    uint64_t wavefrontShadowDispatchCount = 0;
+    uint64_t wavefrontSwapDispatchCount = 0;
+    uint64_t wavefrontAccumulateDispatchCount = 0;
+    uint64_t wavefrontPrimaryGeneratedCount = 0;
+    uint64_t wavefrontIntersectProcessedCount = 0;
+    uint64_t wavefrontShadeProcessedCount = 0;
+    uint64_t wavefrontShadowProcessedCount = 0;
+    uint64_t wavefrontNextRayEnqueueCount = 0;
+    uint64_t wavefrontShadowRayEnqueueCount = 0;
+    uint32_t wavefrontQueueActiveCounts[kWavefrontQueueMetricCount] = {};
+    uint32_t wavefrontQueuePeakActiveCounts[kWavefrontQueueMetricCount] = {};
+    uint32_t wavefrontQueueCapacities[kWavefrontQueueMetricCount] = {};
+    uint32_t wavefrontQueueOverflowCounts[kWavefrontQueueMetricCount] = {};
+    double wavefrontQueueOccupancyRatios[kWavefrontQueueMetricCount] = {};
+    double wavefrontQueuePeakOccupancyRatios[kWavefrontQueueMetricCount] = {};
+    double wavefrontQueueCompactionCostMs = 0.0;
+
     // Resolution
     uint32_t renderWidth = 0;
     uint32_t renderHeight = 0;

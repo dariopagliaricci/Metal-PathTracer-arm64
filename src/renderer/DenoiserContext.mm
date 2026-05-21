@@ -1,16 +1,18 @@
 #import "renderer/DenoiserContext.h"
 
-#ifndef PT_ENABLE_OIDN
-#define PT_ENABLE_OIDN 0
-#endif
-
-#if PT_ENABLE_OIDN
-
-#include <OpenImageDenoise/oidn.h>
 #include <sstream>
 #include <cstring>
 #include <vector>
 
+#ifndef PATH_TRACER_ENABLE_OIDN
+#define PATH_TRACER_ENABLE_OIDN 0
+#endif
+
+#if PATH_TRACER_ENABLE_OIDN
+#include <OpenImageDenoise/oidn.h>
+#endif
+
+#if PATH_TRACER_ENABLE_OIDN
 namespace PathTracer {
 
 namespace {
@@ -235,12 +237,6 @@ DenoiserContext::~DenoiserContext() {
 }
 
 bool DenoiserContext::initialize(MTLDeviceHandle metalDevice) {
-    if (!metalDevice) {
-        m_lastError = "Invalid Metal device handle";
-        m_status = DeviceStatus::Failed;
-        return false;
-    }
-
     m_status = DeviceStatus::Initializing;
     m_metalDevice = metalDevice;
 
@@ -547,6 +543,150 @@ bool DenoiserContext::denoise(MTLTextureHandle colorInput,
     }
 }
 
+bool DenoiserContext::denoiseLinearBuffers(const float* colorInputRGB,
+                                           const float* albedoInputRGB,
+                                           const float* normalInputRGB,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           std::vector<float>& outDenoisedRGB,
+                                           FilterType filterType,
+                                           bool hdr) {
+    if (!isReady()) {
+        m_lastError = "Denoiser not ready (status: " + std::to_string(static_cast<int>(m_status)) + ")";
+        return false;
+    }
+    if (!colorInputRGB || width == 0u || height == 0u) {
+        m_lastError = "Invalid color buffer or dimensions";
+        return false;
+    }
+
+    try {
+        if (m_currentFilterType != filterType) {
+            if (!createFilter(filterType)) {
+                return false;
+            }
+        }
+
+        const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+        const size_t rgbaCount = pixelCount * 4u;
+        m_colorBuffer.assign(rgbaCount, 1.0f);
+        for (size_t i = 0; i < pixelCount; ++i) {
+            m_colorBuffer[i * 4 + 0] = colorInputRGB[i * 3 + 0];
+            m_colorBuffer[i * 4 + 1] = colorInputRGB[i * 3 + 1];
+            m_colorBuffer[i * 4 + 2] = colorInputRGB[i * 3 + 2];
+        }
+
+        m_albedoBuffer.clear();
+        if (albedoInputRGB) {
+            m_albedoBuffer.assign(rgbaCount, 1.0f);
+            for (size_t i = 0; i < pixelCount; ++i) {
+                m_albedoBuffer[i * 4 + 0] = albedoInputRGB[i * 3 + 0];
+                m_albedoBuffer[i * 4 + 1] = albedoInputRGB[i * 3 + 1];
+                m_albedoBuffer[i * 4 + 2] = albedoInputRGB[i * 3 + 2];
+            }
+        }
+
+        m_normalBuffer.clear();
+        if (normalInputRGB) {
+            m_normalBuffer.assign(rgbaCount, 1.0f);
+            for (size_t i = 0; i < pixelCount; ++i) {
+                m_normalBuffer[i * 4 + 0] = normalInputRGB[i * 3 + 0] * 2.0f - 1.0f;
+                m_normalBuffer[i * 4 + 1] = normalInputRGB[i * 3 + 1] * 2.0f - 1.0f;
+                m_normalBuffer[i * 4 + 2] = normalInputRGB[i * 3 + 2] * 2.0f - 1.0f;
+            }
+        }
+
+        m_outputBuffer.assign(rgbaCount, 0.0f);
+        OIDNDevice device = (OIDNDevice)m_device;
+        OIDNFilter filter = (OIDNFilter)m_filter;
+
+        const size_t pixelStride = sizeof(float) * 4u;
+        const size_t rowStride = pixelStride * width;
+
+        oidnSetSharedFilterImage(filter,
+                                 "color",
+                                 m_colorBuffer.data(),
+                                 OIDN_FORMAT_FLOAT3,
+                                 width,
+                                 height,
+                                 0,
+                                 pixelStride,
+                                 rowStride);
+        if (!m_albedoBuffer.empty()) {
+            oidnSetSharedFilterImage(filter,
+                                     "albedo",
+                                     m_albedoBuffer.data(),
+                                     OIDN_FORMAT_FLOAT3,
+                                     width,
+                                     height,
+                                     0,
+                                     pixelStride,
+                                     rowStride);
+        }
+        if (!m_normalBuffer.empty()) {
+            oidnSetSharedFilterImage(filter,
+                                     "normal",
+                                     m_normalBuffer.data(),
+                                     OIDN_FORMAT_FLOAT3,
+                                     width,
+                                     height,
+                                     0,
+                                     pixelStride,
+                                     rowStride);
+        }
+        oidnSetSharedFilterImage(filter,
+                                 "output",
+                                 m_outputBuffer.data(),
+                                 OIDN_FORMAT_FLOAT3,
+                                 width,
+                                 height,
+                                 0,
+                                 pixelStride,
+                                 rowStride);
+
+        oidnSetFilterBool(filter, "hdr", hdr);
+        oidnSetFilterBool(filter, "srgb", false);
+        oidnSetFilterBool(filter, "cleanAux", !m_albedoBuffer.empty() || !m_normalBuffer.empty());
+        oidnCommitFilter(filter);
+
+        const char* errorMsg = nullptr;
+        OIDNError error = oidnGetDeviceError(device, &errorMsg);
+        if (error != OIDN_ERROR_NONE) {
+            m_lastError = std::string("OIDN filter commit failed");
+            if (errorMsg) {
+                m_lastError += std::string(": ") + errorMsg;
+            }
+            return false;
+        }
+
+        oidnExecuteFilter(filter);
+        error = oidnGetDeviceError(device, &errorMsg);
+        if (error != OIDN_ERROR_NONE) {
+            m_lastError = std::string("OIDN filter execution failed");
+            if (errorMsg) {
+                m_lastError += std::string(": ") + errorMsg;
+            }
+            return false;
+        }
+
+        outDenoisedRGB.resize(pixelCount * 3u);
+        for (size_t i = 0; i < pixelCount; ++i) {
+            outDenoisedRGB[i * 3 + 0] = m_outputBuffer[i * 4 + 0];
+            outDenoisedRGB[i * 3 + 1] = m_outputBuffer[i * 4 + 1];
+            outDenoisedRGB[i * 3 + 2] = m_outputBuffer[i * 4 + 2];
+        }
+
+        m_lastError.clear();
+        return true;
+    } catch (const std::exception& e) {
+        m_lastError = std::string("OIDN denoiseLinearBuffers exception: ") + e.what();
+        return false;
+    } catch (...) {
+        m_lastError = "Unknown exception during buffer denoising";
+        return false;
+    }
+}
+
 void DenoiserContext::shutdown() {
     if (m_filter) {
         oidnReleaseFilter((OIDNFilter)m_filter);
@@ -569,18 +709,14 @@ void DenoiserContext::shutdown() {
 }
 
 }  // namespace PathTracer
-
 #else
-
-#include <vector>
-
 namespace PathTracer {
 
 DenoiserContext::DenoiserContext()
     : m_device(nullptr),
       m_filter(nullptr),
       m_status(DeviceStatus::Uninitialized),
-      m_lastError("OIDN support disabled at build time"),
+      m_lastError("OIDN support is disabled in this build"),
       m_metalDevice(nullptr),
       m_currentFilterType(FilterType::RT),
       m_colorBuffer(),
@@ -594,29 +730,44 @@ DenoiserContext::~DenoiserContext() {
 }
 
 bool DenoiserContext::initialize(MTLDeviceHandle metalDevice) {
-    (void)metalDevice;
+    m_metalDevice = metalDevice;
     m_status = DeviceStatus::Failed;
-    m_lastError = "OIDN support disabled: required OIDN dylibs were not found during configure";
+    m_lastError = "OIDN support is disabled in this build";
     return false;
 }
 
 bool DenoiserContext::createFilter(FilterType type) {
-    (void)type;
-    m_lastError = "OIDN support disabled at build time";
+    m_currentFilterType = type;
+    m_lastError = "OIDN support is disabled in this build";
     return false;
 }
 
-bool DenoiserContext::denoise(MTLTextureHandle colorInput,
-                              MTLTextureHandle albedoInput,
-                              MTLTextureHandle normalInput,
-                              MTLTextureHandle colorOutput,
-                              FilterType filterType) {
-    (void)colorInput;
-    (void)albedoInput;
-    (void)normalInput;
-    (void)colorOutput;
-    (void)filterType;
-    m_lastError = "OIDN support disabled at build time";
+bool DenoiserContext::denoise(MTLTextureHandle,
+                              MTLTextureHandle,
+                              MTLTextureHandle,
+                              MTLTextureHandle,
+                              FilterType) {
+    m_status = DeviceStatus::Failed;
+    m_lastError = "OIDN support is disabled in this build";
+    return false;
+}
+
+bool DenoiserContext::denoiseLinearBuffers(const float*,
+                                           const float*,
+                                           const float*,
+                                           uint32_t,
+                                           uint32_t,
+                                           std::vector<float>& outDenoisedRGB,
+                                           FilterType,
+                                           bool) {
+    outDenoisedRGB.clear();
+    m_status = DeviceStatus::Failed;
+    m_lastError = "OIDN support is disabled in this build";
+    return false;
+}
+
+bool DenoiserContext::updateFilterDimensions(uint32_t, uint32_t) {
+    m_lastError = "OIDN support is disabled in this build";
     return false;
 }
 
@@ -628,10 +779,9 @@ void DenoiserContext::shutdown() {
     m_normalBuffer.clear();
     m_outputBuffer.clear();
     m_status = DeviceStatus::Uninitialized;
-    m_lastError = "Shut down";
+    m_lastError = "OIDN support is disabled in this build";
     m_metalDevice = nullptr;
 }
 
 }  // namespace PathTracer
-
 #endif

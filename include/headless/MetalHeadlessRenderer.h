@@ -9,6 +9,8 @@ public:
                 const PathTracer::RenderSettings& settings,
                 uint32_t sppTotal,
                 bool verbose,
+                bool statsMode,
+                bool captureAuxBuffers,
                 HeadlessRenderOutput& out,
                 std::string& error) override;
 };

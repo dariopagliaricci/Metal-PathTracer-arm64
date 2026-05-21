@@ -22,7 +22,14 @@ constexpr MTLPixelFormat kSampleCountFormat = MTLPixelFormatR32Uint;
 constexpr MTLPixelFormat kPresentFormat = MTLPixelFormatRGBA32Float;
 constexpr MTLPixelFormat kAlbedoFormat = MTLPixelFormatRGBA32Float;
 constexpr MTLPixelFormat kNormalFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kPositionFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kMaterialFeatureFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kMotionVectorFormat = MTLPixelFormatRGBA32Float;
 constexpr MTLPixelFormat kDenoisedFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kSvgfScratchFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kSvgfMomentsFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kSvgfGuideFormat = MTLPixelFormatRGBA32Float;
+constexpr MTLPixelFormat kSvgfColorFormat = MTLPixelFormatRGBA32Float;
 
 }  // namespace
 
@@ -50,7 +57,12 @@ void Accumulation::ensureTextures(CGSize drawableSize, bool force) {
 
     const bool hasTextures =
         (m_radianceSumTexture && m_sampleCountTexture && m_presentTexture &&
-         m_albedoTexture && m_normalTexture && m_denoisedTexture);
+         m_albedoTexture && m_normalTexture && m_positionTexture &&
+         m_materialFeatureTexture && m_motionVectorTexture &&
+         m_denoisedTexture && m_svgfScratchTexture &&
+         m_svgfMomentsTextureA && m_svgfMomentsTextureB &&
+         m_svgfGuideTextureA && m_svgfGuideTextureB &&
+         m_svgfColorTextureA && m_svgfColorTextureB);
     if (!force && hasTextures) {
         constexpr CGFloat kSizeTolerance = 0.5f;
         const CGFloat deltaWidth = std::fabs(targetWidth - m_currentSize.width);
@@ -91,7 +103,15 @@ void Accumulation::ensureTextures(CGSize drawableSize, bool force) {
             needsTexture(m_presentTexture, kPresentFormat) ||
             needsTexture(m_albedoTexture, kAlbedoFormat) ||
             needsTexture(m_normalTexture, kNormalFormat) ||
-            needsTexture(m_denoisedTexture, kDenoisedFormat)) {
+            needsTexture(m_positionTexture, kPositionFormat) ||
+            needsTexture(m_denoisedTexture, kDenoisedFormat) ||
+            needsTexture(m_svgfScratchTexture, kSvgfScratchFormat) ||
+            needsTexture(m_svgfMomentsTextureA, kSvgfMomentsFormat) ||
+            needsTexture(m_svgfMomentsTextureB, kSvgfMomentsFormat) ||
+            needsTexture(m_svgfGuideTextureA, kSvgfGuideFormat) ||
+            needsTexture(m_svgfGuideTextureB, kSvgfGuideFormat) ||
+            needsTexture(m_svgfColorTextureA, kSvgfColorFormat) ||
+            needsTexture(m_svgfColorTextureB, kSvgfColorFormat)) {
             needsRebuild = YES;
         }
     }
@@ -146,6 +166,33 @@ void Accumulation::ensureTextures(CGSize drawableSize, bool force) {
     normalDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     m_normalTexture = [m_device newTextureWithDescriptor:normalDescriptor];
 
+    MTLTextureDescriptor* positionDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kPositionFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    positionDescriptor.storageMode = MTLStorageModePrivate;
+    positionDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_positionTexture = [m_device newTextureWithDescriptor:positionDescriptor];
+
+    MTLTextureDescriptor* materialFeatureDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kMaterialFeatureFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    materialFeatureDescriptor.storageMode = MTLStorageModePrivate;
+    materialFeatureDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_materialFeatureTexture = [m_device newTextureWithDescriptor:materialFeatureDescriptor];
+
+    MTLTextureDescriptor* motionVectorDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kMotionVectorFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    motionVectorDescriptor.storageMode = MTLStorageModePrivate;
+    motionVectorDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_motionVectorTexture = [m_device newTextureWithDescriptor:motionVectorDescriptor];
+
     MTLTextureDescriptor* denoisedDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDenoisedFormat
                                                            width:width
@@ -154,6 +201,45 @@ void Accumulation::ensureTextures(CGSize drawableSize, bool force) {
     denoisedDescriptor.storageMode = MTLStorageModePrivate;
     denoisedDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     m_denoisedTexture = [m_device newTextureWithDescriptor:denoisedDescriptor];
+
+    MTLTextureDescriptor* svgfScratchDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kSvgfScratchFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    svgfScratchDescriptor.storageMode = MTLStorageModePrivate;
+    svgfScratchDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_svgfScratchTexture = [m_device newTextureWithDescriptor:svgfScratchDescriptor];
+
+    MTLTextureDescriptor* svgfMomentsDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kSvgfMomentsFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    svgfMomentsDescriptor.storageMode = MTLStorageModePrivate;
+    svgfMomentsDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_svgfMomentsTextureA = [m_device newTextureWithDescriptor:svgfMomentsDescriptor];
+    m_svgfMomentsTextureB = [m_device newTextureWithDescriptor:svgfMomentsDescriptor];
+
+    MTLTextureDescriptor* svgfGuideDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kSvgfGuideFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    svgfGuideDescriptor.storageMode = MTLStorageModePrivate;
+    svgfGuideDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_svgfGuideTextureA = [m_device newTextureWithDescriptor:svgfGuideDescriptor];
+    m_svgfGuideTextureB = [m_device newTextureWithDescriptor:svgfGuideDescriptor];
+
+    MTLTextureDescriptor* svgfColorDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kSvgfColorFormat
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    svgfColorDescriptor.storageMode = MTLStorageModePrivate;
+    svgfColorDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    m_svgfColorTextureA = [m_device newTextureWithDescriptor:svgfColorDescriptor];
+    m_svgfColorTextureB = [m_device newTextureWithDescriptor:svgfColorDescriptor];
 
     m_currentSize = CGSizeMake(static_cast<CGFloat>(width), static_cast<CGFloat>(height));
     m_frameIndex = 0;
@@ -178,6 +264,15 @@ void Accumulation::clear(MTLCommandBufferHandle commandBuffer,
     [encoder setTexture:m_radianceSumTexture atIndex:0];
     [encoder setTexture:m_sampleCountTexture atIndex:1];
     [encoder setTexture:m_presentTexture atIndex:2];
+    [encoder setTexture:m_svgfMomentsTextureA atIndex:3];
+    [encoder setTexture:m_svgfMomentsTextureB atIndex:4];
+    [encoder setTexture:m_positionTexture atIndex:5];
+    [encoder setTexture:m_svgfGuideTextureA atIndex:6];
+    [encoder setTexture:m_svgfGuideTextureB atIndex:7];
+    [encoder setTexture:m_svgfColorTextureA atIndex:8];
+    [encoder setTexture:m_svgfColorTextureB atIndex:9];
+    [encoder setTexture:m_materialFeatureTexture atIndex:10];
+    [encoder setTexture:m_motionVectorTexture atIndex:11];
 
     NSUInteger threadWidth = clearPipeline.threadExecutionWidth;
     NSUInteger threadHeight = std::max<NSUInteger>(
@@ -241,7 +336,17 @@ void Accumulation::teardown() {
     m_presentTexture = nil;
     m_albedoTexture = nil;
     m_normalTexture = nil;
+    m_positionTexture = nil;
+    m_materialFeatureTexture = nil;
+    m_motionVectorTexture = nil;
     m_denoisedTexture = nil;
+    m_svgfScratchTexture = nil;
+    m_svgfMomentsTextureA = nil;
+    m_svgfMomentsTextureB = nil;
+    m_svgfGuideTextureA = nil;
+    m_svgfGuideTextureB = nil;
+    m_svgfColorTextureA = nil;
+    m_svgfColorTextureB = nil;
     m_currentSize = CGSizeZero;
     m_frameIndex = 0;
     m_sampleCount = 0;

@@ -1,0 +1,9 @@
+{
+  "scene": "tests/scenes/restir/r2/r2_emissive_closure.scene",
+  "baseline_reference": "validation/baselines/r2_emissive_closure_baseline_reference.pfm",
+  "frames": 512,
+  "M": 8,
+  "psnr_min": 35.000000000,
+  "rmse_max": 0.011255021,
+  "note": "Current Metal --validate-ris threshold record for the active official R2 emissive-primitive closure scene; see docs/RESTIR_R2_CLOSEOUT.md for validity rationale"
+}
