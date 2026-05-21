@@ -248,6 +248,8 @@ private:
     // Frame counter for progressive denoising
     uint32_t m_frameCounter = 0;
     uint32_t m_lastDenoisedFrame = 0;
+    uint32_t m_nextDenoiseAttemptFrame = 0;
+    uint32_t m_denoiseFailureStreak = 0;
     bool m_hasDenoisedOutput = false;
     WavefrontResources m_wavefront{};
     RestirStateResources m_restirState{};

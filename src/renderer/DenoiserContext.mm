@@ -28,9 +28,38 @@ namespace {
         }
     }
 
+    bool ensureStagingBuffer(id<MTLDevice> device,
+                             MTLBufferHandle __strong& buffer,
+                             size_t& bufferBytes,
+                             size_t requiredBytes,
+                             const char* purpose,
+                             std::string& outError) {
+        if (!device) {
+            outError = "No Metal device available for staging buffer";
+            return false;
+        }
+        if (buffer && bufferBytes >= requiredBytes) {
+            return true;
+        }
+
+        buffer = [device newBufferWithLength:requiredBytes options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            std::ostringstream oss;
+            oss << "Failed to allocate " << purpose << " staging buffer (" << requiredBytes << " bytes)";
+            outError = oss.str();
+            bufferBytes = 0;
+            return false;
+        }
+        bufferBytes = requiredBytes;
+        return true;
+    }
+
     /// Readback Metal texture to CPU buffer
     /// Returns true if successful, false otherwise
     bool readMetalTextureToCPU(MTLTextureHandle texture,
+                               MTLCommandQueueHandle commandQueue,
+                               MTLBufferHandle __strong& stagingBuffer,
+                               size_t& stagingBufferBytes,
                                std::vector<float>& outBuffer,
                                size_t& outWidth,
                                size_t& outHeight,
@@ -72,9 +101,8 @@ namespace {
         // Create temporary buffer for readback
         @autoreleasepool {
             id<MTLDevice> device = texture.device;
-            id<MTLCommandQueue> commandQueue = [device newCommandQueue];
             if (!commandQueue) {
-                outError = "Failed to create command queue for texture readback";
+                outError = "No command queue available for texture readback";
                 return false;
             }
 
@@ -90,10 +118,12 @@ namespace {
                 return false;
             }
 
-            // Create temporary buffer for readback
-            id<MTLBuffer> tmpBuffer = [device newBufferWithLength:totalBytes options:MTLResourceStorageModeShared];
-            if (!tmpBuffer) {
-                outError = "Failed to allocate temporary Metal buffer for readback";
+            if (!ensureStagingBuffer(device,
+                                     stagingBuffer,
+                                     stagingBufferBytes,
+                                     totalBytes,
+                                     "readback",
+                                     outError)) {
                 [blitEncoder endEncoding];
                 return false;
             }
@@ -106,7 +136,7 @@ namespace {
                              sourceLevel:0
                             sourceOrigin:origin
                               sourceSize:size
-                                toBuffer:tmpBuffer
+                                toBuffer:stagingBuffer
                        destinationOffset:0
                   destinationBytesPerRow:outWidth * bytesPerPixel
                 destinationBytesPerImage:outWidth * outHeight * bytesPerPixel];
@@ -116,7 +146,7 @@ namespace {
             [commandBuffer waitUntilCompleted];
 
             // Convert texture data to float32 if needed
-            const void* srcData = [tmpBuffer contents];
+            const void* srcData = [stagingBuffer contents];
             if (texture.pixelFormat == MTLPixelFormatRGBA32Float) {
                 // Direct copy
                 std::memcpy(outBuffer.data(), srcData, totalBytes);
@@ -137,6 +167,9 @@ namespace {
 
     /// Writeback CPU buffer to Metal texture
     bool writeMetalTextureFromCPU(MTLTextureHandle texture,
+                                  MTLCommandQueueHandle commandQueue,
+                                  MTLBufferHandle __strong& stagingBuffer,
+                                  size_t& stagingBufferBytes,
                                   const std::vector<float>& buffer,
                                   std::string& outError) {
         if (!texture) {
@@ -168,21 +201,22 @@ namespace {
 
         @autoreleasepool {
             id<MTLDevice> device = texture.device;
-            id<MTLCommandQueue> commandQueue = [device newCommandQueue];
             if (!commandQueue) {
-                outError = "Failed to create command queue for texture writeback";
+                outError = "No command queue available for texture writeback";
                 return false;
             }
 
-            // Create temporary buffer
-            id<MTLBuffer> tmpBuffer = [device newBufferWithLength:totalBytes options:MTLResourceStorageModeShared];
-            if (!tmpBuffer) {
-                outError = "Failed to allocate temporary Metal buffer for writeback";
+            if (!ensureStagingBuffer(device,
+                                     stagingBuffer,
+                                     stagingBufferBytes,
+                                     totalBytes,
+                                     "writeback",
+                                     outError)) {
                 return false;
             }
 
             // Convert float32 to texture format if needed
-            void* dstData = [tmpBuffer contents];
+            void* dstData = [stagingBuffer contents];
             if (texture.pixelFormat == MTLPixelFormatRGBA32Float) {
                 std::memcpy(dstData, buffer.data(), totalBytes);
             } else if (texture.pixelFormat == MTLPixelFormatRGBA16Float) {
@@ -196,11 +230,19 @@ namespace {
 
             // Blit buffer to texture
             id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+            if (!commandBuffer) {
+                outError = "Failed to create command buffer for texture writeback";
+                return false;
+            }
             id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+            if (!blitEncoder) {
+                outError = "Failed to create blit encoder for texture writeback";
+                return false;
+            }
 
             MTLOrigin origin = MTLOriginMake(0, 0, 0);
             MTLSize size = MTLSizeMake(width, height, 1);
-            [blitEncoder copyFromBuffer:tmpBuffer
+            [blitEncoder copyFromBuffer:stagingBuffer
                            sourceOffset:0
                       sourceBytesPerRow:width * bytesPerPixel
                     sourceBytesPerImage:width * height * bytesPerPixel
@@ -225,6 +267,7 @@ DenoiserContext::DenoiserContext()
       m_status(DeviceStatus::Uninitialized),
       m_lastError("Not initialized"),
       m_metalDevice(nullptr),
+      m_commandQueue(nullptr),
       m_currentFilterType(FilterType::RT),
       m_colorBuffer(),
       m_albedoBuffer(),
@@ -236,9 +279,10 @@ DenoiserContext::~DenoiserContext() {
     shutdown();
 }
 
-bool DenoiserContext::initialize(MTLDeviceHandle metalDevice) {
+bool DenoiserContext::initialize(MTLDeviceHandle metalDevice, MTLCommandQueueHandle commandQueue) {
     m_status = DeviceStatus::Initializing;
     m_metalDevice = metalDevice;
+    m_commandQueue = commandQueue;
 
     try {
         // Create OIDN device with Metal backend using C API
@@ -383,7 +427,14 @@ bool DenoiserContext::denoise(MTLTextureHandle colorInput,
 
         // STEP 1: Readback color texture to CPU buffer
         size_t colorWidth, colorHeight;
-        if (!readMetalTextureToCPU(colorInput, m_colorBuffer, colorWidth, colorHeight, m_lastError)) {
+        if (!readMetalTextureToCPU(colorInput,
+                                   m_commandQueue,
+                                   m_colorReadbackBuffer,
+                                   m_colorReadbackBufferBytes,
+                                   m_colorBuffer,
+                                   colorWidth,
+                                   colorHeight,
+                                   m_lastError)) {
             m_lastError = std::string("Failed to readback color texture: ") + m_lastError;
             return false;
         }
@@ -391,7 +442,14 @@ bool DenoiserContext::denoise(MTLTextureHandle colorInput,
         // STEP 2: Readback optional auxiliary buffers
         size_t albedoWidth = 0, albedoHeight = 0;
         if (albedoInput) {
-            if (!readMetalTextureToCPU(albedoInput, m_albedoBuffer, albedoWidth, albedoHeight, m_lastError)) {
+            if (!readMetalTextureToCPU(albedoInput,
+                                       m_commandQueue,
+                                       m_albedoReadbackBuffer,
+                                       m_albedoReadbackBufferBytes,
+                                       m_albedoBuffer,
+                                       albedoWidth,
+                                       albedoHeight,
+                                       m_lastError)) {
                 NSLog(@"[OIDN] Warning: Failed to readback albedo texture, continuing without it");
                 m_albedoBuffer.clear();
             } else if (albedoWidth != colorWidth || albedoHeight != colorHeight) {
@@ -403,7 +461,14 @@ bool DenoiserContext::denoise(MTLTextureHandle colorInput,
 
         size_t normalWidth = 0, normalHeight = 0;
         if (normalInput) {
-            if (!readMetalTextureToCPU(normalInput, m_normalBuffer, normalWidth, normalHeight, m_lastError)) {
+            if (!readMetalTextureToCPU(normalInput,
+                                       m_commandQueue,
+                                       m_normalReadbackBuffer,
+                                       m_normalReadbackBufferBytes,
+                                       m_normalBuffer,
+                                       normalWidth,
+                                       normalHeight,
+                                       m_lastError)) {
                 NSLog(@"[OIDN] Warning: Failed to readback normal texture, continuing without it");
                 m_normalBuffer.clear();
             } else if (normalWidth != colorWidth || normalHeight != colorHeight) {
@@ -523,7 +588,12 @@ bool DenoiserContext::denoise(MTLTextureHandle colorInput,
         }
 
         // STEP 6: Writeback denoised output to GPU texture
-        if (!writeMetalTextureFromCPU(colorOutput, m_outputBuffer, m_lastError)) {
+        if (!writeMetalTextureFromCPU(colorOutput,
+                                      m_commandQueue,
+                                      m_writebackBuffer,
+                                      m_writebackBufferBytes,
+                                      m_outputBuffer,
+                                      m_lastError)) {
             m_lastError = std::string("Failed to writeback denoised texture: ") + m_lastError;
             return false;
         }
@@ -706,6 +776,19 @@ void DenoiserContext::shutdown() {
     m_status = DeviceStatus::Uninitialized;
     m_lastError = "Shut down";
     m_metalDevice = nullptr;
+    m_commandQueue = nullptr;
+    releaseMetalStagingBuffers();
+}
+
+void DenoiserContext::releaseMetalStagingBuffers() {
+    m_colorReadbackBuffer = nullptr;
+    m_albedoReadbackBuffer = nullptr;
+    m_normalReadbackBuffer = nullptr;
+    m_writebackBuffer = nullptr;
+    m_colorReadbackBufferBytes = 0;
+    m_albedoReadbackBufferBytes = 0;
+    m_normalReadbackBufferBytes = 0;
+    m_writebackBufferBytes = 0;
 }
 
 }  // namespace PathTracer
@@ -718,6 +801,7 @@ DenoiserContext::DenoiserContext()
       m_status(DeviceStatus::Uninitialized),
       m_lastError("OIDN support is disabled in this build"),
       m_metalDevice(nullptr),
+      m_commandQueue(nullptr),
       m_currentFilterType(FilterType::RT),
       m_colorBuffer(),
       m_albedoBuffer(),
@@ -729,8 +813,9 @@ DenoiserContext::~DenoiserContext() {
     shutdown();
 }
 
-bool DenoiserContext::initialize(MTLDeviceHandle metalDevice) {
+bool DenoiserContext::initialize(MTLDeviceHandle metalDevice, MTLCommandQueueHandle commandQueue) {
     m_metalDevice = metalDevice;
+    m_commandQueue = commandQueue;
     m_status = DeviceStatus::Failed;
     m_lastError = "OIDN support is disabled in this build";
     return false;
@@ -781,6 +866,19 @@ void DenoiserContext::shutdown() {
     m_status = DeviceStatus::Uninitialized;
     m_lastError = "OIDN support is disabled in this build";
     m_metalDevice = nullptr;
+    m_commandQueue = nullptr;
+    releaseMetalStagingBuffers();
+}
+
+void DenoiserContext::releaseMetalStagingBuffers() {
+    m_colorReadbackBuffer = nullptr;
+    m_albedoReadbackBuffer = nullptr;
+    m_normalReadbackBuffer = nullptr;
+    m_writebackBuffer = nullptr;
+    m_colorReadbackBufferBytes = 0;
+    m_albedoReadbackBufferBytes = 0;
+    m_normalReadbackBufferBytes = 0;
+    m_writebackBufferBytes = 0;
 }
 
 }  // namespace PathTracer

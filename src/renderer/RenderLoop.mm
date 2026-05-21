@@ -59,6 +59,30 @@ bool SkipTextureUseResources() {
     return enabled;
 }
 
+uint64_t CurrentAllocatedSizeBytes(MTLDeviceHandle device) {
+    if (device && [device respondsToSelector:@selector(currentAllocatedSize)]) {
+        return static_cast<uint64_t>(device.currentAllocatedSize);
+    }
+    return 0;
+}
+
+uint64_t RecommendedMaxWorkingSetBytes(MTLDeviceHandle device) {
+    if (device && [device respondsToSelector:@selector(recommendedMaxWorkingSetSize)]) {
+        return static_cast<uint64_t>(device.recommendedMaxWorkingSetSize);
+    }
+    return 0;
+}
+
+uint64_t ApplyPercent(uint64_t value, uint64_t numerator, uint64_t denominator) {
+    if (denominator == 0u || value == 0u) {
+        return 0u;
+    }
+    const long double scaled =
+        static_cast<long double>(value) * static_cast<long double>(numerator) /
+        static_cast<long double>(denominator);
+    return static_cast<uint64_t>(scaled);
+}
+
 void LogIsolationTogglesIfNeeded() {
     static const bool logged = []() {
         const bool skipBlas = SkipBlasUseResources();
@@ -1865,7 +1889,7 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
             }
             if (!SkipBlasUseResources() && !provider.hardware.blasHandles.empty()) {
                 for (auto h : provider.hardware.blasHandles) {
-                    id<MTLAccelerationStructure> blasObj = (id<MTLAccelerationStructure>)h;
+                    id<MTLAccelerationStructure> blasObj = (__bridge id<MTLAccelerationStructure>)h;
                     if (blasObj) {
                         [encoder useResource:blasObj usage:MTLResourceUsageRead];
                     }
@@ -2336,7 +2360,7 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                     }
                     if (!SkipBlasUseResources() && !provider.hardware.blasHandles.empty()) {
                         for (auto h : provider.hardware.blasHandles) {
-                            id<MTLAccelerationStructure> blasObj = (id<MTLAccelerationStructure>)h;
+                            id<MTLAccelerationStructure> blasObj = (__bridge id<MTLAccelerationStructure>)h;
                             if (blasObj) {
                                 [encoder useResource:blasObj usage:MTLResourceUsageRead];
                             }
@@ -2409,7 +2433,7 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                     }
                     if (!SkipBlasUseResources() && !provider.hardware.blasHandles.empty()) {
                         for (auto h : provider.hardware.blasHandles) {
-                            id<MTLAccelerationStructure> blasObj = (id<MTLAccelerationStructure>)h;
+                            id<MTLAccelerationStructure> blasObj = (__bridge id<MTLAccelerationStructure>)h;
                             if (blasObj) {
                                 [encoder useResource:blasObj usage:MTLResourceUsageRead];
                             }
@@ -2560,7 +2584,7 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                     }
                     if (!SkipBlasUseResources() && !provider.hardware.blasHandles.empty()) {
                         for (auto h : provider.hardware.blasHandles) {
-                            id<MTLAccelerationStructure> blasObj = (id<MTLAccelerationStructure>)h;
+                            id<MTLAccelerationStructure> blasObj = (__bridge id<MTLAccelerationStructure>)h;
                             if (blasObj) {
                                 [encoder useResource:blasObj usage:MTLResourceUsageRead];
                             }
@@ -2707,7 +2731,7 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                     }
                     if (!SkipBlasUseResources() && !provider.hardware.blasHandles.empty()) {
                         for (auto h : provider.hardware.blasHandles) {
-                            id<MTLAccelerationStructure> blasObj = (id<MTLAccelerationStructure>)h;
+                            id<MTLAccelerationStructure> blasObj = (__bridge id<MTLAccelerationStructure>)h;
                             if (blasObj) {
                                 [encoder useResource:blasObj usage:MTLResourceUsageRead];
                             }
@@ -2839,6 +2863,44 @@ void RenderLoop::encodeDenoising(MTLCommandBufferHandle commandBuffer,
         return;
     }
 
+    if (frameIndex < m_nextDenoiseAttemptFrame) {
+        return;
+    }
+
+    const uint64_t recommendedWorkingSet = RecommendedMaxWorkingSetBytes(m_device);
+    const uint64_t currentAllocated = CurrentAllocatedSizeBytes(m_device);
+    if (recommendedWorkingSet > 0u) {
+        const uint64_t suspendThreshold = ApplyPercent(recommendedWorkingSet, 102u, 100u);
+        const uint64_t resumeThreshold = ApplyPercent(recommendedWorkingSet, 98u, 100u);
+        if (currentAllocated > suspendThreshold) {
+            if (m_denoiseFailureStreak == 0u) {
+                NSLog(@"[Denoise] Deferring OIDN while Metal residency exceeds denoise pressure threshold "
+                      "(currentAllocatedSize=%.2f MiB threshold=%.2f MiB recommendedMaxWorkingSetSize=%.2f MiB)",
+                      static_cast<double>(currentAllocated) / (1024.0 * 1024.0),
+                      static_cast<double>(suspendThreshold) / (1024.0 * 1024.0),
+                      static_cast<double>(recommendedWorkingSet) / (1024.0 * 1024.0));
+            }
+            m_hasDenoisedOutput = false;
+            m_denoiseFailureStreak = std::min(m_denoiseFailureStreak + 1u, 6u);
+            m_nextDenoiseAttemptFrame = frameIndex + std::max(30u, frequency * (1u << m_denoiseFailureStreak));
+            return;
+        }
+        if (m_denoiseFailureStreak > 0u && currentAllocated > resumeThreshold) {
+            m_hasDenoisedOutput = false;
+            m_nextDenoiseAttemptFrame = frameIndex + std::max(30u, frequency);
+            return;
+        }
+        if (m_denoiseFailureStreak > 0u && currentAllocated <= resumeThreshold) {
+            NSLog(@"[Denoise] Resuming OIDN after Metal residency dropped below denoise resume threshold "
+                  "(currentAllocatedSize=%.2f MiB threshold=%.2f MiB recommendedMaxWorkingSetSize=%.2f MiB)",
+                  static_cast<double>(currentAllocated) / (1024.0 * 1024.0),
+                  static_cast<double>(resumeThreshold) / (1024.0 * 1024.0),
+                  static_cast<double>(recommendedWorkingSet) / (1024.0 * 1024.0));
+            m_nextDenoiseAttemptFrame = 0;
+            m_denoiseFailureStreak = 0;
+        }
+    }
+
     // Get the accumulated noisy image from presentation buffer
     MTLTextureHandle colorInput = accumulation.present();
     if (!colorInput) {
@@ -2867,10 +2929,14 @@ void RenderLoop::encodeDenoising(MTLCommandBufferHandle commandBuffer,
     if (!m_denoiser->denoise(colorInput, albedoInput, normalInput, colorOutput, filterType)) {
         NSLog(@"[Denoise] Denoising failed: %s", m_denoiser->lastError().c_str());
         m_hasDenoisedOutput = false;
+        m_denoiseFailureStreak = std::min(m_denoiseFailureStreak + 1u, 6u);
+        m_nextDenoiseAttemptFrame = frameIndex + std::max(30u, frequency * (1u << m_denoiseFailureStreak));
         return;
     }
 
     m_lastDenoisedFrame = frameIndex;
+    m_nextDenoiseAttemptFrame = 0;
+    m_denoiseFailureStreak = 0;
     m_hasDenoisedOutput = true;
 }
 

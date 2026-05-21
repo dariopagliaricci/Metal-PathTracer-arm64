@@ -90,8 +90,8 @@ HardwareBuildPlan BuildHardwareBuildPlan(const SceneAccelBuildInput& input) {
         plan.instancePrimitiveCount += triangleCount;
 
         const MeshGeometryKey key{
-            .vertexBuffer = mesh.vertexBuffer,
-            .indexBuffer = mesh.indexBuffer,
+            .vertexBuffer = (__bridge const void*)mesh.vertexBuffer,
+            .indexBuffer = (__bridge const void*)mesh.indexBuffer,
             .vertexStride = mesh.vertexStride,
             .vertexCount = mesh.vertexCount,
             .indexCount = mesh.indexCount,
@@ -1503,7 +1503,7 @@ public:
                 m_blasHandles.count > 0 ? (MTLAccelerationStructureHandle)m_blasHandles[0] : nil;
             outProvider.hardware.blasHandles.clear();
             for (id<MTLAccelerationStructure> blasHandle in m_blasHandles) {
-                outProvider.hardware.blasHandles.push_back((void*)blasHandle);
+                outProvider.hardware.blasHandles.push_back((__bridge void*)blasHandle);
             }
 
 #if PT_DEBUG_TOOLS || PT_MNEE_SWRT_RAYS || PT_MNEE_OCCLUSION_PARITY
@@ -1881,7 +1881,7 @@ private:
         // Added: record all BLAS handles for encoder resource usage later.
         outProvider.hardware.blasHandles.clear();
         for (id<MTLAccelerationStructure> blasHandle in m_blasHandles) {
-            outProvider.hardware.blasHandles.push_back((void*)blasHandle);
+            outProvider.hardware.blasHandles.push_back((__bridge void*)blasHandle);
         }
 
         if (m_scratchBuffer) {

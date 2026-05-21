@@ -301,6 +301,12 @@ Large scenes are checked against `MTLDevice.recommendedMaxWorkingSetSize` before
 acceleration-structure build. This is a device-specific working-set budget, not
 the same as total unified memory.
 
+For practical interactive GUI expectations across Apple Silicon memory tiers,
+see [GUI Hardware Expectations](docs/GUI_HARDWARE_EXPECTATIONS.md). In short,
+16 GB unified memory is not enough to guarantee that every asset-pack scene can
+load in the GUI; 32 GB to 36 GB is the practical large-scene baseline, and
+64 GB or more is recommended for comfortable large-scene GUI work.
+
 ## Building
 
 Basic Metal build:
@@ -399,6 +405,24 @@ PT_HWRT_BUILD_POLICY=compact_memory \
 PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI=1 \
 ./build-metal/PathTracer.app/Contents/MacOS/PathTracer --scene=bistro_full
 ```
+
+### Large-Scene Apple Silicon Guidance
+
+Large scenes such as Bistro, San Miguel, and Sponza can put heavy pressure on
+Apple Silicon unified memory, especially in the interactive GUI. Geometry,
+textures, Metal acceleration structures, render targets, denoising state, and
+optional ReSTIR buffers all share the same physical memory pool as macOS and
+other applications.
+
+On older or lower-memory Apple Silicon systems, expect the GUI to become less
+responsive when these scenes are resident. `PT_HWRT_BUILD_POLICY=compact_memory`
+is recommended for large static scenes because it reduces acceleration-structure
+memory pressure, but it does not reduce texture memory, scene buffers, render
+targets, or ReSTIR state. For constrained systems, prefer headless rendering for
+final output, close other memory-heavy applications, start with smaller scenes,
+and avoid enabling the explicit interactive ReSTIR DI path unless profiling that
+mode specifically. See [GUI Hardware Expectations](docs/GUI_HARDWARE_EXPECTATIONS.md)
+for the practical memory-tier guidance.
 
 Presentation mode:
 

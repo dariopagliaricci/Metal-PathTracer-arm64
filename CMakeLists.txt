@@ -16,6 +16,8 @@ option(PT_DEBUG_TOOLS "Enable HWRT/SWRT debug tooling" OFF)
 option(PT_MNEE_SWRT_RAYS "Force MNEE rays to use SWRT in HWRT path (debug)" OFF)
 option(PT_MNEE_OCCLUSION_PARITY "Compare HWRT vs SWRT MNEE visibility (debug)" OFF)
 
+include(CheckCXXCompilerFlag)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD ${CMAKE_CXX_STANDARD})
@@ -126,7 +128,12 @@ set(PATH_TRACER_IMGUI_SOURCES
     external/imgui/backends/imgui_impl_osx.mm
 )
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+set(_PATH_TRACER_PREV_REQUIRED_QUIET ${CMAKE_REQUIRED_QUIET})
+set(CMAKE_REQUIRED_QUIET ON)
+check_cxx_compiler_flag("-Wno-nontrivial-memcall" PATH_TRACER_HAS_WNO_NONTRIVIAL_MEMCALL)
+set(CMAKE_REQUIRED_QUIET ${_PATH_TRACER_PREV_REQUIRED_QUIET})
+unset(_PATH_TRACER_PREV_REQUIRED_QUIET)
+if(PATH_TRACER_HAS_WNO_NONTRIVIAL_MEMCALL)
     set_source_files_properties(${PATH_TRACER_IMGUI_SOURCES}
         PROPERTIES
             COMPILE_OPTIONS "-Wno-nontrivial-memcall"
@@ -308,6 +315,11 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
     set_source_files_properties(
         src/main.mm
         src/MetalRenderer.mm
+        src/renderer/Accumulation.mm
+        src/renderer/BvhBuilder.mm
+        src/renderer/RenderLoop.mm
+        src/renderer/SceneAccel.mm
+        src/renderer/DenoiserContext.mm
         src/renderer/SceneResources.mm
         src/renderer/TransportMemoryAllocator.mm
         src/renderer/UIOverlay.mm
@@ -461,6 +473,11 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         src/headless/MetalHeadlessRenderer.mm
         src/headless/EmbreeHeadlessRenderer.mm
         src/MetalRenderer.mm
+        src/renderer/Accumulation.mm
+        src/renderer/BvhBuilder.mm
+        src/renderer/RenderLoop.mm
+        src/renderer/SceneAccel.mm
+        src/renderer/DenoiserContext.mm
         src/renderer/SceneResources.mm
         src/renderer/SettingsUtils.mm
         src/renderer/TransportMemoryAllocator.mm

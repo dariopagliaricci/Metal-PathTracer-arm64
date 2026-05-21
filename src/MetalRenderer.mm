@@ -1075,7 +1075,7 @@ bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOption
     }
 
 #if PATH_TRACER_ENABLE_OIDN
-    if (!m_denoiser.initialize(device)) {
+    if (!m_denoiser.initialize(device, m_context.commandQueue())) {
         NSLog(@"[Denoise] OIDN init failed: %s", m_denoiser.lastError().c_str());
     }
 #endif
@@ -3880,6 +3880,20 @@ bool MetalRenderer::Impl::shouldUseExclusiveSceneSwitch(const std::string& scene
          activeReport.textureCount > 0u ||
          activeReport.totalEstimatedMemoryBytes > 0u);
 
+    if (hasActiveScene) {
+        if (reason) {
+            std::ostringstream out;
+            out << "scene switch is an explicit memory-release point"
+                << " active='" << m_activeSceneId << "'"
+                << " estimated=" << FormatMiB(activeReport.totalEstimatedMemoryBytes)
+                << " geometry=" << FormatMiB(activeReport.geometryMemoryBytes)
+                << " textures=" << FormatMiB(activeReport.textureAllocatedMemoryBytes)
+                << " triangles=" << activeReport.triangleCount;
+            *reason = out.str();
+        }
+        return true;
+    }
+
     const SceneSwitchPreflight incoming =
         AnalyzeSceneSwitchPreflight(scenePath, activeSceneId, m_sceneManager.sceneDirectory());
 
@@ -3924,6 +3938,21 @@ bool MetalRenderer::Impl::shouldUseExclusiveSceneSwitch(const std::string& scene
         std::max(activeReport.totalEstimatedMemoryBytes, currentAllocated);
     const uint64_t incomingProxyBytes = incoming.referencedAssetBytes;
     const uint64_t projectedOverlap = SaturatingAdd(activeResidentEstimate, incomingProxyBytes);
+
+    if (hasActiveScene &&
+        workingSetLimit > 0u &&
+        activeResidentEstimate > workingSetLimit) {
+        if (reason) {
+            std::ostringstream out;
+            out << "active Metal residency already exceeds interactive working-set limit"
+                << " active=" << FormatMiB(activeResidentEstimate)
+                << " activeEstimated=" << FormatMiB(activeReport.totalEstimatedMemoryBytes)
+                << " currentAllocated=" << FormatMiB(currentAllocated)
+                << " limit=" << FormatMiB(workingSetLimit);
+            *reason = out.str();
+        }
+        return true;
+    }
 
     if (hasActiveScene &&
         incomingProxyBytes >= kExclusiveIncomingAssetBytes &&
@@ -4002,8 +4031,12 @@ void MetalRenderer::Impl::releaseActiveSceneForExclusiveLoad(const std::string& 
     m_pathTraceFrameInFlight.store(false, std::memory_order_release);
     m_interactiveUiFrameInFlight.store(false, std::memory_order_release);
 
+    m_denoiser.releaseMetalStagingBuffers();
     m_externalSceneResources = nullptr;
-    m_loadedSceneResources.reset();
+    if (m_loadedSceneResources) {
+        m_loadedSceneResources->clear();
+        m_loadedSceneResources.reset();
+    }
     m_sceneResources.clear();
     m_cameraCollisionSource = nullptr;
     m_cameraCollisionMeshes.clear();
@@ -4011,6 +4044,14 @@ void MetalRenderer::Impl::releaseActiveSceneForExclusiveLoad(const std::string& 
     m_cameraCollisionBvh = PathTracer::BvhBuildOutput{};
     resetFirstPersonMotion();
     resetAccumulation();
+    if (id<MTLCommandQueue> queue = m_context.commandQueue()) {
+        id<MTLCommandBuffer> drain = [queue commandBuffer];
+        if (drain) {
+            drain.label = @"Exclusive Scene Release Drain";
+            [drain commit];
+            [drain waitUntilCompleted];
+        }
+    }
     m_sceneLoadExclusiveActive = true;
 }
 
@@ -4458,6 +4499,12 @@ void MetalRenderer::Impl::serviceSceneLoadState(bool allowGpuWork) {
             }
 
             m_externalSceneResources = nullptr;
+            if (m_loadedSceneResources) {
+                m_loadedSceneResources->clear();
+                m_loadedSceneResources.reset();
+            } else {
+                m_sceneResources.clear();
+            }
             m_loadedSceneResources = std::move(pending.resources);
             m_settings = pending.settings;
             m_settings.renderScale = ClampRenderScale(m_settings.renderScale);
@@ -5874,7 +5921,9 @@ bool MetalRenderer::init(void* windowHandle, const MetalRendererOptions& options
 
 void MetalRenderer::drawFrame() {
     if (m_impl) {
-        m_impl->drawFrame();
+        @autoreleasepool {
+            m_impl->drawFrame();
+        }
     }
 }
 

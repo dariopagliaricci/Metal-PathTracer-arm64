@@ -53,7 +53,10 @@ gltf/
 /assets/*
 !/assets/CREDITS.md
 /doc/
-/docs/
+# Keep local docs ignored except explicitly published repository docs.
+/docs/*
+!/docs/
+!/docs/GUI_HARDWARE_EXPECTATIONS.md
 /scripts/
 
 #Artifacts

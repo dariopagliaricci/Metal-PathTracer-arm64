@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <cstddef>
 #include "renderer/MetalHandles.h"
 
 namespace PathTracer {
@@ -37,7 +38,7 @@ public:
     /// Must be called once before any denoising operations
     /// @param metalDevice Metal device to use for denoising
     /// @return true if initialization succeeded
-    bool initialize(MTLDeviceHandle metalDevice);
+    bool initialize(MTLDeviceHandle metalDevice, MTLCommandQueueHandle commandQueue = nullptr);
 
     /// Check if denoiser is ready for use
     bool isReady() const { return m_status == DeviceStatus::Ready; }
@@ -80,6 +81,9 @@ public:
     /// Shutdown and release all OIDN resources
     void shutdown();
 
+    /// Release reusable Metal transfer buffers while keeping the OIDN CPU device alive.
+    void releaseMetalStagingBuffers();
+
 private:
     // OIDN device and filter (stored as opaque void* to avoid exposing OIDN headers)
     // These are actually OIDNDevice and OIDNFilter pointers, but stored as void*
@@ -90,7 +94,17 @@ private:
     DeviceStatus m_status = DeviceStatus::Uninitialized;
     std::string m_lastError;
     MTLDeviceHandle m_metalDevice = nullptr;
+    MTLCommandQueueHandle m_commandQueue = nullptr;
     FilterType m_currentFilterType = FilterType::RT;
+
+    MTLBufferHandle m_colorReadbackBuffer = nullptr;
+    MTLBufferHandle m_albedoReadbackBuffer = nullptr;
+    MTLBufferHandle m_normalReadbackBuffer = nullptr;
+    MTLBufferHandle m_writebackBuffer = nullptr;
+    size_t m_colorReadbackBufferBytes = 0;
+    size_t m_albedoReadbackBufferBytes = 0;
+    size_t m_normalReadbackBufferBytes = 0;
+    size_t m_writebackBufferBytes = 0;
 
     // CPU buffers for Metal↔OIDN data transfer
     std::vector<float> m_colorBuffer;     // Input color (beauty) buffer
