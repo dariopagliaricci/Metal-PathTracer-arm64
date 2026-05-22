@@ -304,8 +304,9 @@ the same as total unified memory.
 For practical interactive GUI expectations across Apple Silicon memory tiers,
 see [GUI Hardware Expectations](docs/GUI_HARDWARE_EXPECTATIONS.md). In short,
 16 GB unified memory is not enough to guarantee that every asset-pack scene can
-load in the GUI; 32 GB to 36 GB is the practical large-scene baseline, and
-64 GB or more is recommended for comfortable large-scene GUI work.
+load in the GUI; 32 GB is the first broadly useful large-scene GUI tier, 36 GB
+to 48 GB is the more realistic current Pro/Max-class baseline, and 64 GB or more
+is recommended for comfortable large-scene GUI work.
 
 ## Building
 
