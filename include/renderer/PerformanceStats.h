@@ -5,6 +5,7 @@
 // Use only the public API from MetalRenderer.h
 
 #include <cstdint>
+#include <string>
 
 namespace PathTracer {
 
@@ -91,6 +92,9 @@ struct PerformanceStats {
     uint64_t throughputNanInfCount = 0;
     uint64_t radianceNanInfCount = 0;
     uint64_t clampEventCount = 0;
+    uint64_t restirDiRegirCandidateCount = 0;
+    uint64_t restirDiRegirAcceptedCount = 0;
+    uint64_t restirDiRegirFallbackCount = 0;
     uint64_t restirGiCandidateCount = 0;
     uint64_t restirGiReservoirUpdateCount = 0;
     uint64_t restirGiAcceptCount = 0;
@@ -109,6 +113,27 @@ struct PerformanceStats {
     uint64_t restirPtReuseAppliedCount = 0;
     uint64_t restirPtReuseRejectedInvalidCount = 0;
     uint64_t restirPtReuseFallbackCount = 0;
+    uint64_t restirPtEnhancedCandidateCount = 0;
+    uint64_t restirPtEnhancedInitialSelectedCount = 0;
+    uint64_t restirPtEnhancedTemporalAcceptedCount = 0;
+    uint64_t restirPtEnhancedTemporalRejectedCount = 0;
+    uint64_t restirPtEnhancedSpatialAcceptedCount = 0;
+    uint64_t restirPtEnhancedSpatialRejectedCount = 0;
+    uint64_t restirPtEnhancedInvalidShiftGeometryCount = 0;
+    uint64_t restirPtEnhancedInvalidShiftMaterialCount = 0;
+    uint64_t restirPtEnhancedInvalidShiftPdfCount = 0;
+    uint64_t restirPtEnhancedInvalidShiftVisibilityCount = 0;
+    uint64_t restirPtEnhancedInvalidShiftInvertibilityCount = 0;
+    uint64_t restirPtEnhancedInvalidShiftUnsupportedCount = 0;
+    uint64_t restirPtEnhancedDuplicateScoreSum = 0;
+    uint64_t restirPtEnhancedBiasedCCapApplicationCount = 0;
+    uint64_t restirPtEnhancedVectorWeightUseCount = 0;
+    uint64_t restirPtEnhancedReplayCompactionInputCount = 0;
+    uint64_t restirPtEnhancedReplayCompactionOutputCount = 0;
+    uint64_t restirPtEnhancedFallbackCount = 0;
+    uint64_t restirPtEnhancedCanonicalSampleCount = 0;
+    uint64_t restirPtEnhancedPathLengthHistogram[8] = {};
+    uint64_t restirPtEnhancedReconnectionDepthHistogram[8] = {};
     uint64_t radianceCacheQueryCount = 0;
     uint64_t radianceCacheHitCount = 0;
     uint64_t radianceCacheMissCount = 0;
@@ -181,6 +206,9 @@ struct PerformanceStats {
     uint64_t transportMemoryBytesShared = 0;
     uint64_t transportMemoryBytesStaging = 0;
     uint32_t transportMemoryRecordCount = 0;
+    uint32_t transportMemoryAllocatorBackedRecordCount = 0;
+    uint32_t transportMemoryFrameGraphBackedRecordCount = 0;
+    uint32_t transportMemoryOwnershipGapRecordCount = 0;
     uint32_t transportMemoryInvalidatedRecordCount = 0;
     uint32_t transportMemoryLastInvalidationReason = 0;
     uint64_t primaryRayCount = 0;
@@ -196,6 +224,7 @@ struct PerformanceStats {
     uint64_t restirDiApplyLightingDispatchCount = 0;
     uint64_t restirDiDebugAovDispatchCount = 0;
     bool restirDiHardwareTraceActive = false;
+    std::string restirDiPathStatus;
     uint64_t integrationDispatchCount = 0;
     uint64_t presentationDispatchCount = 0;
     uint64_t wavefrontResetDispatchCount = 0;

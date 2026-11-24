@@ -27,6 +27,11 @@ struct ImportOptions {
     ImportMode importMode = ImportMode::Generic;
     OutputFormat outputFormat = OutputFormat::Glb;
     TextureMode textureMode = TextureMode::Copy;
+    // OBJ only: serve Assimp the file with every distinct `mtllib` ahead of all geometry
+    // (works around Assimp's repeated/late `mtllib` material mis-assignment).
+    bool objHoistMaterialLibraries = true;
+    // OBJ only: downgrade a per-material face-count mismatch from an import failure to a warning.
+    bool allowObjMaterialMismatch = false;
 };
 
 struct ImportResult {

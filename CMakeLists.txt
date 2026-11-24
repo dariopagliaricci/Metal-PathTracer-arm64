@@ -67,6 +67,44 @@ endif()
 # Enable testing
 enable_testing()
 
+if(APPLE AND NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY
+   AND EXISTS "${CMAKE_SOURCE_DIR}/tests/tools/test_env_sampling_mapping.cpp")
+    add_executable(EnvSamplingMappingTest
+        tests/tools/test_env_sampling_mapping.cpp
+        src/renderer/EnvImportanceSampler.mm
+    )
+    target_include_directories(EnvSamplingMappingTest PRIVATE include)
+    add_test(NAME env_sampling_mapping COMMAND EnvSamplingMappingTest)
+endif()
+
+if(APPLE AND NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
+    add_executable(RadianceCacheTrainingTest
+        src/headless/RadianceCacheTrainingTest.cpp
+    )
+    target_include_directories(RadianceCacheTrainingTest PRIVATE include)
+    add_test(NAME radiance_cache_training_target COMMAND RadianceCacheTrainingTest)
+endif()
+
+# EP8: the shared Metal/C++ closure headers (shaders/shared) built as C++: each Tungsten source model's sampler
+# must agree with its eval and pdf.
+if(APPLE AND NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
+    add_executable(SharedClosuresTest
+        src/headless/SharedClosuresTest.cpp
+    )
+    target_include_directories(SharedClosuresTest PRIVATE include shaders)
+    add_test(NAME shared_closures COMMAND SharedClosuresTest)
+endif()
+
+# Host-side checks for hero-wavelength spectral mode: white balance, wavelength rotation, collapse expectation.
+if(APPLE AND NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY
+   AND EXISTS "${CMAKE_SOURCE_DIR}/tests/tools/test_spectral_hero_wavelength.cpp")
+    add_executable(SpectralHeroWavelengthTest
+        tests/tools/test_spectral_hero_wavelength.cpp
+    )
+    target_include_directories(SpectralHeroWavelengthTest PRIVATE include)
+    add_test(NAME spectral_hero_wavelength COMMAND SpectralHeroWavelengthTest)
+endif()
+
 set(PATH_TRACER_IMPORT_ASSIMP_ENABLED OFF)
 if(PATH_TRACER_ENABLE_ASSIMP)
     find_package(assimp CONFIG QUIET)
@@ -149,6 +187,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
     )
     file(GLOB_RECURSE SHADER_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/shaders/*.metal"
+        "${CMAKE_SOURCE_DIR}/shaders/*.h"
     )
 
     add_executable(PathTracer
@@ -232,6 +271,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
             external/tinyobjloader
             external/tinyply
             external/tinybvh
+            external/stb
             "${PATH_TRACER_OIDN_INCLUDE_DIR}"
     )
 
@@ -247,6 +287,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
 
     target_compile_definitions(PathTracer PRIVATE
         PATH_TRACER_ENABLE_OIDN=$<BOOL:${PATH_TRACER_OIDN_AVAILABLE}>
+        PATH_TRACER_GIT_HASH="${PATH_TRACER_GIT_HASH}"
         PT_DEBUG_TOOLS=$<BOOL:${PT_DEBUG_TOOLS}>
         PT_MNEE_SWRT_RAYS=$<BOOL:${PT_MNEE_SWRT_RAYS}>
         PT_MNEE_OCCLUSION_PARITY=$<BOOL:${PT_MNEE_OCCLUSION_PARITY}>
@@ -275,18 +316,58 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
     )
 
     set(ASSET_SOURCE_DIR "${CMAKE_SOURCE_DIR}/assets")
+    set(PAVILION_REFERENCE_ENVS)
+    foreach(PAVILION_VARIANT day sunset night)
+        set(PAVILION_HDR "${ASSET_SOURCE_DIR}/barcelona_pavilion/${PAVILION_VARIANT}.hdr")
+        if(EXISTS "${PAVILION_HDR}"
+           AND EXISTS "${CMAKE_SOURCE_DIR}/scripts/prepare_pavilion_environment.cpp")
+            if(NOT TARGET PathTracerPavilionEnvironmentTool)
+                add_executable(PathTracerPavilionEnvironmentTool EXCLUDE_FROM_ALL
+                    scripts/prepare_pavilion_environment.cpp)
+            endif()
+            set(PAVILION_REFERENCE_HDR
+                "${ASSET_SOURCE_DIR}/barcelona_pavilion/${PAVILION_VARIANT}_reference_ibl.hdr")
+            add_custom_command(
+                OUTPUT "${PAVILION_REFERENCE_HDR}"
+                COMMAND $<TARGET_FILE:PathTracerPavilionEnvironmentTool>
+                        "${PAVILION_HDR}" "${PAVILION_REFERENCE_HDR}"
+                DEPENDS PathTracerPavilionEnvironmentTool "${PAVILION_HDR}"
+                COMMENT "Preparing Barcelona Pavilion ${PAVILION_VARIANT} environment"
+                VERBATIM
+            )
+            list(APPEND PAVILION_REFERENCE_ENVS "${PAVILION_REFERENCE_HDR}")
+        endif()
+    endforeach()
+    if(PAVILION_REFERENCE_ENVS)
+        add_custom_target(PathTracerPavilionEnvironments
+            DEPENDS ${PAVILION_REFERENCE_ENVS})
+    endif()
     file(GLOB_RECURSE ASSET_FILES CONFIGURE_DEPENDS
         "${ASSET_SOURCE_DIR}/*"
     )
+    # assets/ is not tracked, so a fresh clone has none: build without bundled scene assets then.
+    if(EXISTS "${ASSET_SOURCE_DIR}")
+        set(APP_ASSET_COPY COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets")
+        set(HEADLESS_ASSET_COPY COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${ASSET_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/assets")
+        set(HEADLESS_TARGET_ASSET_COPY COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracerHeadless>/assets")
+    else()
+        message(STATUS "No assets/ directory: building without bundled scene assets")
+        set(APP_ASSET_COPY)
+        set(HEADLESS_ASSET_COPY)
+        set(HEADLESS_TARGET_ASSET_COPY)
+    endif()
 
     set(ASSET_COPY_STAMP "${CMAKE_BINARY_DIR}/PathTracerAssets.stamp")
     add_custom_command(
         OUTPUT "${ASSET_COPY_STAMP}"
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracer>/../Resources"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
+        ${APP_ASSET_COPY}
         COMMAND ${CMAKE_COMMAND} -E touch "${ASSET_COPY_STAMP}"
-        DEPENDS ${ASSET_FILES}
+        DEPENDS ${ASSET_FILES} ${PAVILION_REFERENCE_ENVS}
         COMMENT "Copying scene assets into PathTracer.app bundle"
     )
 
@@ -294,16 +375,19 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         DEPENDS "${ASSET_COPY_STAMP}"
     )
     add_dependencies(PathTracerAssets PathTracer)
+    if(TARGET PathTracerPavilionEnvironments)
+        add_dependencies(PathTracerAssets PathTracerPavilionEnvironments)
+    endif()
 
     set(HEADLESS_ASSET_COPY_STAMP "${CMAKE_BINARY_DIR}/PathTracerHeadlessAssets.stamp")
     add_custom_command(
         OUTPUT "${HEADLESS_ASSET_COPY_STAMP}"
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/assets"
+        ${HEADLESS_ASSET_COPY}
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/shaders" "${CMAKE_BINARY_DIR}/shaders"
         COMMAND ${CMAKE_COMMAND} -E touch "${HEADLESS_ASSET_COPY_STAMP}"
-        DEPENDS ${ASSET_FILES} ${SHADER_SOURCES}
+        DEPENDS ${ASSET_FILES} ${PAVILION_REFERENCE_ENVS} ${SHADER_SOURCES}
         COMMENT "Copying scene assets next to PathTracerHeadless"
     )
 
@@ -311,6 +395,9 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         DEPENDS "${HEADLESS_ASSET_COPY_STAMP}"
     )
     add_dependencies(PathTracerHeadlessAssets PathTracerHeadless)
+    if(TARGET PathTracerPavilionEnvironments)
+        add_dependencies(PathTracerHeadlessAssets PathTracerPavilionEnvironments)
+    endif()
 
     set_source_files_properties(
         src/main.mm
@@ -400,12 +487,16 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         external/imgui/backends/imgui_impl_osx.mm
         ${MIKKTSPACE_SOURCE}
     )
+    if(TARGET PathTracerPavilionEnvironments)
+        add_dependencies(PathTracerHeadless PathTracerPavilionEnvironments)
+    endif()
 
     target_sources(PathTracerHeadless PRIVATE ${SHADER_SOURCES})
 
     target_include_directories(PathTracerHeadless
         PRIVATE
             include
+            shaders  # shaders/shared: closure headers compiled by Metal and by the Embree backend (EP8)
     )
 
     target_include_directories(PathTracerHeadless
@@ -417,6 +508,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
             external/tinyobjloader
             external/tinyply
             external/tinybvh
+            external/stb
             "${PATH_TRACER_OIDN_INCLUDE_DIR}"
     )
 
@@ -489,11 +581,15 @@ endif()
 
 if(STRICT)
     set(_STRICT_FLAGS -Wall -Wextra -Werror -Wshadow -Wconversion)
-    foreach(_target PathTracer PathTracerHeadless PathTracerImport)
+    foreach(_target PathTracer PathTracerHeadless PathTracerImport SharedClosuresTest)
         if(TARGET ${_target})
             target_compile_options(${_target} PRIVATE ${_STRICT_FLAGS})
         endif()
     endforeach()
+    # STRICT checks our own code only. Vendored sources compiled into the targets above get -w, which
+    # suppresses every warning in them; vendored headers stay quiet as SYSTEM include directories.
+    set_property(SOURCE ${PATH_TRACER_IMGUI_SOURCES} external/ImGuizmo/ImGuizmo.cpp ${MIKKTSPACE_SOURCE}
+                 APPEND PROPERTY COMPILE_OPTIONS -w)
 endif()
 
 if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
@@ -512,8 +608,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
     add_custom_command(TARGET PathTracerHeadless POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSET_SOURCE_DIR}"
-                                         "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
+        ${HEADLESS_TARGET_ASSET_COPY}
         COMMENT "Copying scene assets next to PathTracerHeadless"
     )
 
@@ -531,6 +626,9 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         SKIP_REGULAR_EXPRESSION "Metal is not supported|Failed to initialize headless Metal context"
     )
+    if(NOT EXISTS "${ASSET_SOURCE_DIR}/bistro_full.scene")
+        set_tests_properties(bistro_full_smoke PROPERTIES DISABLED TRUE)
+    endif()
 
     add_executable(PathTracerImport
         src/main_import.mm
@@ -538,6 +636,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         src/import/TextureConverter.cpp
         include/import/ImportPipeline.h
         include/import/TextureConverter.h
+        include/shared/DdsTexture.h
         include/shared/Ktx2Texture.h
     )
 
@@ -581,6 +680,7 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         src/import/TextureConverter.cpp
         include/import/BistroMaterialAudit.h
         include/import/TextureConverter.h
+        include/shared/DdsTexture.h
         include/shared/Ktx2Texture.h
     )
 
@@ -617,7 +717,14 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
             COMPILE_FLAGS "-fobjc-arc"
     )
 
-    if(M0_TESTS)
+    # The golden image script is not part of every tree (the public release leaves it out), so M0_TESTS registers
+    # the tests only when the script exists and says so when it does not.
+    if(M0_TESTS AND NOT EXISTS "${CMAKE_SOURCE_DIR}/tests/tools/golden_test.sh")
+        message(WARNING
+            "M0_TESTS is ON but tests/tools/golden_test.sh is not in this tree. "
+            "The golden image tests are not registered."
+        )
+    elseif(M0_TESTS)
         # Golden image tests
         add_test(
             NAME golden_image_test_generate_after

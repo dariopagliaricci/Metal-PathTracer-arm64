@@ -24,6 +24,9 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
     result.lobeType = 0u;
     result.lobeRoughness = 0.0f;
 
+    if (source_model(material) > 0.0f) {
+        return source_sample(material, normal, wo, frontFace, state, specularOnly);
+    }
     uint type = static_cast<uint>(material.typeEta.x);
     switch (type) {
         case 0u: { // Lambertian
@@ -90,7 +93,7 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
                 break;
             }
 
-            float alpha = roughness * roughness;
+            float alpha = max(roughness * roughness, 1.0e-4f);
             float3 wh = sample_ggx_vndf(normal, wo, roughness, state);
             if (dot(wh, normal) <= 0.0f) {
                 return result;
@@ -114,7 +117,7 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
                 return result;
             }
 
-            float D = ggx_D(alpha, dot(normal, wh));
+            float D = ggx_D(alpha, normal, wh);
             float G = ggx_G1(alpha, cosThetaO) * ggx_G1(alpha, cosThetaI);
             if (material_has_conductor_ior(material)) {
                 F = fresnel_conductor(dot(wi, wh), eta, k);
@@ -125,8 +128,8 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
             float denom = 4.0f * cosThetaO * cosThetaI;
             float3 f = F * (D * G / max(denom, 1e-6f));
             f *= specular_energy_compensation(f0, roughness, cosThetaO);
-            f = clamp_specular_tail(f, roughness, f0, clampParams);
-            float pdf = ggx_pdf(alpha, normal, wo, wi);
+            f = sanitize_specular_value(f);
+            float pdf = D * ggx_G1(alpha, cosThetaO) / (4.0f * cosThetaO);
             if (pdf <= 0.0f) {
                 return result;
             }
@@ -146,118 +149,44 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
             result.lobeRoughness = roughness;
             break;
         }
-        case 4u: { // Plastic (Diffuse + Clearcoat)
-            float cosThetaO = dot(normal, wo);
-            if (cosThetaO <= 0.0f) {
+        case 4u: { // Plastic: one-sample MIS over the coat and the diffuse base (see plastic_closure_eval)
+            PlasticLobeProbabilities probs = plastic_lobe_probabilities(material, normal, wo, specularOnly);
+            if (probs.coat + probs.diffuse <= 0.0f) {
                 return result;
             }
-
             float coatRoughness = plastic_coat_roughness(material);
-            float alpha = coatRoughness * coatRoughness;
-            float f0 = plastic_coat_f0(material);
-            float3 f0Color = float3(f0);
-            float pCoat = clamp(plastic_coat_sample_weight(material), 0.0f, 1.0f);
-            float pDiffuse = 1.0f - pCoat;
-            float fresnelAvg = plastic_coat_fresnel_average(material);
-            float3 specTint = plastic_specular_tint(material);
-            if (specularOnly) {
-                pCoat = 1.0f;
-                pDiffuse = 0.0f;
-            }
-
-            float selector = rand_uniform(state);
-            bool sampleCoat = (selector < pCoat) && (pCoat > 0.0f);
-
+            bool sampleCoat = rand_uniform(state) < probs.coat;
+            float3 wi;
             if (sampleCoat) {
                 float3 wh = sample_ggx_vndf(normal, wo, coatRoughness, state);
                 if (dot(wh, normal) <= 0.0f) {
                     return result;
                 }
-
-                float3 wi = reflect(-wo, wh);
-                wi = safe_normalize(wi);
-                float cosThetaI = dot(normal, wi);
-                if (cosThetaI <= 0.0f) {
-                    return result;
-                }
-
-                float dotWiWh = dot(wi, wh);
-                if (dotWiWh <= 0.0f) {
-                    return result;
-                }
-
-                float D = ggx_D(alpha, dot(normal, wh));
-                float G = ggx_G1(alpha, cosThetaO) * ggx_G1(alpha, cosThetaI);
-                float3 F = schlick_fresnel(f0Color, dotWiWh);
-                float denom = 4.0f * cosThetaO * cosThetaI;
-                float3 spec = F * (D * G / max(denom, 1e-6f));
-                spec = clamp_specular_tail(spec, coatRoughness, f0Color, clampParams);
-                spec *= specTint;
-
-                float specPdfRaw = ggx_pdf(alpha, normal, wo, wi);
-                float specPdf = (specPdfRaw > 0.0f) ? clamp_specular_pdf(specPdfRaw, clampParams) : 0.0f;
-                float diffusePdf = lambert_pdf(normal, wi);
-                float combinedPdf = pCoat * specPdf + pDiffuse * diffusePdf;
-                if (combinedPdf <= 0.0f) {
-                    return result;
-                }
-
-                float3 weight = spec * cosThetaI / combinedPdf;
-                if (!all(isfinite(weight))) {
-                    return result;
-                }
-
-                result.direction = wi;
-                result.weight = max(weight, float3(0.0f));
-                result.pdf = combinedPdf;
-                result.directionalPdf = combinedPdf;
-                result.isDelta = false;
-                result.lobeType = 1u;
-                result.lobeRoughness = coatRoughness;
-                break;
+                wi = safe_normalize(reflect(-wo, wh));
+            } else {
+                wi = safe_normalize(to_world(sample_cosine_hemisphere(state), normal));
             }
-
-            float3 local = sample_cosine_hemisphere(state);
-            float3 wi = safe_normalize(to_world(local, normal));
             float cosThetaI = dot(normal, wi);
-            if (cosThetaI <= 0.0f) {
+            if (!all(isfinite(wi)) || cosThetaI <= 0.0f) {
                 return result;
             }
 
-            float3 base = material_base_color(material);
-            float3 diffuse = base / kPi;
-            diffuse *= clamp(diffuseOcclusion, 0.0f, 1.0f);
-            float3 tintThrough = plastic_diffuse_transmission(material, cosThetaI, cosThetaO);
-            float3 F_i = schlick_fresnel(f0Color, cosThetaI);
-            float3 F_o = schlick_fresnel(f0Color, cosThetaO);
-            diffuse *= tintThrough;
-            diffuse *= (float3(1.0f) - F_i) * (float3(1.0f) - F_o);
-            diffuse *= max(1.0f - fresnelAvg, 0.0f);
-            diffuse = max(diffuse, float3(0.0f));
-            if (specularOnly) {
-                diffuse = float3(0.0f);
-            }
-
-            float diffusePdf = lambert_pdf(normal, wi);
-            float specPdfRaw = ggx_pdf(alpha, normal, wo, wi);
-            float specPdf = (specPdfRaw > 0.0f) ? clamp_specular_pdf(specPdfRaw, clampParams) : 0.0f;
-            float combinedPdf = pCoat * specPdf + pDiffuse * diffusePdf;
-            if (combinedPdf <= 0.0f) {
+            ClosureValuePdf closure =
+                plastic_closure_eval(material, normal, wo, wi, probs, diffuseOcclusion, specularOnly, clampParams);
+            if (closure.pdf <= 0.0f || !any(closure.value > float3(0.0f))) {
                 return result;
             }
-
-            float3 weight = diffuse * cosThetaI / combinedPdf;
+            float3 weight = closure.value * cosThetaI / closure.pdf;
             if (!all(isfinite(weight))) {
                 return result;
             }
-
             result.direction = wi;
             result.weight = max(weight, float3(0.0f));
-            result.pdf = combinedPdf;
-            result.directionalPdf = combinedPdf;
+            result.pdf = closure.pdf;
+            result.directionalPdf = closure.pdf;
             result.isDelta = false;
-            result.lobeType = 0u;
-            result.lobeRoughness = 1.0f;
+            result.lobeType = sampleCoat ? 1u : 0u;
+            result.lobeRoughness = sampleCoat ? coatRoughness : 1.0f;
             break;
         }
         case 5u: { // Subsurface scattering (separable diffusion)
@@ -368,133 +297,64 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
             result.hasExitPoint = false;
             break;
         }
-        case 6u: { // CarPaint (base + flakes + clearcoat)
-            float pCoat = carpaint_coat_sample_weight(material);
-            float pFlake = carpaint_flake_sample_weight(material);
-            float pBase = max(1.0f - (pCoat + pFlake), 0.0f);
-            float norm = pCoat + pFlake + pBase;
-            if (norm <= 1.0e-6f) {
-                pBase = 1.0f;
-                pCoat = 0.0f;
-                pFlake = 0.0f;
-                norm = 1.0f;
+        case 6u: { // CarPaint: one-sample MIS over the closure's lobes (see carpaint_closure_eval)
+            if (dot(normal, wo) <= 0.0f) {
+                return result;
             }
-            pCoat /= norm;
-            pFlake /= norm;
-            pBase /= norm;
-
-            float r = rand_uniform(state);
-            uint lobe = 0u; // 0 = base, 1 = flake, 2 = coat
-            uint selectedLobeType = 0u;
-            float selectedLobeRoughness = 0.0f;
-            float thresholdCoat = pCoat;
-            float thresholdFlake = pCoat + pFlake;
-            if (pCoat > 0.0f && r < thresholdCoat) {
-                lobe = 2u;
-            } else if (pFlake > 0.0f && r < thresholdFlake) {
-                lobe = 1u;
+            float3 flakeNormal = carpaint_flake_normal(material, position, normal);
+            CarpaintLobeProbabilities probs = carpaint_lobe_probabilities(material, normal, flakeNormal, wo);
+            float u = rand_uniform(state);
+            float3 lobeNormal = normal;
+            float lobeRoughness = 1.0f;
+            bool diffuseLobe = false;
+            if (u < probs.coat) {
+                lobeRoughness = carpaint_coat_roughness(material);
+            } else if (u < probs.coat + probs.flake) {
+                lobeNormal = flakeNormal;
+                lobeRoughness = carpaint_flake_lobe_roughness(material);
+            } else if (u < probs.coat + probs.flake + probs.diffuse || probs.metal <= 0.0f) {
+                diffuseLobe = true;
             } else {
-                lobe = 0u;
-                if (pBase <= 1.0e-6f) {
-                    if (pFlake > pCoat && pFlake > 0.0f) {
-                        lobe = 1u;
-                    } else if (pCoat > 0.0f) {
-                        lobe = 2u;
-                    }
-                }
+                lobeRoughness = carpaint_metal_roughness(material);
+            }
+            if (probs.coat + probs.flake + probs.diffuse + probs.metal <= 0.0f) {
+                return result;
             }
 
             float3 wi;
-            if (lobe == 2u) {
-                float coatRoughness = plastic_coat_roughness(material);
-                float3 wh = sample_ggx_vndf(normal, wo, coatRoughness, state);
-                if (dot(wh, normal) <= 0.0f) {
-                    return result;
-                }
-                wi = reflect(-wo, wh);
-                wi = safe_normalize(wi);
-                selectedLobeType = 1u;
-                selectedLobeRoughness = coatRoughness;
-            } else if (lobe == 1u) {
-                float flakeRoughness = max(carpaint_flake_roughness(material), 1.0e-3f);
-                float3 flakeNormal = carpaint_flake_normal(material, position, normal);
-                float3 wh = sample_ggx_vndf(flakeNormal, wo, flakeRoughness, state);
-                if (dot(wh, flakeNormal) <= 0.0f) {
-                    return result;
-                }
-                wi = reflect(-wo, wh);
-                wi = safe_normalize(wi);
-                selectedLobeType = 1u;
-                selectedLobeRoughness = flakeRoughness;
+            if (diffuseLobe) {
+                wi = safe_normalize(to_world(sample_cosine_hemisphere(state), normal));
             } else {
-                float metallic = carpaint_base_metallic(material);
-                float diffuseWeight = max(1.0f - metallic, 0.0f);
-                float specWeight = max(metallic, 0.0f);
-                float weightSum = diffuseWeight + specWeight;
-                float choose = rand_uniform(state);
-                bool sampleSpec = (specWeight > 0.0f) && (weightSum > 0.0f) &&
-                                  (choose < specWeight / max(weightSum, 1.0e-6f));
-                if (sampleSpec) {
-                    float baseRough = max(carpaint_base_roughness(material), 1.0e-3f);
-                    float3 wh = sample_ggx_vndf(normal, wo, baseRough, state);
-                    if (dot(wh, normal) <= 0.0f) {
-                        return result;
-                    }
-                    wi = reflect(-wo, wh);
-                    wi = safe_normalize(wi);
-                    selectedLobeType = 1u;
-                    selectedLobeRoughness = baseRough;
-                } else {
-                    float3 local = sample_cosine_hemisphere(state);
-                    wi = safe_normalize(to_world(local, normal));
-                    selectedLobeType = 0u;
-                    selectedLobeRoughness = 1.0f;
+                float3 wh = sample_ggx_vndf(lobeNormal, wo, lobeRoughness, state);
+                if (dot(wh, lobeNormal) <= 0.0f) {
+                    return result;
                 }
+                wi = safe_normalize(reflect(-wo, wh));
             }
-
-            if (!all(isfinite(wi)) || dot(normal, wi) <= 0.0f) {
+            float cosThetaI = dot(normal, wi);
+            if (!all(isfinite(wi)) || cosThetaI <= 0.0f) {
                 return result;
             }
 
-            CarpaintLobeResult coatRes = carpaint_eval_coat(material, normal, wo, wi, clampParams);
-            CarpaintLobeResult flakeRes = carpaint_eval_flake(material, position, normal, wo, wi, clampParams);
-            CarpaintLobeResult baseRes = carpaint_eval_base(material, normal, wo, wi, clampParams);
-
-            float combinedPdf = pBase * baseRes.pdf + pFlake * flakeRes.pdf + pCoat * coatRes.pdf;
-            if (combinedPdf <= 0.0f) {
+            ClosureValuePdf closure =
+                carpaint_closure_eval(material, normal, flakeNormal, wo, wi, probs, clampParams);
+            if (closure.pdf <= 0.0f || !any(closure.value > float3(0.0f))) {
                 return result;
             }
-
-            float3 selectedF = baseRes.f;
-            float selectedPdf = baseRes.pdf;
-            if (lobe == 1u) {
-                selectedF = flakeRes.f;
-                selectedPdf = flakeRes.pdf;
-            } else if (lobe == 2u) {
-                selectedF = coatRes.f;
-                selectedPdf = coatRes.pdf;
-            }
-            if (selectedPdf <= 0.0f || !any(selectedF > float3(0.0f))) {
-                return result;
-            }
-            float cosThetaI = max(dot(normal, wi), 0.0f);
-            if (cosThetaI <= 0.0f) {
-                return result;
-            }
-            float3 weight = selectedF * cosThetaI / combinedPdf;
+            float3 weight = closure.value * cosThetaI / closure.pdf;
             if (!all(isfinite(weight))) {
                 return result;
             }
             result.direction = wi;
             result.weight = max(weight, float3(0.0f));
-            result.pdf = combinedPdf;
-            result.directionalPdf = max(selectedPdf, 0.0f);
+            result.pdf = closure.pdf;
+            result.directionalPdf = closure.pdf;
             result.areaPdf = 0.0f;
             result.isDelta = false;
             result.isBssrdf = false;
             result.hasExitPoint = false;
-            result.lobeType = selectedLobeType;
-            result.lobeRoughness = selectedLobeRoughness;
+            result.lobeType = diffuseLobe ? 0u : 1u;
+            result.lobeRoughness = lobeRoughness;
             break;
         }
         case 7u: { // PBR Metallic-Roughness
@@ -502,12 +362,16 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
                                                  normal,
                                                  wo,
                                                  incidentDir,
+                                                 frontFace,
                                                  state,
                                                  clampParams,
                                                  diffuseOcclusion,
                                                  specularOnly);
         }
         case 2u: { // Dielectric
+            if (material_is_regularized_dielectric(material)) {
+                return sample_regularized_dielectric(material, normal, wo, frontFace, state);
+            }
             result.isDelta = true;
             bool isThin = material_is_thin_dielectric(material);
             float refIdx = max(material.typeEta.y, 1.0f);
@@ -523,6 +387,11 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
             float relativeEta = etaI / etaT;
             float cosThetaT = 0.0f;
             float Fr = fresnel_dielectric_exact(cosThetaO, etaI, etaT, cosThetaT);
+            if (isThin && Fr < 1.0f) {
+                float Ft = 1.0f - Fr;
+                Fr += (Ft * Ft * Fr) / max(1.0f - Fr * Fr, 1.0e-6f);
+            }
+            float3 transmissionTint = dielectric_transmission_tint(material);
 
             float3 direction;
             float3 weight;
@@ -530,6 +399,10 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
                 direction = reflect(unitDir, normal);
                 // The Fresnel branch probability is already accounted for by lobe selection.
                 weight = float3(1.0f);
+            } else if (isThin) {
+                // A thin dielectric represents two coincident, parallel interfaces.
+                direction = unitDir;
+                weight = transmissionTint;
             } else {
                 direction = refract(unitDir, normal, relativeEta);
                 float dirLen2 = dot(direction, direction);
@@ -538,14 +411,12 @@ inline BsdfSampleResult sample_bsdf(const MaterialData material,
                     weight = float3(1.0f);
                 } else {
                     direction = direction / sqrt(dirLen2);
-                    float etaScale = (etaT * etaT) / (etaI * etaI);
-                    float cosThetaI = fabs(cosThetaO);
-                    float cosThetaTrans = fabs(cosThetaT);
-                    float directionScale = etaScale * (cosThetaTrans / max(cosThetaI, 1e-6f));
-                    weight = float3(max(directionScale, 0.0f));
-                    if (!isThin) {
-                        result.mediumEvent = frontFace ? 1 : -1;
-                    }
+                    // Fresnel transmission cancels against its branch probability.
+                    // Physical radiance transport scales by eta^-2; the tagged
+                    // Pavilion reference uses its legacy continuation convention.
+                    float etaScale = dielectric_continuation_eta_scale(material, relativeEta);
+                    weight = transmissionTint * etaScale;
+                    result.mediumEvent = frontFace ? 1 : -1;
                 }
             }
 

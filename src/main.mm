@@ -111,7 +111,7 @@ int main(int argc, const char** argv) {
         MetalRendererOptions options;
         options.width = kInitialWidth;
         options.height = kInitialHeight;
-        options.windowTitle = "Path Tracer Metal";
+        options.windowTitle = "Metal PathTracer";
         options.presentationMode = presentationMode;
         options.initialScene = sceneIdentifier;
         [window setTitle:[NSString stringWithUTF8String:options.windowTitle.c_str()]];

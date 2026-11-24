@@ -54,6 +54,9 @@ inline void wavefront_store_primary_ray_diff(thread WavefrontRay& ray,
     ray.rayDiffDDdy = float4(diff.dDdy, 0.0f);
 }
 
+// The macOS 27.2 GPU compiler (AGX G17X) fails with "Internal compiler error" when either delta chain is inlined
+// into the per-slot loop of wavefrontShadowKernel or wavefrontShadowHardwareKernel, so both stay out of line.
+__attribute__((noinline))
 inline bool trace_environment_delta_chain_software(constant PathtraceUniforms& uniforms,
                                                    device const SphereData* spheres,
                                                    device const RectData* rectangles,
@@ -70,7 +73,7 @@ inline bool trace_environment_delta_chain_software(constant PathtraceUniforms& u
                                                    thread uint& state,
                                                    const FireflyClampParams clampParams,
                                                    const bool specularOnly,
-                                                   thread Ray currentRay,
+                                                   Ray currentRay,
                                                    thread float3& outEnvDirection,
                                                    thread float3& outChainWeight,
                                                    thread bool& outUsedDeltaChain) {
@@ -135,7 +138,7 @@ inline bool trace_environment_delta_chain_software(constant PathtraceUniforms& u
 
         uint matIndex = min(chainHit.materialIndex, uniforms.materialCount - 1u);
         MaterialData chainMaterial = materials[matIndex];
-        if (!material_is_delta(chainMaterial)) {
+        if (!material_has_delta_lobe(chainMaterial)) {
             if (stats) {
                 atomic_fetch_add_explicit(&stats->mneeEnvChainNonDeltaBlockCount, 1u, memory_order_relaxed);
             }
@@ -166,7 +169,7 @@ inline bool trace_environment_delta_chain_software(constant PathtraceUniforms& u
                                                                chainHit.frontFace != 0u,
                                                                state,
                                                                clampParams,
-                                                               uniforms.sssMode,
+                                                               PT_DEFAULT_OFF(uniforms.sssMode),
                                                                1.0f,
                                                                specularOnly);
         if (chainSample.pdf <= 0.0f || !chainSample.isDelta) {
@@ -233,6 +236,7 @@ inline bool trace_environment_delta_chain_software(constant PathtraceUniforms& u
 }
 
 #if __METAL_VERSION__ >= 310
+__attribute__((noinline))  // see trace_environment_delta_chain_software
 inline bool trace_environment_delta_chain_hardware(constant PathtraceUniforms& uniforms,
                                                    acceleration_structure<instancing> accel,
                                                    device const MeshInfo* meshInfos,
@@ -249,7 +253,7 @@ inline bool trace_environment_delta_chain_hardware(constant PathtraceUniforms& u
                                                    thread uint& state,
                                                    const FireflyClampParams clampParams,
                                                    const bool specularOnly,
-                                                   thread Ray currentRay,
+                                                   Ray currentRay,
                                                    thread float3& outEnvDirection,
                                                    thread float3& outChainWeight,
                                                    thread bool& outUsedDeltaChain) {
@@ -314,7 +318,7 @@ inline bool trace_environment_delta_chain_hardware(constant PathtraceUniforms& u
 
         uint matIndex = min(chainHit.materialIndex, uniforms.materialCount - 1u);
         MaterialData chainMaterial = materials[matIndex];
-        if (!material_is_delta(chainMaterial)) {
+        if (!material_has_delta_lobe(chainMaterial)) {
             if (stats) {
                 atomic_fetch_add_explicit(&stats->mneeEnvChainNonDeltaBlockCount, 1u, memory_order_relaxed);
             }
@@ -345,7 +349,7 @@ inline bool trace_environment_delta_chain_hardware(constant PathtraceUniforms& u
                                                                chainHit.frontFace != 0u,
                                                                state,
                                                                clampParams,
-                                                               uniforms.sssMode,
+                                                               PT_DEFAULT_OFF(uniforms.sssMode),
                                                                1.0f,
                                                                specularOnly);
         if (chainSample.pdf <= 0.0f || !chainSample.isDelta) {

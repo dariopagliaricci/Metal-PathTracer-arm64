@@ -46,7 +46,6 @@ enum class TransportMemoryOwner : uint32_t {
 enum class TransportMemoryStorageClass : uint32_t {
     Private = 0,
     Shared,
-    Managed,
     Staging,
     External,
 };
@@ -194,8 +193,6 @@ inline const char* TransportMemoryStorageClassLabel(TransportMemoryStorageClass 
             return "private";
         case TransportMemoryStorageClass::Shared:
             return "shared";
-        case TransportMemoryStorageClass::Managed:
-            return "managed";
         case TransportMemoryStorageClass::Staging:
             return "staging";
         case TransportMemoryStorageClass::External:
@@ -277,6 +274,35 @@ public:
     uint32_t invalidatedRecordCount() const { return m_invalidatedRecordCount; }
     HistoryResetReason lastInvalidationReason() const { return m_lastInvalidationReason; }
     const std::vector<TransportMemoryRecord>& records() const { return m_records; }
+    uint32_t allocatorBackedRecordCount() const {
+        uint32_t count = 0u;
+        for (const auto& record : m_records) {
+            if (record.bytes > 0u && record.transportMemoryOwned && record.ownedBuffer) {
+                ++count;
+            }
+        }
+        return count;
+    }
+    uint32_t frameGraphBackedRecordCount() const {
+        uint32_t count = 0u;
+        for (const auto& record : m_records) {
+            if (record.bytes > 0u && record.frameGraphOwned) {
+                ++count;
+            }
+        }
+        return count;
+    }
+    uint32_t ownershipGapRecordCount() const {
+        uint32_t count = 0u;
+        for (const auto& record : m_records) {
+            if (recordRequiresOwnershipBacking(record) &&
+                !record.frameGraphOwned &&
+                !(record.transportMemoryOwned && record.ownedBuffer)) {
+                ++count;
+            }
+        }
+        return count;
+    }
 
     const TransportMemoryRecord* findRecord(const std::string& name) const {
         for (const auto& record : m_records) {
@@ -293,6 +319,15 @@ public:
     }
 
 private:
+    static bool recordRequiresOwnershipBacking(const TransportMemoryRecord& record) {
+        if (record.bytes == 0u ||
+            record.storage == TransportMemoryStorageClass::External ||
+            record.history == TransportMemoryHistoryPolicy::Placeholder) {
+            return false;
+        }
+        return true;
+    }
+
     void rebuildSummary() {
         m_totalBytes = 0u;
         m_privateBytes = 0u;
@@ -311,7 +346,6 @@ private:
                 case TransportMemoryStorageClass::Staging:
                     m_stagingBytes += record.bytes;
                     break;
-                case TransportMemoryStorageClass::Managed:
                 case TransportMemoryStorageClass::External:
                     break;
             }

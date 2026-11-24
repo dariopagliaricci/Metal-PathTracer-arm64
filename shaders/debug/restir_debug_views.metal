@@ -1,4 +1,4 @@
-inline bool restir_prototype_diffuse_material_eligible(const MaterialData material) {
+inline bool restir_diffuse_material_eligible(const MaterialData material) {
     return material_closure_restir_diffuse_eligible(material);
 }
 
@@ -71,7 +71,7 @@ inline PathGuidingReservoirState restir_debug_path_guiding_best_bin(
 
 inline bool restir_live_debug_view_mode(const uint mode) {
     return mode >= kDebugViewRestirCandidateSourceId &&
-           mode <= kDebugViewRadianceCache;
+           mode <= kDebugViewCausticTransport;
 }
 
 inline float3 restir_debug_hash_color(uint value) {
@@ -99,7 +99,7 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
                                       const float debugMetallic,
                                       const float debugRoughness,
                                       const float debugAO) {
-    switch (uniforms.debugViewMode) {
+    switch (PT_DEFAULT_OFF(uniforms.debugViewMode)) {
         case kDebugViewBaseColor:
             return debugBaseColor;
         case kDebugViewMetallic:
@@ -112,11 +112,11 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
             break;
     }
 
-    if (!restir_live_debug_view_mode(uniforms.debugViewMode)) {
+    if (!restir_live_debug_view_mode(PT_DEFAULT_OFF(uniforms.debugViewMode))) {
         return float3(0.0f);
     }
 
-    const bool eligible = restir_prototype_diffuse_material_eligible(material);
+    const bool eligible = restir_diffuse_material_eligible(material);
     const uint stateIndex = restir_path_state_index(uniforms, pixelCoord, depth);
     bool pathGuidingValid = false;
     const PathGuidingReservoirState pathGuidingBest =
@@ -133,7 +133,7 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
                                    1.0f)
                            : 0.0f;
 
-    switch (uniforms.debugViewMode) {
+    switch (PT_DEFAULT_OFF(uniforms.debugViewMode)) {
         case kDebugViewRestirCandidateSourceId: {
             if (uniforms.directLightMode == kDirectLightModeLegacyRect ||
                 uniforms.directLightMode == kDirectLightModeBaselineEmissive) {
@@ -161,7 +161,7 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
             return restir_debug_hash_color(hash);
         }
         case kDebugViewRestirPathGuidingMask: {
-            if (uniforms.pathGuidingMode != kPathGuidingModePrototype || !eligible) {
+            if (PT_DEFAULT_OFF(uniforms.pathGuidingMode) != kPathGuidingModePrototype || !eligible) {
                 return float3(0.0f);
             }
             if (!pathGuidingValid) {
@@ -174,7 +174,9 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
             return float3(confidence, bin, max(pdf, guidedChoice * 0.35f));
         }
         case kDebugViewRestirPtReuseMask: {
-            if (uniforms.restirPtMode != kRestirPtModeExperimentalPathReuse || !eligible) {
+            if ((PT_DEFAULT_OFF(uniforms.restirPtMode) != kRestirPtModeProductionPathReuse &&
+                 PT_DEFAULT_OFF(uniforms.restirPtMode) != kRestirPtModeEnhancedUnbiased &&
+                 PT_DEFAULT_OFF(uniforms.restirPtMode) != kRestirPtModeEnhancedBiased) || !eligible) {
                 return float3(0.0f);
             }
             const float v = pathReservoirValid ? max(ptReservoirConfidence, 0.45f) : 0.16f;
@@ -196,7 +198,7 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
             return invalid ? float3(1.0f, 0.0f, 0.0f) : float3(0.0f);
         }
         case kDebugViewRadianceCache: {
-            if (uniforms.radianceCacheMode != kRadianceCacheModePrototype || !radianceCacheStates) {
+            if (PT_DEFAULT_OFF(uniforms.radianceCacheMode) != kRadianceCacheModePrototype || !radianceCacheStates) {
                 return float3(0.0f);
             }
             const float invCell = 1.0f / max(uniforms.radianceCacheCellSize, 1.0e-4f);
@@ -205,7 +207,8 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
             const uint hy = as_type<uint>(cell.y) * 19349663u;
             const uint hz = as_type<uint>(cell.z) * 83492791u;
             const uint hd = min(depth, kRestirPathReservoirDepthCount - 1u) * 2654435761u;
-            const uint hm = static_cast<uint>(material.typeEta.x) * 2246822519u;
+            const MaterialClosureMetadata closure = material_primary_closure_metadata(material);
+            const uint hm = closure.type * 2246822519u;
             const uint capacity = max(uniforms.width * uniforms.height * kRestirPathReservoirDepthCount, 1u);
             const uint domainKey = pcg_hash(hx ^ hy ^ hz ^ hd ^ hm ^ 0x9E3779B9u);
             const uint index = domainKey % capacity;
@@ -236,6 +239,30 @@ inline float3 restir_debug_view_color(constant PathtraceUniforms& uniforms,
             }
             const float debugLuma = clamp(luma / max(uniforms.radianceCacheMaxRadiance, 1.0f), 0.0f, 1.0f);
             return float3(confidence, train, debugLuma);
+        }
+        case kDebugViewCausticTransport: {
+            if (PT_DEFAULT_OFF(uniforms.causticTransportMode) != 1u) {
+                return float3(0.0f);
+            }
+            const MaterialClosureMetadata closure = material_primary_closure_metadata(material);
+            const bool delta = (closure.flags & kMaterialClosureFlagDelta) != 0u;
+            const bool emissive = (closure.flags & kMaterialClosureFlagEmissive) != 0u;
+            const bool diffuse = (closure.flags & kMaterialClosureFlagDiffuse) != 0u;
+            const bool glossy = (closure.flags & kMaterialClosureFlagGlossy) != 0u;
+            const bool connectable = (closure.flags & kMaterialClosureFlagConnectable) != 0u;
+            if (emissive) {
+                return float3(1.0f, 0.85f, 0.12f);
+            }
+            if (delta) {
+                return float3(0.95f, 0.12f, 0.08f);
+            }
+            if (diffuse && connectable) {
+                return float3(0.10f, 0.85f, 0.28f);
+            }
+            if (glossy && connectable) {
+                return float3(0.10f, 0.36f, 1.0f);
+            }
+            return connectable ? float3(0.45f, 0.70f, 1.0f) : float3(0.12f);
         }
         default:
             break;

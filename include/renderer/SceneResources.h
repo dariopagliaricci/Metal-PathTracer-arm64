@@ -5,6 +5,7 @@
 // Use only the public API from MetalRenderer.h
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -53,6 +54,7 @@ struct MaterialTextureSamplerDesc {
     int32_t minFilter = -1;  // glTF enum (9728/9729/9984..9987), -1 uses default
     int32_t wrapS = 10497;   // glTF enum (33071/33648/10497)
     int32_t wrapT = 10497;   // glTF enum (33071/33648/10497)
+    uint32_t maxAnisotropy = 8u;
 };
 
 enum class MaterialTextureSemantic : uint32_t {
@@ -63,6 +65,8 @@ enum class MaterialTextureSemantic : uint32_t {
     Occlusion = 4,
     Emissive = 5,
     Transmission = 6,
+    ScalarAverage = 7, // Raw integer RGB average, native resolution, no generated mips.
+    ScalarAlpha = 8,   // Raw alpha, native resolution, no generated mips.
 };
 
 enum class TextureBudgetPolicy : uint32_t {
@@ -112,6 +116,11 @@ struct MaterialTextureCpuData {
         uint32_t width = 0;
         uint32_t height = 0;
         std::vector<float> rgba;
+        // The 8-bit texels this level was decoded from, in the same row order, on the CPU decode paths (level 0, a DDS
+        // source's levels, the 8-bit levels of a size that is not a power of two); empty for a level filtered in float
+        // and for a readback of a Metal-resident texture. A normal map's level 0 keeps its source alpha here, where
+        // rgba holds 0. Embree keeps such a level as these bytes when they decode to exactly rgba (EP22).
+        std::vector<uint8_t> rgba8;
     };
 
     uint32_t width = 0;
@@ -120,6 +129,7 @@ struct MaterialTextureCpuData {
     std::vector<float> rgba;
     std::vector<MipLevel> mipLevels;
     MaterialTextureSamplerDesc samplerDesc{};
+    bool footprintMipChain = false;  // levels from MipChain.h's footprint filter (size not a power of two)
 };
 
 struct MeshInventoryEntry {
@@ -145,6 +155,35 @@ struct AssetTextureColorSpace {
     std::string colorSpace;
     std::string source;
     std::string status;
+};
+
+struct AssetSupportMatrixEntry {
+    std::string area;
+    std::string status;
+    std::string details;
+};
+
+struct AssetStableResourceId {
+    std::string resourceType;
+    std::string name;
+    int32_t sourceIndex = -1;
+    std::string stableId;
+};
+
+struct AssetTexturePolicyReport {
+    std::string residencyPolicy;
+    std::string mipPolicy;
+    std::string compressionPolicy;
+    std::string budgetPolicy;
+    std::string determinismPolicy;
+    uint32_t maxDimension = 0;
+    uint64_t maxTextureBytes = 0;
+};
+
+struct AssetMaterialOverrideRecord {
+    std::string target;
+    std::string action;
+    std::string reason;
 };
 
 struct AssetPipelineStats {
@@ -180,11 +219,25 @@ struct AssetPipelineManifest {
 struct AssetPipelineReport {
     AssetPipelineManifest manifest;
     AssetPipelineStats stats;
+    std::vector<AssetSupportMatrixEntry> supportMatrix;
+    std::vector<AssetStableResourceId> stableResourceIds;
+    AssetTexturePolicyReport texturePolicy;
+    std::vector<AssetMaterialOverrideRecord> materialOverrides;
     std::vector<AssetTextureColorSpace> textureColorSpaces;
     std::vector<AssetPipelineDiagnostic> diagnostics;
 };
 
 class MetalContext;
+struct MaterialImagePrefetch;
+
+// A material image a loader is about to request: a file path, or encoded bytes that stay alive until
+// endMaterialImagePrefetch() (a glTF buffer view).
+struct MaterialImagePrefetchSource {
+    std::string path;
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    bool normalMap = false;  // requested as a normal map: a KTX2 file is then parsed even when it has a DDS source
+};
 
 /// Manages scene geometry, materials, and acceleration structures
 /// Owns spheres, materials, and their GPU buffers
@@ -250,6 +303,10 @@ public:
                          bool carpaintHasBaseConductor = false,
                          simd::float3 carpaintBaseTint = simd_make_float3(1.0f, 1.0f, 1.0f),
                          bool thinDielectric = false,
+                         float spectralDispersionScale = 0.0f,
+                         float spectralAbsorptionScale = 1.0f,
+                         uint32_t spectralMaterialPolicy = 0u,
+                         uint32_t spectralTexturePolicy = 0u,
                          std::string name = {});
 
     /// Add a fully specified material data block (used for glTF/PBR materials).
@@ -280,9 +337,15 @@ public:
                  float radius,
                  bool twoSided,
                  uint32_t materialIndex);
+    void addReferencePointLight(const simd::float3& position,
+                                float jitterRadius,
+                                uint32_t materialIndex,
+                                bool inverseSquareFalloff = false,
+                                float minimumDistance = 1.0f);
     void addDirectionalLight(const simd::float3& directionToLight,
                              const simd::float3& radiance,
-                             float selectionWeight = 1.0f);
+                             float selectionWeight = 1.0f,
+                             float angularRadiusDegrees = 0.0f);
     void addBox(const simd::float3& minCorner,
                 const simd::float3& maxCorner,
                 uint32_t materialIndex,
@@ -329,9 +392,13 @@ public:
 
     /// Environment map support
     bool setEnvironmentMap(const std::string& path);
-    bool reloadEnvironmentIfNeeded(const std::string& path, EnvGpuHandles* outHandles = nullptr);
+    // sunClampLuminance > 0 scales texels brighter than it down to it (see RenderSettings).
+    bool reloadEnvironmentIfNeeded(const std::string& path,
+                                   EnvGpuHandles* outHandles = nullptr,
+                                   float sunClampLuminance = 0.0f);
     void clearEnvironmentMap();
     const std::string& environmentPath() const { return m_environmentPath; }
+    float environmentSunClamp() const { return m_environmentSunClamp; }
     MTLTextureHandle environmentTexture() const { return m_environmentTexture; }
     MTLBufferHandle environmentConditionalAliasBuffer() const { return m_environmentConditionalAliasBuffer; }
     MTLBufferHandle environmentMarginalAliasBuffer() const { return m_environmentMarginalAliasBuffer; }
@@ -361,6 +428,18 @@ public:
                                         const MaterialTextureSamplerDesc* samplerDesc = nullptr,
                                         MaterialTextureSemantic semantic = MaterialTextureSemantic::Generic,
                                         TextureLoadStatus* outStatus = nullptr);
+    // Decodes these images ahead of their requests, a few at a time on worker threads, so the image decode overlaps
+    // the main thread's uploads and mip chains. Textures are still created, uploaded and registered in request order;
+    // a request takes the finished decode (the same decoder's output) or, for an image not listed, decodes it itself.
+    // Sources in expected request order; KTX2 sources are skipped. endMaterialImagePrefetch() waits for the workers
+    // and drops what was not taken.
+    void beginMaterialImagePrefetch(const std::vector<MaterialImagePrefetchSource>& sources);
+    void endMaterialImagePrefetch();
+    // The smallest alpha (0-255) of a material texture's decoded level 0, as the renderer samples it (after the
+    // black-key alpha derivations), recorded when the texture was decoded; -1 when unknown (KTX2 / DDS, or not
+    // decoded here). Meant for load time: the glTF loader's foliage texture-name rule reads it instead of decoding the
+    // image again. After a CPU scene is adopted, deferred keys no longer match real indices and it returns -1.
+    int materialTextureMinAlpha(uint32_t index) const;
     uint32_t materialTextureCount() const {
         return static_cast<uint32_t>(m_materialTextures.size());
     }
@@ -377,6 +456,10 @@ public:
     /// Clear all scene data
     void clear();
     void buildCPUPackedSceneData();
+    /// What buildCPUPackedSceneData() sets besides the packed arrays (mesh infos, per-triangle data, packed vertices
+    /// and indices), which only Metal uploads: the triangle count and the emissive inventory. The Embree backend reads
+    /// meshes() and never the packed arrays, so its runs call this instead and do not build them.
+    void buildCPUSceneCountsAndEmissiveInventory();
 
     /// Copy CPU-only scene content from a staging SceneResources and resolve any
     /// deferred texture requests on the current (GPU-capable) instance.
@@ -420,6 +503,23 @@ public:
     // Scene stats
     uint32_t sphereCount() const { return m_sphereCount; }
     uint32_t rectangleCount() const { return m_rectangleCount; }
+    uint32_t analyticLightCount(bool excludeExactPoints = false) const {
+        if (m_materialCount == 0u) return 0u;
+        uint32_t count = 0u;
+        for (uint32_t i = 0u; i < m_rectangleCount; ++i) {
+            const auto& light = m_rectangles[i];
+            const auto& material = m_materials[std::min(light.materialTwoSided.x, m_materialCount - 1u)];
+            const bool emissive = static_cast<uint32_t>(material.typeEta.x) == 3u ||
+                material.emission.x > 0.0f || material.emission.y > 0.0f || material.emission.z > 0.0f;
+            const bool exactPoint = light.materialTwoSided.z ==
+                static_cast<uint32_t>(PathTracerShaderTypes::AreaPrimitiveShape::ReferencePoint) && light.corner.w == 0.0f;
+            if (emissive && (!excludeExactPoints || !exactPoint)) ++count;
+        }
+        return count;
+    }
+    uint32_t zeroRadiusReferencePointLightCount() const {
+        return analyticLightCount() - analyticLightCount(true);
+    }
     uint32_t materialCount() const { return m_materialCount; }
     uint32_t triangleCount() const { return m_triangleCount; }
     uint32_t primitiveCount() const { return m_primitiveCount; }
@@ -427,6 +527,13 @@ public:
     float totalEmittedPower() const { return m_totalEmittedPower; }
     uint32_t skippedTexturedEmissivePrimitiveCount() const { return m_skippedTexturedEmissivePrimitiveCount; }
     uint32_t skippedZeroPowerEmissivePrimitiveCount() const { return m_skippedZeroPowerEmissivePrimitiveCount; }
+    /// Emitted power of the mesh emitters in the light list, per material, largest first.
+    struct MaterialEmittedPower {
+        uint32_t materialIndex = 0u;
+        uint32_t primitiveCount = 0u;
+        float power = 0.0f;
+    };
+    const std::vector<MaterialEmittedPower>& emittedPowerByMaterial() const { return m_emittedPowerByMaterial; }
     const std::vector<PathTracerShaderTypes::LightPrimitive>& emissivePrimitives() const { return m_emissivePrimitives; }
     const PathTracerShaderTypes::SphereData* spheresData() const { return m_spheres.data(); }
     const PathTracerShaderTypes::RectData* rectanglesData() const { return m_rectangles.data(); }
@@ -456,6 +563,9 @@ public:
     const TextureLoadPolicy& textureLoadPolicy() const { return m_textureLoadPolicy; }
     const std::vector<TextureInventoryEntry>& textureInventory() const { return m_textureInventory; }
     std::vector<MeshInventoryEntry> meshInventory() const;
+    uint64_t texturePolicySkippedCount() const { return m_texturePolicySkippedCount; }
+    // Material textures whose mip levels come from MipChain.h's footprint filter (sizes not powers of two).
+    uint64_t footprintMipChainCount() const { return m_footprintMipChainCount; }
     bool textureBudgetExceeded() const { return m_textureBudgetExceeded; }
     const std::string& textureBudgetMessage() const { return m_textureBudgetMessage; }
     void setAssetPipelineReport(AssetPipelineReport report);
@@ -463,6 +573,7 @@ public:
 
     void setForceSoftwareBvh(bool force);
     void setSoftwareRayTracingOverride(bool force);
+    void setHardwareDebugSoftwareFallbackEnabled(bool enabled);
     bool forceSoftwareBvh() const { return m_forceSoftwareOverride; }
     bool supportsRaytracing() const { return m_supportsRaytracing; }
     bool hardwareRaytracingEnabled() const {
@@ -507,6 +618,7 @@ private:
     bool m_dirty = true;
     MTLTextureHandle m_environmentTexture = nullptr;
     bool m_forceSoftwareOverride = false;
+    bool m_hardwareDebugSoftwareFallbackEnabled = false;
     
     // Helper methods
     void uploadMeshes();
@@ -543,6 +655,7 @@ private:
     uint32_t m_environmentWidth = 0;
     uint32_t m_environmentHeight = 0;
     std::string m_environmentPath;
+    float m_environmentSunClamp = 0.0f;
 
     void clearEnvironmentDistribution();
     bool buildEnvironmentDistribution(const float* rgba32,
@@ -575,9 +688,13 @@ private:
     std::vector<std::string> m_materialTextureLabels;
     std::vector<TextureInventoryEntry> m_textureInventory;
     std::unordered_map<std::string, uint32_t> m_materialTextureIndex;
+    std::shared_ptr<MaterialImagePrefetch> m_materialImagePrefetch;
+    std::unordered_map<std::string, uint8_t> m_materialTextureMinAlphaByKey;
     std::unordered_map<uint64_t, uint32_t> m_materialSamplerIndices;
     TextureLoadPolicy m_textureLoadPolicy{};
     uint64_t m_textureBytesLoaded = 0;
+    uint64_t m_texturePolicySkippedCount = 0;
+    uint64_t m_footprintMipChainCount = 0;
     bool m_textureBudgetExceeded = false;
     std::string m_textureBudgetMessage;
     SceneAccelBuildStats m_lastBuildStats{};
@@ -624,6 +741,7 @@ private:
     float m_totalEmittedPower = 0.0f;
     uint32_t m_skippedTexturedEmissivePrimitiveCount = 0u;
     uint32_t m_skippedZeroPowerEmissivePrimitiveCount = 0u;
+    std::vector<MaterialEmittedPower> m_emittedPowerByMaterial;
     enum class UploadPhase : uint8_t {
         Idle = 0,
         ResolveTextures,

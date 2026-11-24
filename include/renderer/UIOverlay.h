@@ -212,7 +212,7 @@ private:
     float m_gizmoSnapScale = 0.1f;
     bool m_gizmoWasActive = false;
     int m_gizmoActiveObject = -1;
-    int m_productionProfile = 0;
+    int m_viewportQualityPreset = 1;
 };
 
 }  // namespace PathTracer

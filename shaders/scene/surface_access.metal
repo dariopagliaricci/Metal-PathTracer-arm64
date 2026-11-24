@@ -309,7 +309,8 @@ inline bool triangle_surface_partials(constant PathtraceUniforms& uniforms,
                                       device const uint3* meshIndices,
                                       thread float3& dPduOut,
                                       thread float3& dPdvOut,
-                                      thread float& uvPerWorldOut) {
+                                      thread float& uvPerWorldOut,
+                                      const bool unitFrameForConstantUv = false) {
     dPduOut = float3(0.0f);
     dPdvOut = float3(0.0f);
     uvPerWorldOut = 0.0f;
@@ -377,6 +378,18 @@ inline bool triangle_surface_partials(constant PathtraceUniforms& uniforms,
         dPdvOut = bitangentFallback / max(uvPerWorldFallback, 1.0e-8f);
         uvPerWorldOut = uvPerWorldFallback;
         return isfinite(uvPerWorldOut) && uvPerWorldOut > 0.0f;
+    }
+    if (unitFrameForConstantUv && worldArea > 1.0e-12f) {
+        // Reference textureGrad: a triangle without UV variation falls back to
+        // its unit tangent frame (one UV unit per world unit).
+        float3 tangentFallback = normalize(edge1);
+        float3 bitangentFallback = normalize(cross(normalize(cross(edge1, edge2)), tangentFallback));
+        if (all(isfinite(tangentFallback)) && all(isfinite(bitangentFallback))) {
+            dPduOut = tangentFallback;
+            dPdvOut = bitangentFallback;
+            uvPerWorldOut = 1.0f;
+            return true;
+        }
     }
     return false;
 }
@@ -493,38 +506,7 @@ inline bool compute_tangent_basis_from_uv(constant PathtraceUniforms& uniforms,
                                          bitangent);
 }
 
-inline void build_onb(const float3 normal,
-                      thread float3& tangent,
-                      thread float3& bitangent) {
-    float3 up = (fabs(normal.z) < 0.999f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
-    tangent = normalize(cross(up, normal));
-    bitangent = cross(normal, tangent);
-}
-
-inline float3 to_world(const float3 local, const float3 normal) {
-    float3 tangent;
-    float3 bitangent;
-    build_onb(normal, tangent, bitangent);
-    return local.x * tangent + local.y * bitangent + local.z * normal;
-}
-
-inline float3 to_local(const float3 vector, const float3 normal) {
-    float3 tangent;
-    float3 bitangent;
-    build_onb(normal, tangent, bitangent);
-    return float3(dot(vector, tangent), dot(vector, bitangent), dot(vector, normal));
-}
-
-inline float3 sample_cosine_hemisphere(thread uint& state) {
-    float r1 = rand_uniform(state);
-    float r2 = rand_uniform(state);
-    float phi = 2.0f * kPi * r2;
-    float r = sqrt(max(r1, 0.0f));
-    float x = cos(phi) * r;
-    float y = sin(phi) * r;
-    float z = sqrt(max(1.0f - r1, 0.0f));
-    return float3(x, y, z);
-}
+#include "../shared/math.h"
 
 inline float lambert_pdf(const float3 normal, const float3 direction) {
     float3 dir = normalize(direction);
@@ -534,6 +516,10 @@ inline float lambert_pdf(const float3 normal, const float3 direction) {
 
 inline bool area_primitive_is_disk(const RectData rect) {
     return rect.materialTwoSided.z == 1u;
+}
+
+inline bool area_primitive_is_reference_point(const RectData rect) {
+    return rect.materialTwoSided.z == 2u;
 }
 
 inline float area_primitive_area(const RectData rect) {

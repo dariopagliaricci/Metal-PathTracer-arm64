@@ -23,6 +23,7 @@
 #include "renderer/RenderSettings.h"
 #include "renderer/SceneResources.h"
 #include "assets/GltfLoader.h"
+#import "renderer/LoadEventPump.h"
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -109,39 +110,7 @@ void DeriveOrbitCameraFromPositionTarget(RenderSettings& settings,
     settings.firstPersonCameraPosition = position;
 }
 
-void PumpMainThreadEventsBriefly() {
-    if (![NSThread isMainThread]) {
-        return;
-    }
-    NSApplication* app = [NSApplication sharedApplication];
-    if (!app) {
-        return;
-    }
-    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:0.001];
-    NSArray<NSString*>* modes = @[
-        NSDefaultRunLoopMode,
-        NSEventTrackingRunLoopMode,
-        NSModalPanelRunLoopMode
-    ];
-    for (NSString* mode in modes) {
-        while (true) {
-            NSEvent* event = [app nextEventMatchingMask:NSEventMaskAny
-                                              untilDate:deadline
-                                                 inMode:mode
-                                                dequeue:YES];
-            if (!event) {
-                break;
-            }
-            [app sendEvent:event];
-        }
-    }
-}
-
-inline void PumpEventsEvery(size_t counter, size_t interval = 16384u) {
-    if (counter > 0u && (counter % interval) == 0u) {
-        PumpMainThreadEventsBriefly();
-    }
-}
+using PathTracer::LoadEventPump::PumpEventsEvery;
 
 struct LoadedMeshData {
     std::vector<SceneResources::MeshVertex> vertices;
@@ -684,13 +653,16 @@ static simd::float4x4 ComposeTransform(const simd::float3& translation,
 }
 
 std::optional<fs::path> ResolveDefaultScenesDirectory() {
-    // Prefer repo-root assets during development to avoid stale copied assets
-    // inside build directories.
-    std::error_code ec;
-    fs::path cwd = fs::current_path(ec);
-    if (!ec) {
-        // Walk up ancestors and prefer the first directory that looks like the repo root.
-        for (fs::path probe = cwd; !probe.empty(); probe = probe.parent_path()) {
+    auto findRepoAssetsFrom = [](fs::path start) -> std::optional<fs::path> {
+        std::error_code ec;
+        if (start.empty()) {
+            return std::nullopt;
+        }
+        start = fs::weakly_canonical(start, ec);
+        if (ec) {
+            ec.clear();
+        }
+        for (fs::path probe = start; !probe.empty(); probe = probe.parent_path()) {
             fs::path gitMarker = probe / ".git";
             fs::path assetsDir = probe / "assets";
             if (fs::exists(gitMarker, ec) &&
@@ -707,6 +679,18 @@ std::optional<fs::path> ResolveDefaultScenesDirectory() {
                 break;
             }
         }
+        return std::nullopt;
+    };
+
+    // Prefer repo-root assets during development to avoid stale copied assets
+    // inside build directories.
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    if (!ec) {
+        // Walk up ancestors and prefer the first directory that looks like the repo root.
+        if (auto repoAssets = findRepoAssetsFrom(cwd)) {
+            return repoAssets;
+        }
 
         // Fallback: use cwd/assets.
         fs::path candidate = cwd / "assets";
@@ -722,14 +706,20 @@ std::optional<fs::path> ResolveDefaultScenesDirectory() {
     @autoreleasepool {
         NSBundle* bundle = [NSBundle mainBundle];
         if (bundle) {
+            NSString* bundlePath = [bundle bundlePath];
+            if (bundlePath) {
+                if (auto repoAssets = findRepoAssetsFrom(fs::path([bundlePath UTF8String]))) {
+                    return repoAssets;
+                }
+            }
             NSString* resourcePath = [bundle resourcePath];
             if (resourcePath) {
                 fs::path candidate([resourcePath UTF8String]);
                 candidate /= "assets";
-                std::error_code ec;
-                if (fs::exists(candidate, ec) && fs::is_directory(candidate, ec)) {
-                    fs::path canonical = fs::canonical(candidate, ec);
-                    if (!ec) {
+                std::error_code bundleEc;
+                if (fs::exists(candidate, bundleEc) && fs::is_directory(candidate, bundleEc)) {
+                    fs::path canonical = fs::canonical(candidate, bundleEc);
+                    if (!bundleEc) {
                         return canonical;
                     }
                 }
@@ -878,16 +868,50 @@ bool SceneManager::beginStagedLoadSceneFromPath(const std::string& path,
     state.parsedSettings.environmentMapPath = defaults.environmentMapPath;
     state.parsedSettings.environmentRotation = defaults.environmentRotation;
     state.parsedSettings.environmentIntensity = defaults.environmentIntensity;
+    state.parsedSettings.environmentBackgroundScale = defaults.environmentBackgroundScale;
+    state.parsedSettings.environmentSunClamp = defaults.environmentSunClamp;
     state.parsedSettings.fireflyClampEnabled = defaults.fireflyClampEnabled;
     state.parsedSettings.fireflyClampFactor = defaults.fireflyClampFactor;
     state.parsedSettings.fireflyClampFloor = defaults.fireflyClampFloor;
     state.parsedSettings.throughputClamp = defaults.throughputClamp;
-    state.parsedSettings.specularTailClampBase = defaults.specularTailClampBase;
-    state.parsedSettings.specularTailClampRoughnessScale = defaults.specularTailClampRoughnessScale;
     state.parsedSettings.minSpecularPdf = defaults.minSpecularPdf;
     state.parsedSettings.renderWidth = defaults.renderWidth;
     state.parsedSettings.renderHeight = defaults.renderHeight;
     state.parsedSettings.enableSoftwareRayTracing = defaults.enableSoftwareRayTracing;
+    state.parsedSettings.enableRussianRoulette = defaults.enableRussianRoulette;
+    state.parsedSettings.sourceTransport = defaults.sourceTransport;
+    state.parsedSettings.sourceRayEpsilon = defaults.sourceRayEpsilon;
+    state.parsedSettings.denoiseMirrorGuides = defaults.denoiseMirrorGuides;
+    state.parsedSettings.denoiseTransmissionGuides = defaults.denoiseTransmissionGuides;
+    // glTF load options describe how this scene's assets are read; an interactive scene switch must not
+    // inherit them from the previous scene (e.g. San Miguel's gltfFlipTexcoordV=1 scrambling the next asset).
+    state.parsedSettings.gltfViewerCompatibilityMode = defaults.gltfViewerCompatibilityMode;
+    state.parsedSettings.gltfThinWalledFallback = defaults.gltfThinWalledFallback;
+    state.parsedSettings.gltfEmissiveScale = defaults.gltfEmissiveScale;
+    state.parsedSettings.gltfCompatForceLinearBaseColor = defaults.gltfCompatForceLinearBaseColor;
+    state.parsedSettings.gltfCompatForceLinearEmissive = defaults.gltfCompatForceLinearEmissive;
+    state.parsedSettings.gltfCompatFlipTexcoordV = defaults.gltfCompatFlipTexcoordV;
+    // The direct-light mode is the scene's too: a scene without the token gets the default, not the previous scene's.
+    state.parsedSettings.directLightMode = defaults.directLightMode;
+
+    const fs::path directScenePath(path);
+    std::string extensionLower = directScenePath.extension().string();
+    std::transform(extensionLower.begin(),
+                   extensionLower.end(),
+                   extensionLower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (extensionLower == ".gltf" || extensionLower == ".glb") {
+        state.sceneDirectoryOverride = directScenePath.parent_path().string();
+        state.directives.emplace_back(1u,
+                                      "mesh path=\"" + directScenePath.filename().string() + "\"");
+        if (SceneLoadDiagnosticsEnabled()) {
+            std::fprintf(stderr,
+                         "[SceneDiag] directAssetRoute scene='%s' route=gltf_mesh_directive directives=%zu\n",
+                         path.c_str(),
+                         state.directives.size());
+        }
+        return true;
+    }
 
     std::string line;
     size_t lineNumber = 0;
@@ -968,7 +992,7 @@ SceneManager::StagedLoadStatus SceneManager::continueStagedLoadScene(StagedLoadS
                 state.sawExplicitCameraDirective = true;
             }
         } else if (keyword == "renderer") {
-            success = parseRenderer(tokens, state.parsedSettings, localError);
+            success = parseRenderer(tokens, state.parsedSettings, localError, &state.deprecationNoted);
         } else if (keyword == "background") {
             success = parseBackground(tokens, state.parsedSettings, localError, state.sceneDirectoryOverride);
         } else if (keyword == "material") {
@@ -985,6 +1009,8 @@ SceneManager::StagedLoadStatus SceneManager::continueStagedLoadScene(StagedLoadS
             success = parseRectangle(tokens, resources, localError);
         } else if (keyword == "disk") {
             success = parseDisk(tokens, resources, localError);
+        } else if (keyword == "reference_point") {
+            success = parseReferencePoint(tokens, resources, localError);
         } else if (keyword == "sun" || keyword == "directional" || keyword == "distant") {
             success = parseDirectionalLight(tokens, resources, localError);
         } else if (keyword == "mesh") {
@@ -1086,6 +1112,13 @@ bool SceneManager::discoverScenes(std::string* errorMessage) {
         if (filePath.extension() != ".scene") {
             continue;
         }
+        const std::string sceneId = filePath.stem().string();
+        // Keep the four Emerald reference views in the picker. Lighting and
+        // camera probes remain loadable by an explicit .scene file path.
+        if (sceneId.rfind("emerald_square_", 0) == 0 &&
+            sceneId.find("_probe") != std::string::npos) {
+            continue;
+        }
 
         SceneInfo info{};
         fs::path absolutePath = fs::absolute(filePath, ec);
@@ -1097,7 +1130,7 @@ bool SceneManager::discoverScenes(std::string* errorMessage) {
             pathString = filePath.string();
         }
         info.filePath = std::move(pathString);
-        info.identifier = filePath.stem().string();
+        info.identifier = sceneId;
         info.displayName = readDisplayName(info.filePath);
         if (info.displayName.empty()) {
             info.displayName = info.identifier;
@@ -1135,6 +1168,7 @@ bool SceneManager::parseScene(std::istream& stream,
     std::string pending;
     size_t pendingStartLine = 0;
     bool sawExplicitCameraDirective = false;
+    bool deprecationNoted = false;
     std::unordered_map<std::string, uint32_t> materialIndicesByName;
 
     auto flush = [&](const std::string& content, size_t startLine) -> bool {
@@ -1158,7 +1192,7 @@ bool SceneManager::parseScene(std::istream& stream,
                 sawExplicitCameraDirective = true;
             }
         } else if (keyword == "renderer") {
-            success = parseRenderer(tokens, inOutSettings, localError);
+            success = parseRenderer(tokens, inOutSettings, localError, &deprecationNoted);
         } else if (keyword == "background") {
             success = parseBackground(tokens, inOutSettings, localError, m_sceneDirectory);
         } else if (keyword == "material") {
@@ -1175,6 +1209,8 @@ bool SceneManager::parseScene(std::istream& stream,
             success = parseRectangle(tokens, resources, localError);
         } else if (keyword == "disk") {
             success = parseDisk(tokens, resources, localError);
+        } else if (keyword == "reference_point") {
+            success = parseReferencePoint(tokens, resources, localError);
         } else if (keyword == "sun" || keyword == "directional" || keyword == "distant") {
             success = parseDirectionalLight(tokens, resources, localError);
         } else if (keyword == "mesh") {
@@ -1253,21 +1289,63 @@ bool SceneManager::parseScene(std::istream& stream,
 std::unordered_map<std::string, std::string> SceneManager::tokenize(const std::string& line) {
     std::unordered_map<std::string, std::string> tokens;
 
-    std::istringstream stream(line);
-    std::string word;
-    if (!(stream >> word)) {
+    size_t cursor = 0u;
+    auto skipWhitespace = [&]() {
+        while (cursor < line.size() &&
+               std::isspace(static_cast<unsigned char>(line[cursor]))) {
+            ++cursor;
+        }
+    };
+    skipWhitespace();
+    const size_t keywordStart = cursor;
+    while (cursor < line.size() &&
+           !std::isspace(static_cast<unsigned char>(line[cursor]))) {
+        ++cursor;
+    }
+    if (cursor == keywordStart) {
         return tokens;
     }
 
-    tokens.emplace(kKeywordToken, word);
-    while (stream >> word) {
-        auto equalsPos = word.find('=');
-        if (equalsPos == std::string::npos) {
+    tokens.emplace(kKeywordToken, line.substr(keywordStart, cursor - keywordStart));
+    while (cursor < line.size()) {
+        skipWhitespace();
+        if (cursor >= line.size()) {
+            break;
+        }
+        const size_t keyStart = cursor;
+        while (cursor < line.size() &&
+               line[cursor] != '=' &&
+               !std::isspace(static_cast<unsigned char>(line[cursor]))) {
+            ++cursor;
+        }
+        if (cursor >= line.size() || line[cursor] != '=') {
+            while (cursor < line.size() &&
+                   !std::isspace(static_cast<unsigned char>(line[cursor]))) {
+                ++cursor;
+            }
             continue;
         }
-
-        std::string key = word.substr(0, equalsPos);
-        std::string value = word.substr(equalsPos + 1);
+        std::string key = line.substr(keyStart, cursor - keyStart);
+        ++cursor;
+        std::string value;
+        if (cursor < line.size() && line[cursor] == '"') {
+            ++cursor;
+            const size_t valueStart = cursor;
+            while (cursor < line.size() && line[cursor] != '"') {
+                ++cursor;
+            }
+            value = line.substr(valueStart, cursor - valueStart);
+            if (cursor < line.size() && line[cursor] == '"') {
+                ++cursor;
+            }
+        } else {
+            const size_t valueStart = cursor;
+            while (cursor < line.size() &&
+                   !std::isspace(static_cast<unsigned char>(line[cursor]))) {
+                ++cursor;
+            }
+            value = line.substr(valueStart, cursor - valueStart);
+        }
         tokens[std::move(key)] = std::move(value);
     }
 
@@ -1593,7 +1671,8 @@ bool SceneManager::parseCamera(const std::unordered_map<std::string, std::string
 
 bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::string>& tokens,
                                  RenderSettings& inOutSettings,
-                                 std::string& errorMessage) {
+                                 std::string& errorMessage,
+                                 bool* deprecationNoted) {
     if (auto it = tokens.find("samplesPerFrame"); it != tokens.end()) {
         uint32_t value = 0;
         if (!parseUInt(it->second, value)) {
@@ -1636,7 +1715,7 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
             errorMessage = "renderer tonemap expects an integer";
             return false;
         }
-        inOutSettings.tonemapMode = std::max<uint32_t>(1u, std::min<uint32_t>(value, 4u));
+        inOutSettings.tonemapMode = std::max<uint32_t>(1u, std::min<uint32_t>(value, 6u));
     }
 
     if (auto it = tokens.find("exposure"); it != tokens.end()) {
@@ -1664,6 +1743,72 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
             return false;
         }
         inOutSettings.environmentIntensity = std::max(intensity, 0.0f);
+    }
+
+    // Reference capture calibration affects depth-zero HDR misses only.
+    if (auto it = tokens.find("envBackgroundScale"); it != tokens.end()) {
+        float scale = 1.0f;
+        if (!parseFloat(it->second, scale) || !std::isfinite(scale) || scale < 0.0f) {
+            errorMessage = "renderer envBackgroundScale expects a finite nonnegative float";
+            return false;
+        }
+        inOutSettings.environmentBackgroundScale = scale;
+    }
+
+    if (auto it = tokens.find("envSunClamp"); it != tokens.end()) {
+        float clampLuminance = 0.0f;
+        if (!parseFloat(it->second, clampLuminance) || !std::isfinite(clampLuminance) ||
+            clampLuminance < 0.0f) {
+            errorMessage = "renderer envSunClamp expects a finite nonnegative float";
+            return false;
+        }
+        inOutSettings.environmentSunClamp = clampLuminance;
+    }
+
+    if (auto it = tokens.find("directLightMode"); it != tokens.end()) {
+        std::string lower;
+        lower.reserve(it->second.size());
+        for (char ch : it->second) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lower == "legacy" || lower == "legacy_rect") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::LegacyRect;
+        } else if (lower == "baseline_emissive" || lower == "emissive") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::BaselineEmissive;
+        } else if (lower == "ris") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::Ris;
+        } else if (lower == "ris_spatial" || lower == "spatial_ris") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::RisSpatialReuse;
+        } else if (lower == "ris_temporal" || lower == "temporal_ris") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::RisTemporalReuse;
+        } else if (lower == "ris_world" || lower == "world_ris") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::RisWorldReuse;
+        } else if (lower == "ris_regir" || lower == "regir") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::RisRegirCache;
+        } else if (lower == "restir_di") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::RestirDi;
+        } else if (lower == "restir_di_regir_hybrid" || lower == "restir_regir_hybrid") {
+            inOutSettings.directLightMode = RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+        } else {
+            errorMessage = "renderer directLightMode expects legacy, baseline_emissive, ris, ris_spatial, ris_temporal, ris_world, ris_regir, restir_di, or restir_di_regir_hybrid";
+            return false;
+        }
+    }
+
+    if (auto it = tokens.find("risCandidateCount"); it != tokens.end()) {
+        uint32_t value = 0u;
+        if (!parseUInt(it->second, value)) {
+            errorMessage = "renderer risCandidateCount expects an integer";
+            return false;
+        }
+        inOutSettings.risCandidateCount = std::max<uint32_t>(1u, value);
+    } else if (auto risMIt = tokens.find("risM"); risMIt != tokens.end()) {
+        uint32_t value = 0u;
+        if (!parseUInt(risMIt->second, value)) {
+            errorMessage = "renderer risM expects an integer";
+            return false;
+        }
+        inOutSettings.risCandidateCount = std::max<uint32_t>(1u, value);
     }
 
     if (auto it = tokens.find("reinhardWhite"); it != tokens.end()) {
@@ -1834,22 +1979,27 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
         inOutSettings.throughputClamp = std::max(value, 0.0f);
     }
 
-    if (auto it = tokens.find("specularTailClampBase"); it != tokens.end()) {
-        float value = 0.0f;
-        if (!parseFloat(it->second, value)) {
-            errorMessage = "renderer specularTailClampBase expects a float";
-            return false;
+    // Deprecated no-ops: these configured a GGX lobe-value cap that was removed
+    // (the lobe is only sanitized now). Scene files may still carry them, so
+    // validate the value, ignore it and note it once per scene load.
+    bool sawDeprecatedTailClamp = false;
+    for (const char* key : {"specularTailClampBase", "specularTailClampRoughnessScale"}) {
+        if (auto it = tokens.find(key); it != tokens.end()) {
+            float ignored = 0.0f;
+            if (!parseFloat(it->second, ignored)) {
+                errorMessage = std::string("renderer ") + key + " expects a float";
+                return false;
+            }
+            sawDeprecatedTailClamp = true;
         }
-        inOutSettings.specularTailClampBase = std::max(value, 0.0f);
     }
-
-    if (auto it = tokens.find("specularTailClampRoughnessScale"); it != tokens.end()) {
-        float value = 0.0f;
-        if (!parseFloat(it->second, value)) {
-            errorMessage = "renderer specularTailClampRoughnessScale expects a float";
-            return false;
+    if (sawDeprecatedTailClamp && !(deprecationNoted && *deprecationNoted)) {
+        std::fprintf(stderr,
+                     "[Scene] renderer specularTailClampBase/specularTailClampRoughnessScale are deprecated "
+                     "and ignored (the specular tail clamp was removed)\n");
+        if (deprecationNoted) {
+            *deprecationNoted = true;
         }
-        inOutSettings.specularTailClampRoughnessScale = std::max(value, 0.0f);
     }
 
     if (auto it = tokens.find("minSpecularPdf"); it != tokens.end()) {
@@ -1897,6 +2047,22 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
         inOutSettings.enableMneeSecondary = (flag != 0);
     }
 
+    if (auto it = tokens.find("causticTransportMode"); it != tokens.end()) {
+        std::string mode;
+        mode.reserve(it->second.size());
+        for (char ch : it->second) {
+            mode.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (mode == "off") {
+            inOutSettings.causticTransportMode = RenderSettings::CausticTransportMode::Off;
+        } else if (mode == "path_space") {
+            inOutSettings.causticTransportMode = RenderSettings::CausticTransportMode::PathSpacePrototype;
+        } else {
+            errorMessage = "renderer causticTransportMode expects off or path_space";
+            return false;
+        }
+    }
+
     auto parseBoolRendererToken = [&](const char* tokenName, bool& outValue) -> bool {
         auto it = tokens.find(tokenName);
         if (it == tokens.end()) {
@@ -1911,6 +2077,17 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
         return true;
     };
 
+    if (!parseBoolRendererToken("sourceTransport", inOutSettings.sourceTransport)) return false;
+    if (auto it = tokens.find("sourceRayEpsilon"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value) || !std::isfinite(value) || value < 0.0f) {
+            errorMessage = "renderer sourceRayEpsilon expects a finite nonnegative float (world distance)";
+            return false;
+        }
+        inOutSettings.sourceRayEpsilon = value;
+    }
+    if (!parseBoolRendererToken("denoiseMirrorGuides", inOutSettings.denoiseMirrorGuides)) return false;
+    if (!parseBoolRendererToken("denoiseTransmissionGuides", inOutSettings.denoiseTransmissionGuides)) return false;
     if (!parseBoolRendererToken("gltfViewerCompatibilityMode", inOutSettings.gltfViewerCompatibilityMode)) {
         return false;
     }
@@ -1952,6 +2129,25 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
     }
     if (!parseBoolRendererToken("debugAoIndirectOnly", inOutSettings.debugAoIndirectOnly)) {
         return false;
+    }
+    if (auto it = tokens.find("referencePointExactNee"); it != tokens.end()) {
+        uint32_t flag = 0u;
+        if (!parseUInt(it->second, flag) || flag > 1u) {
+            errorMessage = "renderer referencePointExactNee expects 0 or 1";
+            return false;
+        }
+        inOutSettings.referencePointExactNee = flag != 0u;
+    }
+    if (!parseBoolRendererToken("normalVarianceRoughness", inOutSettings.normalVarianceRoughness)) {
+        return false;
+    }
+    if (auto it = tokens.find("textureLodBias"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value) || !std::isfinite(value)) {
+            errorMessage = "renderer textureLodBias expects a finite float";
+            return false;
+        }
+        inOutSettings.textureLodBias = std::clamp(value, -16.0f, 16.0f);
     }
     if (!parseBoolRendererToken("debugDisableNormalMap", inOutSettings.debugDisableNormalMap)) {
         return false;
@@ -2017,6 +2213,17 @@ bool SceneManager::parseRenderer(const std::unordered_map<std::string, std::stri
             return false;
         }
         inOutSettings.bloomRadius = std::max(value, 0.0f);
+    }
+    if (!parseBoolRendererToken("srgbOutput", inOutSettings.srgbOutputEncoding)) {
+        return false;
+    }
+    if (auto it = tokens.find("referenceBloom"); it != tokens.end()) {
+        float value = 0.0f;
+        if (!parseFloat(it->second, value)) {
+            errorMessage = "renderer referenceBloom expects a float";
+            return false;
+        }
+        inOutSettings.referenceBloomIntensity = std::max(value, 0.0f);
     }
 
     return true;
@@ -2115,10 +2322,10 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
     std::string baseColorTexturePath;
     if (auto it = tokens.find("baseColorTexture"); it != tokens.end()) {
         baseColorTexturePath = it->second;
-    } else if (auto it = tokens.find("albedoTexture"); it != tokens.end()) {
-        baseColorTexturePath = it->second;
-    } else if (auto it = tokens.find("texture"); it != tokens.end()) {
-        baseColorTexturePath = it->second;
+    } else if (auto albedoIt = tokens.find("albedoTexture"); albedoIt != tokens.end()) {
+        baseColorTexturePath = albedoIt->second;
+    } else if (auto textureIt = tokens.find("texture"); textureIt != tokens.end()) {
+        baseColorTexturePath = textureIt->second;
     }
     simd::float2 baseColorUvScale = simd_make_float2(1.0f, 1.0f);
     simd::float2 baseColorUvOffset = simd_make_float2(0.0f, 0.0f);
@@ -2133,6 +2340,26 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
             errorMessage = "material uvOffset expects two floats";
             return false;
         }
+    }
+
+    MaterialTextureSamplerDesc textureSampler;
+    const MaterialTextureSamplerDesc* textureSamplerPtr = nullptr;
+    if (auto it = tokens.find("textureFilter"); it != tokens.end()) {
+        if (it->second != "bilinear" && it->second != "nearest") {
+            errorMessage = "material textureFilter expects bilinear or nearest";
+            return false;
+        }
+        textureSampler.magFilter = textureSampler.minFilter = it->second == "bilinear" ? 9729 : 9728;
+        textureSampler.maxAnisotropy = 1u;
+        textureSamplerPtr = &textureSampler;
+    }
+    bool baseTextureSrgb = true;
+    if (auto it = tokens.find("baseColorTextureColorSpace"); it != tokens.end()) {
+        if (it->second != "linear" && it->second != "srgb") {
+            errorMessage = "baseColorTextureColorSpace expects linear or srgb";
+            return false;
+        }
+        baseTextureSrgb = it->second == "srgb";
     }
 
     float roughness = 0.0f;
@@ -2199,6 +2426,69 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
         }
     }
 
+    float spectralDispersionScaleValue = 0.0f;
+    float spectralAbsorptionScaleValue = 1.0f;
+    uint32_t spectralMaterialPolicyValue = 0u;
+    uint32_t spectralTexturePolicyValue = 0u;
+    auto markExplicitSpectralTriplet = [&]() {
+        spectralMaterialPolicyValue = 1u;
+    };
+    auto parseSpectralPolicyToken = [&](const char* tokenName) -> bool {
+        auto it = tokens.find(tokenName);
+        if (it == tokens.end()) {
+            return true;
+        }
+        std::string lower;
+        lower.reserve(it->second.size());
+        for (char ch : it->second) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lower == "rgb_approx" || lower == "rgb_approx_d65" ||
+            lower == "rgbreflectanced65" || lower == "rgb_reflectance_d65" ||
+            lower == "off" || lower == "0") {
+            spectralMaterialPolicyValue = 0u;
+            return true;
+        }
+        if (lower == "sampled_triplet" || lower == "explicit_triplet" ||
+            lower == "spectral_triplet" || lower == "triplet" ||
+            lower == "on" || lower == "1") {
+            spectralMaterialPolicyValue = 1u;
+            return true;
+        }
+        errorMessage = std::string("material ") + tokenName +
+                       " expects rgb_approx_d65 or sampled_triplet";
+        return false;
+    };
+    if (!parseSpectralPolicyToken("spectralPolicy")) {
+        return false;
+    }
+    if (!parseSpectralPolicyToken("spectralMaterialPolicy")) {
+        return false;
+    }
+    if (auto it = tokens.find("spectralDispersion"); it != tokens.end()) {
+        if (!parseFloat(it->second, spectralDispersionScaleValue)) {
+            errorMessage = "material spectralDispersion expects a float";
+            return false;
+        }
+        spectralDispersionScaleValue = std::max(spectralDispersionScaleValue, 0.0f);
+        markExplicitSpectralTriplet();
+    }
+    if (auto it = tokens.find("spectralAbsorptionScale"); it != tokens.end()) {
+        if (!parseFloat(it->second, spectralAbsorptionScaleValue)) {
+            errorMessage = "material spectralAbsorptionScale expects a float";
+            return false;
+        }
+        spectralAbsorptionScaleValue = std::max(spectralAbsorptionScaleValue, 0.0f);
+        markExplicitSpectralTriplet();
+    }
+    if (auto it = tokens.find("spectralEmission"); it != tokens.end()) {
+        if (!parseFloat3(it->second, emission)) {
+            errorMessage = "material spectralEmission expects three floats";
+            return false;
+        }
+        markExplicitSpectralTriplet();
+    }
+
     bool emissionUsesEnvironment = false;
     if (auto it = tokens.find("emitEnv"); it != tokens.end()) {
         uint32_t flag = 0;
@@ -2232,13 +2522,13 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
             errorMessage = "material thin expects on/off";
             return false;
         }
-    } else if (auto it = tokens.find("thinWalled"); it != tokens.end()) {
-        if (!parseBoolToken(it->second, thinDielectric)) {
+    } else if (auto thinWalledIt = tokens.find("thinWalled"); thinWalledIt != tokens.end()) {
+        if (!parseBoolToken(thinWalledIt->second, thinDielectric)) {
             errorMessage = "material thinWalled expects on/off";
             return false;
         }
-    } else if (auto it = tokens.find("thinDielectric"); it != tokens.end()) {
-        if (!parseBoolToken(it->second, thinDielectric)) {
+    } else if (auto thinDielectricIt = tokens.find("thinDielectric"); thinDielectricIt != tokens.end()) {
+        if (!parseBoolToken(thinDielectricIt->second, thinDielectric)) {
             errorMessage = "material thinDielectric expects on/off";
             return false;
         }
@@ -2406,7 +2696,7 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
         carpaintBaseTintValue = simd_make_float3(1.0f, 1.0f, 1.0f);
     }
 
-    if (isPlastic || isSubsurface || isCarPaint) {
+    if (isPlastic || isSubsurface || isCarPaint || tokens.count("closure")) {
         if (auto it = tokens.find("coatRoughness"); it != tokens.end()) {
             if (!parseFloat(it->second, coatRoughnessValue)) {
                 errorMessage = "material coatRoughness expects a float";
@@ -2479,7 +2769,8 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
     simd::float3 conductorEta = simd_make_float3(0.0f, 0.0f, 0.0f);
     simd::float3 conductorK = simd_make_float3(0.0f, 0.0f, 0.0f);
     bool hasConductorParameters = false;
-    if (type == PathTracerShaderTypes::MaterialType::Metal) {
+    if (type == PathTracerShaderTypes::MaterialType::Metal ||
+        (tokens.count("closure") && tokens.at("closure") == "tungsten_smooth_coat")) {
         if (auto itEta = tokens.find("eta"); itEta != tokens.end()) {
             if (!parseFloat3(itEta->second, conductorEta)) {
                 errorMessage = "material eta expects three floats";
@@ -2494,6 +2785,22 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
             }
             hasConductorParameters = true;
         }
+    }
+    if (auto itEta = tokens.find("spectralEta"); itEta != tokens.end()) {
+        if (!parseFloat3(itEta->second, conductorEta)) {
+            errorMessage = "material spectralEta expects three floats";
+            return false;
+        }
+        hasConductorParameters = true;
+        markExplicitSpectralTriplet();
+    }
+    if (auto itK = tokens.find("spectralK"); itK != tokens.end()) {
+        if (!parseFloat3(itK->second, conductorK)) {
+            errorMessage = "material spectralK expects three floats";
+            return false;
+        }
+        hasConductorParameters = true;
+        markExplicitSpectralTriplet();
     }
 
     float sssMeanFreePathValue = 0.0f;
@@ -2593,6 +2900,117 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
                                                      std::max(absorption.z / denom, 0.0f));
         }
     }
+    if (auto it = tokens.find("spectralSigmaA"); it != tokens.end()) {
+        if (!parseFloat3(it->second, dielectricSigmaAValue)) {
+            errorMessage = "material spectralSigmaA expects three floats";
+            return false;
+        }
+        dielectricSigmaAValue = simd_make_float3(std::max(dielectricSigmaAValue.x, 0.0f),
+                                                 std::max(dielectricSigmaAValue.y, 0.0f),
+                                                 std::max(dielectricSigmaAValue.z, 0.0f));
+        markExplicitSpectralTriplet();
+    }
+
+    // New source closures are selected explicitly. Never infer them from names or paths.
+    float sourceModel = 0.0f;
+    bool tungstenClosure = false;
+    if (auto it = tokens.find("closure"); it != tokens.end()) {
+        if (it->second == "tungsten" || it->second == "tungsten_smooth_coat" || it->second == "tungsten_oren_nayar") {
+            tungstenClosure = true;
+            sourceModel = it->second == "tungsten_oren_nayar" ?
+                (type == PathTracerShaderTypes::MaterialType::Lambertian ? 5.0f : 0.0f) :
+                it->second == "tungsten_smooth_coat" ? 4.0f :
+                (type == PathTracerShaderTypes::MaterialType::Metal ? 1.0f :
+                 type == PathTracerShaderTypes::MaterialType::Plastic ? 2.0f :
+                 type == PathTracerShaderTypes::MaterialType::Dielectric ? 3.0f : 0.0f);
+            if (sourceModel == 0.0f || (sourceModel == 4.0f && !isPlastic)) {
+                errorMessage = "closure=tungsten requires metal/plastic/dielectric; tungsten_smooth_coat requires plastic; tungsten_oren_nayar requires lambert";
+                return false;
+            }
+        } else if (it->second != "legacy") {
+            errorMessage = "material closure expects legacy, tungsten, tungsten_smooth_coat or tungsten_oren_nayar";
+            return false;
+        }
+    }
+    float sourceDistribution = 2.0f;
+    for (const auto& entry : {std::make_pair("nonlinear", 2.0f),
+                              std::make_pair("dielectricRefraction", 3.0f),
+                              std::make_pair("dielectricInterfaceAlbedo", 3.0f)}) {
+        if (tokens.count(entry.first) && sourceModel != entry.second) {
+            errorMessage = std::string(entry.first) + " is inapplicable to this closure";
+            return false;
+        }
+    }
+    for (const char* key : {"conductorReflectance", "conductorSingleScatter"}) {
+        if (tokens.count(key) && sourceModel != 1.0f && sourceModel != 4.0f) {
+            errorMessage = std::string(key) + " requires a conductor or coated conductor closure";
+            return false;
+        }
+    }
+    if (auto it = tokens.find("distribution"); it != tokens.end()) {
+        if (it->second == "beckmann") sourceDistribution = 1.0f;
+        else if (it->second != "ggx") {
+            errorMessage = "material distribution expects beckmann or ggx";
+            return false;
+        }
+        if (!tungstenClosure) {
+            errorMessage = "material distribution requires an opt-in Tungsten closure";
+            return false;
+        }
+    }
+    float sourceAlpha = (isPlastic ? coatRoughnessValue * coatRoughnessValue : roughness * roughness);
+    if (auto it = tokens.find("alpha"); it != tokens.end()) {
+        if (!parseFloat(it->second, sourceAlpha) || !std::isfinite(sourceAlpha) || sourceAlpha < 0.0f || !tungstenClosure) {
+            errorMessage = "material alpha expects a nonnegative finite float and a Tungsten closure";
+            return false;
+        }
+    }
+    if (sourceModel == 4.0f && !(sourceAlpha > 0.0f)) {
+        errorMessage = "tungsten_smooth_coat requires positive substrate alpha";
+        return false;
+    }
+    // Oren-Nayar keeps Tungsten's authored roughness (not squared) in sourceParams.z.
+    if (sourceModel == 5.0f) sourceAlpha = roughness;
+    bool sourceNonlinear = true;
+    if ((sourceModel == 1.0f || sourceModel == 4.0f) &&
+        (!tokens.count("eta") || !tokens.count("k") ||
+         !std::isfinite(conductorEta.x) || !std::isfinite(conductorEta.y) || !std::isfinite(conductorEta.z) ||
+         !std::isfinite(conductorK.x) || !std::isfinite(conductorK.y) || !std::isfinite(conductorK.z) ||
+         conductorEta.x < 0 || conductorEta.y < 0 || conductorEta.z < 0 ||
+         conductorK.x < 0 || conductorK.y < 0 || conductorK.z < 0 ||
+         conductorEta.x+conductorK.x <= 0 || conductorEta.y+conductorK.y <= 0 || conductorEta.z+conductorK.z <= 0)) {
+        errorMessage = "Tungsten conductor requires finite nonnegative eta and k with positive eta+k in every channel";
+        return false;
+    }
+    if (thinDielectric && tokens.count("dielectricRefraction")) {
+        errorMessage = "dielectricRefraction is only applicable to solid dielectric interfaces";
+        return false;
+    }
+    bool conductorSingleScatter = true;
+    bool sourceUseBaseColor = false;
+    for (const auto& entry : {std::make_pair("nonlinear", &sourceNonlinear),
+                              std::make_pair("dielectricRefraction", &sourceNonlinear),
+                              std::make_pair("conductorSingleScatter", &conductorSingleScatter)}) {
+        if (auto it = tokens.find(entry.first); it != tokens.end()) {
+            if (!tungstenClosure || !parseBoolToken(it->second, *entry.second)) {
+                errorMessage = std::string("material ") + entry.first + " expects on/off and a Tungsten closure";
+                return false;
+            }
+        }
+    }
+    simd::float3 sourceReflectance = simd_make_float3(1.0f, 1.0f, 1.0f);
+    for (const char* key : {"conductorReflectance", "dielectricInterfaceAlbedo"}) {
+        if (auto it = tokens.find(key); it != tokens.end()) {
+            if (!tungstenClosure) { errorMessage = std::string(key) + " requires a Tungsten closure"; return false; }
+            if (it->second == "baseColor" && std::string(key) == "conductorReflectance") sourceUseBaseColor = true;
+            else if (!parseFloat3(it->second, sourceReflectance) ||
+                     !std::isfinite(sourceReflectance.x) || !std::isfinite(sourceReflectance.y) || !std::isfinite(sourceReflectance.z) ||
+                     sourceReflectance.x < 0 || sourceReflectance.y < 0 || sourceReflectance.z < 0) {
+                errorMessage = std::string(key) + " expects nonnegative finite RGB (or conductor baseColor)";
+                return false;
+            }
+        }
+    }
 
     uint32_t materialIndex = resources.addMaterial(baseColor,
                           roughness,
@@ -2629,7 +3047,77 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
                           carpaintHasBaseConductorValue,
                           carpaintBaseTintValue,
                           thinDielectric,
+                          spectralDispersionScaleValue,
+                          spectralAbsorptionScaleValue,
+                          spectralMaterialPolicyValue,
+                          spectralTexturePolicyValue,
                           materialName);
+
+    if (tungstenClosure) {
+        auto updated = resources.materialsData()[materialIndex];
+        // Integrate internal hemispherical Fresnel over cos², as Tungsten does.
+        const float layerIor = (sourceModel == 2.0f || sourceModel == 4.0f) && tokens.count("coatIOR") ? coatIorValue : ior;
+        if (!(layerIor > 0.0f) || !std::isfinite(layerIor)) {
+            errorMessage = "Tungsten closure requires finite positive relative IOR";
+            return false;
+        }
+        double diffuseFresnel = 0.0;
+        constexpr int samples = 65536;
+        auto fresnelInternal = [&](double cosI) {
+            const double sinT2 = double(layerIor) * layerIor * (1.0 - cosI*cosI);
+            if (sinT2 >= 1.0) return 1.0;
+            const double cosT = std::sqrt(std::max(0.0, 1.0 - sinT2));
+            const double rs = (layerIor*cosI - cosT)/(layerIor*cosI + cosT);
+            const double rp = (cosI - layerIor*cosT)/(cosI + layerIor*cosT);
+            return 0.5*(rs*rs + rp*rp);
+        };
+        if (sourceModel == 2.0f && layerIor != 1.0f) {
+            for (int i = 0; i <= samples; ++i)
+                diffuseFresnel += (i == 0 || i == samples ? 0.5 : 1.0) * fresnelInternal(std::sqrt(double(i)/samples));
+            diffuseFresnel /= samples;
+        }
+        const float meanSigma = (coatAbsorptionValue.x + coatAbsorptionValue.y + coatAbsorptionValue.z)/3.0f;
+        updated.sourceParams = simd_make_float4(sourceModel, sourceDistribution, sourceAlpha, sourceNonlinear ? 1.0f : 0.0f);
+        updated.sourceReflectance = simd_make_float4(sourceReflectance, conductorSingleScatter ? 0.0f : 1.0f);
+        updated.sourceFresnel = simd_make_float4(float(diffuseFresnel), std::exp(-2.0f*coatThicknessValue*meanSigma), sourceUseBaseColor ? 1.0f : 0.0f, layerIor);
+        resources.updateMaterial(materialIndex, updated);
+    }
+
+    // Medium assignment is independent of dielectric relative IOR, as in Tungsten.
+    uint32_t interfaceFlags = 0u;
+    for (const auto& entry : {std::make_pair("interfacePrecision", PathTracerShaderTypes::kMaterialFlagInterfacePrecision),
+                              std::make_pair("authoredDielectricNormal", PathTracerShaderTypes::kMaterialFlagAuthoredDielectricNormal)}) {
+        if (auto it = tokens.find(entry.first); it != tokens.end()) {
+            bool enabled = false;
+            if ((entry.second == PathTracerShaderTypes::kMaterialFlagAuthoredDielectricNormal &&
+                 type != PathTracerShaderTypes::MaterialType::Dielectric) || !parseBoolToken(it->second, enabled)) {
+                errorMessage = std::string("material ") + entry.first + " expects on/off (authoredDielectricNormal requires dielectric)";
+                return false;
+            }
+            if (enabled && entry.second == PathTracerShaderTypes::kMaterialFlagAuthoredDielectricNormal && sourceModel != 3.0f) {
+                errorMessage = "authoredDielectricNormal requires closure=tungsten";
+                return false;
+            }
+            if (enabled) interfaceFlags |= entry.second;
+        }
+    }
+    if (auto it = tokens.find("mediumBoundary"); it != tokens.end()) {
+        if (type != PathTracerShaderTypes::MaterialType::Dielectric ||
+            (it->second != "legacy" && it->second != "interior" && it->second != "inherit")) {
+            errorMessage = "material mediumBoundary expects legacy/interior/inherit on a dielectric";
+            return false;
+        }
+        if (it->second == "interior") interfaceFlags |= PathTracerShaderTypes::kMaterialFlagExplicitInterior;
+        if (it->second == "inherit") interfaceFlags |= PathTracerShaderTypes::kMaterialFlagMediumInherit;
+    }
+    if (interfaceFlags != 0u) {
+        auto updated = resources.materialsData()[materialIndex];
+        updated.materialFlags |= interfaceFlags;
+        if (!resources.updateMaterial(materialIndex, updated)) {
+            errorMessage = "failed to update dielectric interface transport";
+            return false;
+        }
+    }
 
     if (!baseColorTexturePath.empty()) {
         fs::path texturePath(baseColorTexturePath);
@@ -2646,9 +3134,9 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
         std::string textureError;
         PathTracer::TextureLoadStatus textureStatus = PathTracer::TextureLoadStatus::Failed;
         uint32_t textureIndex = resources.addMaterialTextureFromFile(textureCanonical.string(),
-                                                                     /*srgb=*/true,
+                                                                     /*srgb=*/baseTextureSrgb,
                                                                      &textureError,
-                                                                     nullptr,
+                                                                     textureSamplerPtr,
                                                                      PathTracer::MaterialTextureSemantic::BaseColor,
                                                                      &textureStatus);
         if (textureIndex == 0xFFFFFFFFu) {
@@ -2684,6 +3172,68 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
             }
         }
     }
+
+    // Independent scalar bindings share the source UV transform but retain their own dimensions.
+    auto updated = resources.materialsData()[materialIndex];
+    updated.textureTransform0 = simd_make_float4(baseColorUvScale.x, 0.0f, baseColorUvOffset.x, 0.0f);
+    updated.textureTransform1 = simd_make_float4(0.0f, baseColorUvScale.y, baseColorUvOffset.y, 0.0f);
+    updated.textureControl = simd_make_float4(1.0f, 0.0f, 1.0f, 0.0f);
+    if (auto it = tokens.find("opacity"); it != tokens.end()) {
+        float value;
+        if (!parseFloat(it->second, value) || !std::isfinite(value) || value < 0.0f || value > 1.0f) {
+            errorMessage = "material opacity expects a finite value in [0,1]";
+            return false;
+        }
+        updated.textureControl.x = value;
+        updated.textureControl.y = 1.0f;
+    }
+    if (auto it = tokens.find("bumpScale"); it != tokens.end()) {
+        float scale;
+        if (!parseFloat(it->second, scale) || !std::isfinite(scale)) {
+            errorMessage = "material bumpScale expects a finite float";
+            return false;
+        }
+        updated.textureControl.z = scale;
+    }
+    MaterialTextureSemantic opacitySemantic = MaterialTextureSemantic::ScalarAverage;
+    if (auto it = tokens.find("opacityChannel"); it != tokens.end()) {
+        if (it->second != "average" && it->second != "alpha") {
+            errorMessage = "material opacityChannel expects average or alpha";
+            return false;
+        }
+        if (it->second == "alpha") opacitySemantic = MaterialTextureSemantic::ScalarAlpha;
+    }
+    MaterialTextureSamplerDesc scalarSampler;
+    scalarSampler.magFilter = scalarSampler.minFilter = 9729;
+    scalarSampler.maxAnisotropy = 1u;
+    for (const char* token : {"opacityTexture", "bumpTexture"}) {
+        auto it = tokens.find(token);
+        if (it == tokens.end()) continue;
+        fs::path path(it->second);
+        if (path.is_relative()) path = fs::path(sceneDirectory) / path;
+        std::error_code ec;
+        path = fs::weakly_canonical(path, ec);
+        if (ec || !fs::is_regular_file(path)) {
+            errorMessage = std::string(token) + " not found: " + it->second;
+            return false;
+        }
+        std::string loadError;
+        bool isOpacity = std::string(token) == "opacityTexture";
+        auto index = resources.addMaterialTextureFromFile(path.string(), false, &loadError, &scalarSampler,
+            isOpacity ? opacitySemantic : MaterialTextureSemantic::ScalarAverage);
+        if (index == 0xFFFFFFFFu) {
+            errorMessage = std::string(token) + ": " + loadError;
+            return false;
+        }
+        if (isOpacity) {
+            updated.textureIndices1.z = index;
+            updated.textureControl.y = 1.0f;
+        } else updated.textureIndices1.w = index;
+    }
+    for (const char* key : {"closure", "distribution", "alpha", "conductorReflectance", "conductorSingleScatter", "nonlinear", "dielectricInterfaceAlbedo", "dielectricRefraction", "interfacePrecision", "mediumBoundary", "authoredDielectricNormal", "bumpTexture", "bumpScale", "opacity", "opacityTexture", "opacityChannel", "textureFilter", "baseColorTextureColorSpace"}) {
+        if (tokens.count(key)) updated.materialFlags |= PathTracerShaderTypes::kMaterialFlagSourceFeatures;
+    }
+    if (!resources.updateMaterial(materialIndex, updated)) return false;
 
     if (!materialName.empty()) {
         materialIndicesByName[materialName] = materialIndex;
@@ -3025,6 +3575,63 @@ bool SceneManager::parseDisk(const std::unordered_map<std::string, std::string>&
     return true;
 }
 
+// Invisible punctual lights, with optional receiver-facing disk jitter.
+// Material RGB is intensity. Legacy falloff defaults to the reference's 1 m cap;
+// inverse_square evaluates physical 1/r^2 falloff without that cap.
+bool SceneManager::parseReferencePoint(const std::unordered_map<std::string, std::string>& tokens,
+                                      SceneResources& resources,
+                                      std::string& errorMessage) {
+    const auto positionIt = tokens.find("position");
+    const auto materialIt = tokens.find("material");
+    simd::float3 position{};
+    uint32_t materialIndex = 0u;
+    if (positionIt == tokens.end() || !parseFloat3(positionIt->second, position) ||
+        !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
+        errorMessage = "reference_point requires finite position=<x,y,z>";
+        return false;
+    }
+    if (materialIt == tokens.end() || !parseUInt(materialIt->second, materialIndex) ||
+        materialIndex >= resources.materialCount()) {
+        errorMessage = "reference_point requires a previously defined material index";
+        return false;
+    }
+    float radius = 0.1f;
+    if (auto it = tokens.find("radius"); it != tokens.end()) {
+        if (!parseFloat(it->second, radius)) {
+            errorMessage = "reference_point radius expects a float";
+            return false;
+        }
+    }
+    if (!std::isfinite(radius) || radius < 0.0f) {
+        errorMessage = "reference_point radius must be finite and nonnegative";
+        return false;
+    }
+    bool inverseSquareFalloff = false;
+    if (auto it = tokens.find("falloff"); it != tokens.end()) {
+        if (it->second == "inverse_square") {
+            inverseSquareFalloff = true;
+        } else if (it->second != "legacy") {
+            errorMessage = "reference_point falloff expects legacy or inverse_square";
+            return false;
+        }
+    }
+    float minimumDistance = 1.0f;
+    if (auto it = tokens.find("minDistance"); it != tokens.end()) {
+        if (!parseFloat(it->second, minimumDistance) || !std::isfinite(minimumDistance) ||
+            !(minimumDistance > 0.0f) ||
+            !std::isnormal(minimumDistance * minimumDistance)) {
+            errorMessage = "reference_point minDistance must be finite and positive with a normal float square";
+            return false;
+        }
+        if (inverseSquareFalloff && minimumDistance != 1.0f) {
+            errorMessage = "reference_point custom minDistance applies only to falloff=legacy";
+            return false;
+        }
+    }
+    resources.addReferencePointLight(position, radius, materialIndex, inverseSquareFalloff, minimumDistance);
+    return true;
+}
+
 bool SceneManager::parseDirectionalLight(const std::unordered_map<std::string, std::string>& tokens,
                                          SceneResources& resources,
                                          std::string& errorMessage) {
@@ -3076,11 +3683,22 @@ bool SceneManager::parseDirectionalLight(const std::unordered_map<std::string, s
         }
     }
 
+    float angularRadiusDegrees = 0.0f;
+    if (auto radiusIt = tokens.find("angularRadius"); radiusIt != tokens.end()) {
+        if (!parseFloat(radiusIt->second, angularRadiusDegrees) ||
+            !std::isfinite(angularRadiusDegrees) ||
+            angularRadiusDegrees < 0.0f || angularRadiusDegrees > 90.0f) {
+            errorMessage = "sun angularRadius expects a finite number of degrees in [0, 90]";
+            return false;
+        }
+    }
+
     resources.addDirectionalLight(directionToLight,
                                   simd_make_float3(std::max(color.x * intensity, 0.0f),
                                                    std::max(color.y * intensity, 0.0f),
                                                    std::max(color.z * intensity, 0.0f)),
-                                  selectionWeight);
+                                  selectionWeight,
+                                  angularRadiusDegrees);
     return true;
 }
 
@@ -3203,6 +3821,120 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
             gltfOptions.forceLinearBaseColor = inOutSettings.gltfCompatForceLinearBaseColor;
             gltfOptions.forceLinearEmissive = inOutSettings.gltfCompatForceLinearEmissive;
             gltfOptions.flipTexcoordV = inOutSettings.gltfCompatFlipTexcoordV;
+            auto parseMeshBoolToken = [&](const char* tokenName, bool& outValue) -> bool {
+                auto itTok = tokens.find(tokenName);
+                if (itTok == tokens.end()) {
+                    return true;
+                }
+                uint32_t flag = 0;
+                if (!parseUInt(itTok->second, flag)) {
+                    errorMessage = std::string("mesh ") + tokenName + " expects 0 or 1";
+                    return false;
+                }
+                outValue = (flag != 0u);
+                return true;
+            };
+            if (!parseMeshBoolToken("gltfAnimation", gltfOptions.enableAnimationSampling)) {
+                return false;
+            }
+            if (!parseMeshBoolToken("gltfSampleAnimation", gltfOptions.enableAnimationSampling)) {
+                return false;
+            }
+            if (!parseMeshBoolToken("gltfLoopAnimation", gltfOptions.loopAnimation)) {
+                return false;
+            }
+            if (!parseMeshBoolToken("gltfPunctualLights", gltfOptions.importPunctualLights)) {
+                return false;
+            }
+            if (!parseMeshBoolToken("gltfTexturedEmissionNee", gltfOptions.texturedEmissionNee)) {
+                return false;
+            }
+            if (!parseMeshBoolToken("gltfReferenceDielectricContinuation",
+                                    gltfOptions.referenceDielectricContinuation)) {
+                return false;
+            }
+            if (auto it = tokens.find("gltfAnimationIndex"); it != tokens.end()) {
+                uint32_t value = 0u;
+                if (!parseUInt(it->second, value)) {
+                    errorMessage = "mesh gltfAnimationIndex expects an integer";
+                    return false;
+                }
+                gltfOptions.animationIndex = static_cast<int>(value);
+            }
+            if (auto it = tokens.find("gltfAnimationTime"); it != tokens.end()) {
+                float value = 0.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh gltfAnimationTime expects a float";
+                    return false;
+                }
+                gltfOptions.animationTimeSeconds = value;
+            }
+            if (auto it = tokens.find("gltfPunctualLightScale"); it != tokens.end()) {
+                float value = 1.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh gltfPunctualLightScale expects a float";
+                    return false;
+                }
+                gltfOptions.punctualLightIntensityScale = std::max(value, 0.0f);
+            }
+            if (auto it = tokens.find("gltfTransmissionScale"); it != tokens.end()) {
+                float value = 1.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh gltfTransmissionScale expects a float";
+                    return false;
+                }
+                gltfOptions.transmissionScale = std::max(value, 0.0f);
+            }
+            if (auto it = tokens.find("gltfRoughnessOverride"); it != tokens.end()) {
+                float value = -1.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh gltfRoughnessOverride expects a float";
+                    return false;
+                }
+                gltfOptions.roughnessOverride = std::clamp(value, 0.0f, 1.0f);
+            }
+            if (auto it = tokens.find("gltfMaterialFactors"); it != tokens.end()) {
+                const char* factorError =
+                    "mesh gltfMaterialFactors expects material:roughness:R:G:B:metallic pairs "
+                    "(roughness in [0,1.5], metallic in [0,1], RGB in [0,4])";
+                if (it->second.empty() || it->second.back() == ',') {
+                    errorMessage = factorError;
+                    return false;
+                }
+                std::istringstream entries(it->second);
+                std::string entry;
+                while (std::getline(entries, entry, ',')) {
+                    float values[5]{};
+                    for (int i = 4; i >= 0; --i) {
+                        const size_t separator = entry.rfind(':');
+                        if (separator == std::string::npos ||
+                            !parseFloat(entry.substr(separator + 1u), values[i]) ||
+                            !std::isfinite(values[i]) || values[i] < 0.0f ||
+                            values[i] > (i == 0 ? 1.5f : (i == 4 ? 1.0f : 4.0f))) {
+                            errorMessage = factorError;
+                            return false;
+                        }
+                        entry.resize(separator);
+                    }
+                    const std::string name = trim(entry);
+                    GltfMaterialFactors factors;
+                    factors.roughnessMultiplier = values[0];
+                    factors.baseColorMultiplier = simd_make_float3(values[1], values[2], values[3]);
+                    factors.metallicMultiplier = values[4];
+                    if (name.empty() || !gltfOptions.materialFactorsByName.emplace(name, factors).second) {
+                        errorMessage = factorError;
+                        return false;
+                    }
+                }
+            }
+            if (auto it = tokens.find("gltfAlphaOverride"); it != tokens.end()) {
+                float value = -1.0f;
+                if (!parseFloat(it->second, value)) {
+                    errorMessage = "mesh gltfAlphaOverride expects a float";
+                    return false;
+                }
+                gltfOptions.alphaOverride = std::clamp(value, 0.0f, 1.0f);
+            }
             auto appendDisableOrmPatterns = [&](const std::string& value) {
                 std::string token;
                 token.reserve(value.size());
@@ -3265,7 +3997,24 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
                              extensionLower.c_str(),
                              loadedMeshCount);
             }
-            if (allowEmbeddedCameraOverride &&
+            bool useEmbeddedCamera = allowEmbeddedCameraOverride;
+            if (auto it = tokens.find("useEmbeddedCamera"); it != tokens.end()) {
+                uint32_t flag = 0u;
+                if (!parseUInt(it->second, flag)) {
+                    errorMessage = "mesh useEmbeddedCamera expects 0 or 1";
+                    return false;
+                }
+                useEmbeddedCamera = (flag != 0u);
+            }
+            if (auto it = tokens.find("gltfUseEmbeddedCamera"); it != tokens.end()) {
+                uint32_t flag = 0u;
+                if (!parseUInt(it->second, flag)) {
+                    errorMessage = "mesh gltfUseEmbeddedCamera expects 0 or 1";
+                    return false;
+                }
+                useEmbeddedCamera = (flag != 0u);
+            }
+            if (useEmbeddedCamera &&
                 gltfCamera.valid && gltfCamera.hasPerspective && gltfCamera.yfov > 0.0f) {
                 constexpr float kPi = 3.14159265358979323846f;
                 float distance = gltfCamera.hasSceneBounds
@@ -3283,7 +4032,7 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
                 inOutSettings.cameraVerticalFov = gltfCamera.yfov * (180.0f / kPi);
                 inOutSettings.cameraDefocusAngle = 0.0f;
                 inOutSettings.cameraFocusDistance = distance;
-            } else if (allowEmbeddedCameraOverride && gltfCamera.hasSceneBounds) {
+            } else if (useEmbeddedCamera && gltfCamera.hasSceneBounds) {
                 const float distance = std::max(gltfCamera.sceneRadius * 2.25f, 0.1f);
                 inOutSettings.cameraTarget = gltfCamera.sceneCenter;
                 inOutSettings.cameraDistance = distance;

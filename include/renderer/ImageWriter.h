@@ -13,14 +13,16 @@ enum class ImageFileFormat {
 };
 
 struct TonemapSettings {
-    uint32_t tonemapMode = 1;       // 1=Linear, 2=ACES, 3=Reinhard, 4=Hable
-    uint32_t acesVariant = 0;       // 0=ACES Fitted, 1=ACES Simple
+    uint32_t tonemapMode = 1;       // 1=Linear, 2=ACES, 3=Reinhard, 4=Hable, 5=Exponential, 6=Filmic (Tungsten, no extra encode)
+    uint32_t acesVariant = 0;       // 0=ACES Fitted, 1=ACES Simple, 2=Falcor (0.6 pre-exposure, sRGB)
     float exposure = 0.0f;          // Exposure in stops
     float reinhardWhitePoint = 1.5f;
+    bool srgbEncode = true;                // Piecewise sRGB encode (matches the PNG's sRGB tag); false = gamma 2.2
+    float referenceBloomIntensity = 0.0f;  // Path-Tracing reference bloom before tonemapping; 0 disables
 };
 
 /// Write an image to disk in the requested format.
-/// For LDR formats (PNG/PPM) the image is tone mapped and gamma corrected.
+/// For LDR formats (PNG/PPM) the image is tone mapped and sRGB encoded (gamma 2.2 if srgbEncode is false).
 /// For HDR formats (EXR/PFM) the input is written as linear HDR.
 /// @param path Output file path (UTF-8 encoded)
 /// @param format Image file format to write

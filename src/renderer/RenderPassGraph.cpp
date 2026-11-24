@@ -99,6 +99,23 @@ FrameResourceDesc MakeResource(std::string name,
     resource.historyPolicy = historyPolicy;
     resource.invalidatesOn = std::move(invalidatesOn);
     resource.debugLabel = "FrameGraph.Resource." + resource.name;
+    switch (lifetime) {
+        case ResourceLifetime::Imported:
+            resource.clearLoadPolicy = "external_owner_preserves";
+            break;
+        case ResourceLifetime::Transient:
+            resource.clearLoadPolicy = "clear_or_full_overwrite_on_first_write";
+            break;
+        case ResourceLifetime::Persistent:
+            resource.clearLoadPolicy = "preserve_until_resize_or_feature_change";
+            break;
+        case ResourceLifetime::History:
+            resource.clearLoadPolicy = "preserve_until_declared_invalidation_then_clear";
+            break;
+        case ResourceLifetime::DebugReadback:
+            resource.clearLoadPolicy = "clear_when_debug_readback_enabled";
+            break;
+    }
     return resource;
 }
 
@@ -156,10 +173,10 @@ void ApplyProductionBridgeMetadata(std::vector<FrameResourceDesc>& resources) {
                 resource.featureGate = "analytic_lights || emissive_primitives || environment";
                 break;
             case RenderResourceGroup::GBufferResources:
-                resource.currentOwner = "RenderLoop.Accumulation";
-                resource.targetOwner = "Reconstruction";
+                resource.currentOwner = "FrameGraph.AccumulationAllocator";
+                resource.targetOwner = "FrameGraph.Reconstruction";
                 resource.featureGate = "accumulation || denoiser || debug_aov";
-                resource.migrationRisk = "medium";
+                resource.migrationRisk = "low";
                 break;
             case RenderResourceGroup::ReSTIRDIResources:
                 resource.currentOwner = "FrameGraph+TransportMemory.ReSTIRDI";
@@ -179,42 +196,44 @@ void ApplyProductionBridgeMetadata(std::vector<FrameResourceDesc>& resources) {
                 resource.hotPath = true;
                 break;
             case RenderResourceGroup::ReSTIRGIResources:
-                resource.currentOwner = "PrototypeGI";
+                resource.currentOwner = "TransportMemory.ReSTIRGI";
                 resource.targetOwner = "TransportMemory.ReSTIRGI";
-                resource.storageClass = StorageClass::Shared;
+                resource.storageClass = StorageClass::Private;
                 resource.targetStorageClass = StorageClass::Private;
-                resource.featureGate = "restirGiMode=diffuse_prototype";
-                resource.migrationRisk = "high";
+                resource.featureGate = "restirGiMode=production_diffuse";
+                resource.migrationRisk = "low";
                 resource.hotPath = true;
-                resource.temporaryShared = true;
+                resource.temporaryShared = false;
                 break;
             case RenderResourceGroup::ReSTIRPTResources:
-                resource.currentOwner = "PathReservoirPrototype";
+                resource.currentOwner = "TransportMemory.ReSTIRPT";
                 resource.targetOwner = "TransportMemory.ReSTIRPT";
-                resource.storageClass = StorageClass::Shared;
+                resource.storageClass = StorageClass::Private;
                 resource.targetStorageClass = StorageClass::Private;
                 resource.featureGate = "restirPtMode!=off";
-                resource.migrationRisk = "high";
+                resource.migrationRisk = "low";
                 resource.hotPath = true;
-                resource.temporaryShared = true;
+                resource.temporaryShared = false;
                 break;
             case RenderResourceGroup::PathGuidingResources:
-                resource.currentOwner = "PathGuidingPrototype.WorldGrid";
+                resource.currentOwner = "TransportMemory.PathGuiding";
                 resource.targetOwner = "GuidingProvider";
+                resource.storageClass = StorageClass::Private;
                 resource.targetStorageClass = StorageClass::Private;
-                resource.featureGate = "pathGuidingMode=prototype";
-                resource.debugReadbackPolicy = "direct_cpu_visible_for_metrics";
-                resource.migrationRisk = "high";
+                resource.featureGate = "pathGuidingMode=path_guiding";
+                resource.debugReadbackPolicy = "staging";
+                resource.migrationRisk = "medium";
                 resource.hotPath = true;
-                resource.temporaryShared = true;
+                resource.temporaryShared = false;
                 break;
             case RenderResourceGroup::RadianceCacheResources:
-                resource.currentOwner = "RadianceProvider.WorldGrid";
+                resource.currentOwner = "TransportMemory.RadianceCache";
                 resource.targetOwner = "RadianceProvider";
+                resource.storageClass = StorageClass::Private;
                 resource.targetStorageClass = StorageClass::Private;
-                resource.featureGate = "radianceCacheMode=prototype";
-                resource.debugReadbackPolicy = "metadata_only_metrics";
-                resource.migrationRisk = "low";
+                resource.featureGate = "radianceCacheMode=radiance_cache";
+                resource.debugReadbackPolicy = "staging";
+                resource.migrationRisk = "medium";
                 resource.hotPath = true;
                 resource.temporaryShared = false;
                 break;
@@ -239,50 +258,51 @@ void ApplyProductionBridgeMetadata(std::vector<FrameResourceDesc>& resources) {
                 resource.temporaryShared = false;
                 break;
             case RenderResourceGroup::MLBackendResources:
-                resource.currentOwner = "MLBackend.NoOp";
-                resource.targetOwner = "FrameGraph.MLBackend";
+                resource.currentOwner = "MLBackend.CustomMetalOrNoOp";
+                resource.targetOwner = "TransportMemory.MLBackend";
                 resource.storageClass = StorageClass::Private;
                 resource.targetStorageClass = StorageClass::Private;
                 resource.featureGate = "mlBackendMode!=off";
-                resource.debugReadbackPolicy = "metadata_only_capability_and_fallback";
+                resource.debugReadbackPolicy = "metadata_only_confidence_and_fallback";
                 resource.migrationRisk = "medium";
-                resource.hotPath = false;
+                resource.hotPath = true;
                 resource.temporaryShared = false;
                 break;
             case RenderResourceGroup::WavefrontResources:
-                resource.currentOwner = "WavefrontScheduler";
-                resource.targetOwner = "WavefrontScheduler";
+                resource.currentOwner = "TransportMemory.WavefrontScheduler";
+                resource.targetOwner = "TransportMemory.WavefrontScheduler";
+                resource.storageClass = StorageClass::Private;
                 resource.targetStorageClass = StorageClass::Private;
                 resource.featureGate = "executionMode=wavefront";
-                resource.debugReadbackPolicy = "counters_direct_cpu_visible";
-                resource.migrationRisk = "high";
+                resource.debugReadbackPolicy = "private_hot_queues_with_shared_counter_readback";
+                resource.migrationRisk = "medium";
                 resource.hotPath = true;
-                resource.temporaryShared = true;
+                resource.temporaryShared = false;
                 break;
             case RenderResourceGroup::DenoiserResources:
             case RenderResourceGroup::DenoiserScratchResources:
-                resource.currentOwner = "Denoiser";
-                resource.targetOwner = "Reconstruction";
+                resource.currentOwner = "FrameGraph.Reconstruction";
+                resource.targetOwner = "FrameGraph.Reconstruction";
                 resource.featureGate = "svgfDenoiseEnabled || oidn_export";
-                resource.migrationRisk = "medium";
+                resource.migrationRisk = "low";
                 break;
             case RenderResourceGroup::ReconstructionAOVResources:
-                resource.currentOwner = "RenderLoop.Accumulation";
+                resource.currentOwner = "FrameGraph.AccumulationAllocator";
                 resource.targetOwner = "FrameGraph.Reconstruction";
                 resource.featureGate = "always";
                 resource.debugReadbackPolicy = "metrics_and_optional_aov_export";
-                resource.migrationRisk = "medium";
+                resource.migrationRisk = "low";
                 resource.hotPath = true;
                 break;
             case RenderResourceGroup::ReconstructionHistoryResources:
-                resource.currentOwner = "Denoiser";
+                resource.currentOwner = "FrameGraph.Reconstruction";
                 resource.targetOwner = "FrameGraph.Reconstruction";
                 resource.featureGate = "temporalAccumulation || svgfDenoiseEnabled || denoiseEnabled";
                 resource.debugReadbackPolicy = "metadata_only";
-                resource.migrationRisk = "medium";
+                resource.migrationRisk = "low";
                 break;
             case RenderResourceGroup::FinalOutputResources:
-                resource.currentOwner = "RenderLoop.Accumulation";
+                resource.currentOwner = "FrameGraph.AccumulationAllocator";
                 resource.targetOwner = "FrameGraph";
                 resource.featureGate = "always";
                 break;
@@ -673,8 +693,6 @@ const char* StorageClassLabel(StorageClass storageClass) {
             return "Private";
         case StorageClass::Shared:
             return "Shared";
-        case StorageClass::Managed:
-            return "Managed";
         case StorageClass::Memoryless:
             return "Memoryless";
         case StorageClass::External:
@@ -737,6 +755,8 @@ const char* RenderPassExecutionLabel(RenderPassExecutionId executionId) {
             return "RestirDiDebugAov";
         case RenderPassExecutionId::MlBackendNoOp:
             return "MlBackendNoOp";
+        case RenderPassExecutionId::MlBackendReconstructionTiny:
+            return "MlBackendReconstructionTiny";
     }
     return "Unknown";
 }
@@ -811,9 +831,10 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
         settings.volumeTransportMode == RenderSettings::VolumeTransportMode::Homogeneous;
     const bool mlBackendEnabled =
         settings.mlBackendMode != RenderSettings::MlBackendMode::Off;
-    const bool restirDiWavefrontStageEnabled =
-        restirDiEnabled && settings.executionMode == RenderSettings::ExecutionMode::Wavefront;
-    const bool restirDiScreenPassesEnabled = restirDiEnabled && !restirDiWavefrontStageEnabled;
+    const bool mlBackendTinyEnabled =
+        settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny;
+    const bool restirDiWavefrontStageEnabled = false;
+    const bool restirDiScreenPassesEnabled = restirDiEnabled;
     const bool reconstructionConfidenceInputsEnabled =
         restirDiEnabled ||
         settings.pathGuidingMode == RenderSettings::PathGuidingMode::Prototype ||
@@ -955,7 +976,7 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
             RenderResourceKind::Buffer,
             ResourceLifetime::History,
             StorageClass::Private,
-            "bounded PathVertex + PathConnection records for eye/light subpaths and MIS metadata",
+            "bounded PathVertex + PathConnection + ConnectionResult records for eye/light subpaths and MIS metadata",
             PixelFormatClass::StructuredBuffer,
             HistoryPolicy::Persistent,
             TransportHistoryInvalidations()),
@@ -973,12 +994,14 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
             "MLBackendResources",
             RenderResourceGroup::MLBackendResources,
             RenderResourceKind::Buffer,
-            ResourceLifetime::Transient,
+            mlBackendTinyEnabled ? ResourceLifetime::Persistent : ResourceLifetime::Transient,
             StorageClass::Private,
-            "tensor descriptors for reconstruction inputs/outputs: radiance, albedo, normal, depth, "
-            "motion, variance, confidence, optional model package metadata, and scratch tensors",
+            mlBackendTinyEnabled
+                ? "versioned PTMLRECONv1 model header + 1x1 reconstruction weights; input/output "
+                  "tensors are graph-owned reconstruction textures"
+                : "no-op tensor contract metadata only; no model or scratch allocation",
             PixelFormatClass::StructuredBuffer,
-            HistoryPolicy::None,
+            mlBackendTinyEnabled ? HistoryPolicy::Persistent : HistoryPolicy::None,
             FrameHistoryInvalidations()),
         MakeResource(
             "WavefrontResources",
@@ -1184,7 +1207,7 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
             RenderPassExecutionId::RestirDiInitialCandidates,
             "restirDiInitialCandidatesKernel",
             Dispatch(DispatchKind::FullScreen, "render width * render height"),
-            {"directLightMode", "risCandidateCount", "spatialReuseNeighborCount"},
+            {"directLightMode", "risCandidateCount", "spatialReuseNeighborCount", "worldReuseCellSize"},
             {RenderResourceGroup::ReSTIRDIReservoirCurrent}));
         passes.push_back(MakePass(
             "ReSTIR DI Temporal Reuse",
@@ -1397,12 +1420,19 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
             {"executionMode", "directLightMode", "restirGiMode", "pathGuidingMode", "restirPtMode"}));
     }
 
-    if (settings.restirPtMode == RenderSettings::RestirPtMode::Research ||
-        settings.restirPtMode == RenderSettings::RestirPtMode::ExperimentalPathReuse) {
+    if (settings.restirPtMode == RenderSettings::RestirPtMode::ProductionReservoirCapture ||
+        settings.restirPtMode == RenderSettings::RestirPtMode::ProductionPathReuse ||
+        settings.restirPtMode == RenderSettings::RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == RenderSettings::RestirPtMode::EnhancedBiased) {
+        const bool enhanced =
+            settings.restirPtMode == RenderSettings::RestirPtMode::EnhancedUnbiased ||
+            settings.restirPtMode == RenderSettings::RestirPtMode::EnhancedBiased;
         passes.push_back(MakePass(
-            settings.restirPtMode == RenderSettings::RestirPtMode::ExperimentalPathReuse
-                ? "ReSTIR PT Experimental Path Reuse Audit"
-                : "ReSTIR PT Research Audit",
+            enhanced
+                ? "ReSTIR PT Enhanced Fused Audit"
+                : settings.restirPtMode == RenderSettings::RestirPtMode::ProductionPathReuse
+                ? "ReSTIR PT Production Path Reuse Audit"
+                : "ReSTIR PT Reservoir Capture Audit",
             RenderPassType::Host,
             FeatureMask({RenderPassFeature::Optional, RenderPassFeature::DebugOnly}),
             {RenderResourceGroup::FrameConstants,
@@ -1513,9 +1543,12 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
     }
 
     if (mlBackendEnabled) {
+        const bool tinyBackend =
+            settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny;
         passes.push_back(MakePass(
-            "ML Reconstruction Backend Audit",
-            RenderPassType::Host,
+            tinyBackend ? "ML Reconstruction Tiny Inference"
+                        : "ML Reconstruction Backend Audit",
+            tinyBackend ? RenderPassType::Compute : RenderPassType::Host,
             FeatureMask({RenderPassFeature::Optional,
                          RenderPassFeature::Reconstruction,
                          RenderPassFeature::MLBackend}),
@@ -1525,11 +1558,17 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
              RenderResourceGroup::ReconstructionHistoryResources,
              RenderResourceGroup::MLBackendResources},
             {RenderResourceGroup::MLBackendResources,
+             RenderResourceGroup::DenoiserResources,
              RenderResourceGroup::ReconstructionHistoryResources,
              RenderResourceGroup::DebugResources},
-            RenderPassExecutionId::MlBackendNoOp,
-            "MLBackend.NoOp.Reconstruction",
-            Dispatch(DispatchKind::External, "host capability/fallback audit; no tensor dispatch"),
+            tinyBackend ? RenderPassExecutionId::MlBackendReconstructionTiny
+                        : RenderPassExecutionId::MlBackendNoOp,
+            tinyBackend ? "MLBackend.CustomMetal.TinyReconstructionV1"
+                        : "MLBackend.NoOp.Reconstruction",
+            tinyBackend ? Dispatch(DispatchKind::FullScreen,
+                                   "render width * render height GPU inference")
+                        : Dispatch(DispatchKind::External,
+                                   "host capability/fallback audit; no tensor dispatch"),
             {"mlBackendMode", "mlModelPackagePath", "mlDebug"},
             {RenderResourceGroup::ReconstructionAOVResources,
              RenderResourceGroup::ReconstructionHistoryResources,
@@ -1556,7 +1595,7 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
             RenderPassExecutionId::SvgfDenoise,
             "svgfTemporalMomentsKernel + svgfAtrousFilterKernel",
             Dispatch(DispatchKind::FullScreen, "render width * render height"),
-            {"svgfDenoiseEnabled", "svgfAtrousIterations"},
+            {"svgfDenoiseEnabled", "svgfDenoiseDirect", "svgfDenoiseIndirect", "svgfAtrousIterations"},
             {RenderResourceGroup::ReconstructionAOVResources,
              RenderResourceGroup::ReconstructionHistoryResources,
              RenderResourceGroup::DenoiserResources}));
@@ -1581,13 +1620,18 @@ RenderPassGraphDesc BuildRenderPassGraph(const RenderSettings& settings,
     }
 
     if (hasDisplayPass) {
+        std::vector<RenderResourceGroup> displayInputs = {
+            RenderResourceGroup::FinalOutputResources,
+        };
+        if (settings.denoiseEnabled || settings.svgfDenoiseEnabled) {
+            displayInputs.push_back(RenderResourceGroup::DenoiserResources);
+            displayInputs.push_back(RenderResourceGroup::ReconstructionHistoryResources);
+        }
         passes.push_back(MakePass(
             "Display Quad",
             RenderPassType::Render,
             0u,
-            {RenderResourceGroup::FinalOutputResources,
-             RenderResourceGroup::DenoiserResources,
-             RenderResourceGroup::ReconstructionHistoryResources},
+            std::move(displayInputs),
             {RenderResourceGroup::FinalOutputResources},
             RenderPassExecutionId::Display,
             "Display Quad",
@@ -1626,17 +1670,16 @@ RenderPassGraphCompileResult CompileRenderPassGraph(const RenderPassGraphDesc& g
             result.warnings.push_back(
                 resource.name + " has no resource debug label");
         }
+        if (resource.clearLoadPolicy.empty()) {
+            result.warnings.push_back(
+                resource.name + " has no graph clear/load policy");
+        }
         if ((resource.lifetime == ResourceLifetime::History ||
              resource.historyPolicy == HistoryPolicy::CurrentPrevious ||
              resource.historyPolicy == HistoryPolicy::Persistent) &&
             resource.invalidatesOn.empty()) {
             result.warnings.push_back(
                 resource.name + " has history lifetime/policy without invalidation reasons");
-        }
-        if (resource.lifetime == ResourceLifetime::Transient &&
-            i < result.resourcePlans.size() &&
-            !result.resourcePlans[i].used) {
-            result.warnings.push_back(resource.name + " is transient but unused by this graph");
         }
         for (size_t j = i + 1u; j < graph.resources.size(); ++j) {
             if (graph.resources[j].group == resource.group) {

@@ -5,6 +5,7 @@
 #import <Metal/Metal.h>
 
 #import "renderer/BvhBuilder.h"
+#import "renderer/LoadEventPump.h"
 
 #define TINYBVH_IMPLEMENTATION
 #include "tiny_bvh.h"
@@ -24,10 +25,6 @@ namespace PathTracer {
 namespace {
 
 constexpr NSUInteger kIncrementalBlasBatchSize = 1u;
-constexpr MTLAccelerationStructureUsage kAccelerationUsagePreferFastIntersection =
-    static_cast<MTLAccelerationStructureUsage>(1u << 4u);
-constexpr MTLAccelerationStructureUsage kAccelerationUsageMinimizeMemory =
-    static_cast<MTLAccelerationStructureUsage>(1u << 5u);
 
 // Shared signal struct captured by GPU completion handlers.
 // Using shared_ptr ensures the struct stays alive even if MetalRtAccel is
@@ -173,12 +170,12 @@ MTLAccelerationStructureUsage MetalUsageForBuildPolicy(SceneAccelBuildPolicy pol
             break;
         case SceneAccelBuildPolicy::HardwareFastTrace:
             if (@available(macOS 26.0, *)) {
-                usage |= kAccelerationUsagePreferFastIntersection;
+                usage |= MTLAccelerationStructureUsagePreferFastIntersection;
             }
             break;
         case SceneAccelBuildPolicy::HardwareCompactMemory:
             if (@available(macOS 26.0, *)) {
-                usage |= kAccelerationUsageMinimizeMemory;
+                usage |= MTLAccelerationStructureUsageMinimizeMemory;
             }
             break;
         case SceneAccelBuildPolicy::HardwareDynamicUpdate:
@@ -188,6 +185,10 @@ MTLAccelerationStructureUsage MetalUsageForBuildPolicy(SceneAccelBuildPolicy pol
             break;
     }
     return usage;
+}
+
+bool ShouldCompactBuildPolicy(SceneAccelBuildPolicy policy) {
+    return policy == SceneAccelBuildPolicy::HardwareCompactMemory;
 }
 
 std::string MetalUsageFlagsLabel(MTLAccelerationStructureUsage usage) {
@@ -211,10 +212,10 @@ std::string MetalUsageFlagsLabel(MTLAccelerationStructureUsage usage) {
         append("extended_limits");
     }
     if (@available(macOS 26.0, *)) {
-        if ((usage & kAccelerationUsagePreferFastIntersection) != 0) {
+        if ((usage & MTLAccelerationStructureUsagePreferFastIntersection) != 0) {
             append("prefer_fast_intersection");
         }
-        if ((usage & kAccelerationUsageMinimizeMemory) != 0) {
+        if ((usage & MTLAccelerationStructureUsageMinimizeMemory) != 0) {
             append("minimize_memory");
         }
     }
@@ -255,6 +256,8 @@ void PopulateSoftwarePolicyStats(SceneAccelBuildStats& stats) {
         "software BVH primitive identity is derived from packed scene triangle and sphere indices";
     stats.intersectionFunctionStrategy =
         "software analytic triangle/sphere/rectangle intersection";
+    stats.compactionSupported = false;
+    stats.compactionPolicy = "software_bvh_not_compacted";
 }
 
 void PopulateHardwarePolicyStats(SceneAccelBuildStats& stats,
@@ -268,6 +271,10 @@ void PopulateHardwarePolicyStats(SceneAccelBuildStats& stats,
     stats.metalUsageFlags = MetalUsageFlagsLabel(MetalUsageForBuildPolicy(policy));
     stats.deviceSupportsHardwareRaytracing = true;
     stats.estimatedUniqueGeometryBytes = plan.uniqueGeometryBytes;
+    stats.compactionSupported = ShouldCompactBuildPolicy(policy);
+    stats.compactionPolicy = ShouldCompactBuildPolicy(policy)
+        ? "compact_memory_policy_queries_compacted_size_and_copy_compacts_blas_tlas"
+        : "not_requested_for_selected_policy";
     stats.identityStable = plan.instanceToBlasIndex.size() > 0u ||
                            plan.instancePrimitiveCount == 0u;
     stats.identityStrategy =
@@ -278,48 +285,104 @@ void PopulateHardwarePolicyStats(SceneAccelBuildStats& stats,
         "native Metal triangle acceleration for mesh BLAS; spheres/rectangles use shader-side analytic fallback; custom intersection functions are disabled";
 }
 
-void PumpMainThreadEventsBriefly() {
-    if (![NSThread isMainThread]) {
-        [NSThread sleepForTimeInterval:0.001];
-        return;
-    }
-    NSApplication* app = [NSApplication sharedApplication];
-    if (!app) {
-        [NSThread sleepForTimeInterval:0.001];
-        return;
-    }
-    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:0.001];
-    NSArray<NSString*>* modes = @[
-        NSDefaultRunLoopMode,
-        NSEventTrackingRunLoopMode,
-        NSModalPanelRunLoopMode
-    ];
-    for (NSString* mode in modes) {
-        while (true) {
-            NSEvent* event = [app nextEventMatchingMask:NSEventMaskAny
-                                              untilDate:deadline
-                                                 inMode:mode
-                                                dequeue:YES];
-            if (!event) {
-                break;
-            }
-            [app sendEvent:event];
-        }
-    }
-}
+using LoadEventPump::WaitForCommandBufferResponsive;
 
-void WaitForCommandBufferResponsive(id<MTLCommandBuffer> commandBuffer) {
-    if (!commandBuffer) {
-        return;
+bool CompactAccelerationStructureIfBeneficial(id<MTLDevice> device,
+                                              id<MTLCommandQueue> queue,
+                                              id<MTLAccelerationStructure> source,
+                                              NSUInteger originalSize,
+                                              id<MTLAccelerationStructure>* outAccelerationStructure,
+                                              uint64_t* outSizeBytes) {
+    if (outAccelerationStructure) {
+        *outAccelerationStructure = source;
     }
-    while (true) {
-        const MTLCommandBufferStatus status = commandBuffer.status;
-        if (status == MTLCommandBufferStatusCompleted ||
-            status == MTLCommandBufferStatusError) {
-            break;
+    if (outSizeBytes) {
+        *outSizeBytes = static_cast<uint64_t>(originalSize);
+    }
+    if (!device || !queue || !source || originalSize == 0u) {
+        return false;
+    }
+
+    id<MTLBuffer> sizeBuffer =
+        [device newBufferWithLength:sizeof(uint64_t) options:MTLResourceStorageModeShared];
+    if (!sizeBuffer) {
+        return false;
+    }
+    std::memset([sizeBuffer contents], 0, sizeof(uint64_t));
+
+    id<MTLCommandBuffer> sizeCommandBuffer = [queue commandBuffer];
+    if (!sizeCommandBuffer) {
+        return false;
+    }
+    sizeCommandBuffer.label = @"AS Compacted Size Query";
+    id<MTLAccelerationStructureCommandEncoder> sizeEncoder =
+        [sizeCommandBuffer accelerationStructureCommandEncoder];
+    if (!sizeEncoder) {
+        [sizeCommandBuffer commit];
+        WaitForCommandBufferResponsive(sizeCommandBuffer);
+        return false;
+    }
+    if (@available(macOS 12.0, *)) {
+        [sizeEncoder writeCompactedAccelerationStructureSize:source
+                                                    toBuffer:sizeBuffer
+                                                      offset:0
+                                                sizeDataType:MTLDataTypeULong];
+    } else {
+        [sizeEncoder writeCompactedAccelerationStructureSize:source
+                                                    toBuffer:sizeBuffer
+                                                      offset:0];
+    }
+    [sizeEncoder endEncoding];
+    [sizeCommandBuffer commit];
+    WaitForCommandBufferResponsive(sizeCommandBuffer);
+    if (sizeCommandBuffer.status != MTLCommandBufferStatusCompleted || sizeCommandBuffer.error) {
+        return false;
+    }
+
+    uint64_t compactedSize = 0u;
+    std::memcpy(&compactedSize, [sizeBuffer contents], sizeof(uint64_t));
+    if (compactedSize == 0u || compactedSize >= static_cast<uint64_t>(originalSize)) {
+        if (outSizeBytes) {
+            *outSizeBytes = static_cast<uint64_t>(originalSize);
         }
-        PumpMainThreadEventsBriefly();
+        return true;
     }
+
+    id<MTLAccelerationStructure> compacted =
+        [device newAccelerationStructureWithSize:static_cast<NSUInteger>(compactedSize)];
+    if (!compacted) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> compactCommandBuffer = [queue commandBuffer];
+    if (!compactCommandBuffer) {
+        return false;
+    }
+    compactCommandBuffer.label = @"AS Copy And Compact";
+    id<MTLAccelerationStructureCommandEncoder> compactEncoder =
+        [compactCommandBuffer accelerationStructureCommandEncoder];
+    if (!compactEncoder) {
+        [compactCommandBuffer commit];
+        WaitForCommandBufferResponsive(compactCommandBuffer);
+        return false;
+    }
+    [compactEncoder copyAndCompactAccelerationStructure:source
+                               toAccelerationStructure:compacted];
+    [compactEncoder endEncoding];
+    [compactCommandBuffer commit];
+    WaitForCommandBufferResponsive(compactCommandBuffer);
+    if (compactCommandBuffer.status != MTLCommandBufferStatusCompleted ||
+        compactCommandBuffer.error) {
+        return false;
+    }
+
+    if (outAccelerationStructure) {
+        *outAccelerationStructure = compacted;
+    }
+    if (outSizeBytes) {
+        *outSizeBytes = compactedSize;
+    }
+    return true;
 }
 
 }  // namespace
@@ -356,33 +419,43 @@ public:
             instanceInfos.reserve(input.meshCount);
             instanceAabbs.reserve(input.meshCount);
 
-            uint32_t triangleBaseOffset = 0;
-            for (uint32_t i = 0; i < input.meshCount; ++i) {
-                const SceneAccelMeshInput& mesh = input.meshes[i];
+            // Instances of one mesh (the same vertex and index buffers, the key the hardware path shares its BLAS by) share
+            // one software BLAS. The BLAS is built in object space from those buffers alone; traversal moves the ray into
+            // the instance's space and adds the instance's own triangleBaseOffset to the BLAS's local primitive indices
+            // (visibility.metal), so a shared BLAS traverses exactly like a copy built for each instance.
+            struct SharedBlas {
+                uint32_t nodeBase;
+                uint32_t primBase;
+                uint32_t usedNodeCount;
+                simd::float3 localMin;
+                simd::float3 localMax;
+            };
+            std::unordered_map<MeshGeometryKey, SharedBlas, MeshGeometryKeyHasher> sharedBlasByGeometry;
+            uint32_t sharedBlasInstanceCount = 0u;
+            uint32_t instancePrimitiveCount = 0u;  // triangles over all instances, as reported before the sharing
+            // One BLAS, built from the mesh's object-space vertices exactly as the serial loop below used to build it,
+            // returned as copies of tinybvh's nodes and primitive order so the loop can pack it in its original place.
+            struct BuiltBlas {
+                std::vector<tinybvh::BVH::BVHNode> nodes;
+                std::vector<uint32_t> primIdx;
+                uint32_t usedNodeCount = 0u;
+                simd::float3 localMin{};
+                simd::float3 localMax{};
+            };
+            auto buildBlas = [](const SceneAccelMeshInput& mesh, BuiltBlas& out) {
                 const uint32_t triCount = mesh.indexCount / 3u;
-                if (!mesh.vertexBuffer || !mesh.indexBuffer || triCount == 0) {
-                    instanceInfos.push_back({});
-                    instanceAabbs.push_back({{0,0,0}, {0,0,0}});
-                    continue;
-                }
-
                 const uint8_t* vbase = reinterpret_cast<const uint8_t*>([mesh.vertexBuffer contents]);
                 const uint32_t* indices = reinterpret_cast<const uint32_t*>([mesh.indexBuffer contents]);
-                if (!vbase || !indices) {
-                    instanceInfos.push_back({});
-                    instanceAabbs.push_back({{0,0,0}, {0,0,0}});
-                    triangleBaseOffset += triCount;
-                    continue;
-                }
-
+                simd::float3 localMin{};
+                simd::float3 localMax{};
                 // Build per-mesh triangles in OBJECT SPACE for BLAS
                 // tinyBVH expects bvhvec4 format: 3 vertices per triangle, each as (x,y,z,w)
                 std::vector<tinybvh::bvhvec4> blasVerts;
                 blasVerts.reserve(triCount * 3);
-                simd::float3 localMin{std::numeric_limits<float>::max(),
+                localMin = simd::float3{std::numeric_limits<float>::max(),
                                       std::numeric_limits<float>::max(),
                                       std::numeric_limits<float>::max()};
-                simd::float3 localMax{-std::numeric_limits<float>::max(),
+                localMax = simd::float3{-std::numeric_limits<float>::max(),
                                       -std::numeric_limits<float>::max(),
                                       -std::numeric_limits<float>::max()};
 
@@ -420,45 +493,157 @@ public:
                 blas.Build(blasVerts.data(), triCount);
 
                 // Convert tinyBVH nodes to our format and pack them
-                uint32_t nodeBase = static_cast<uint32_t>(packedBlasNodes.size());
-                uint32_t primBase = static_cast<uint32_t>(packedBlasPrimIndices.size());
-
-                // tinyBVH uses node index 0 and 1 is typically reserved, start from node 2
-                uint32_t usedNodeCount = blas.usedNodes;
-                const uint32_t invalidIndex = std::numeric_limits<uint32_t>::max();
-                for (uint32_t n = 0; n < usedNodeCount; ++n) {
-                    const tinybvh::BVH::BVHNode& srcNode = blas.bvhNode[n];
-                    PathTracerShaderTypes::BvhNode dstNode{};
-                    dstNode.boundsMin = simd_make_float4(srcNode.aabbMin.x, srcNode.aabbMin.y, srcNode.aabbMin.z, 0.0f);
-                    dstNode.boundsMax = simd_make_float4(srcNode.aabbMax.x, srcNode.aabbMax.y, srcNode.aabbMax.z, 0.0f);
-                    if (srcNode.triCount > 0) {
-                        // Leaf nodes refer to triangle ranges; no child nodes.
-                        dstNode.leftChild = invalidIndex;
-                        dstNode.rightChild = invalidIndex;
-                        dstNode.primitiveOffset = srcNode.leftFirst;
-                        dstNode.primitiveCount = srcNode.triCount;
-                    } else {
-                        // Interior nodes reference children relative to this mesh's node segment.
-                        uint32_t leftChildIndex = nodeBase + srcNode.leftFirst;
-                        uint32_t rightChildIndex = nodeBase + srcNode.leftFirst + 1;
-                        if (srcNode.leftFirst >= usedNodeCount) {
-                            leftChildIndex = invalidIndex;
-                        }
-                        if ((srcNode.leftFirst + 1u) >= usedNodeCount) {
-                            rightChildIndex = invalidIndex;
-                        }
-                        dstNode.leftChild = leftChildIndex;
-                        dstNode.rightChild = rightChildIndex;
-                        dstNode.primitiveOffset = 0;
-                        dstNode.primitiveCount = 0;
+                out.usedNodeCount = blas.usedNodes;
+                out.nodes.assign(blas.bvhNode, blas.bvhNode + blas.usedNodes);
+                out.primIdx.assign(blas.primIdx, blas.primIdx + triCount);
+                out.localMin = localMin;
+                out.localMax = localMax;
+            };
+            // The BLAS of different geometries are built in parallel, in chunks of at most kParallelBlasBuilds BLAS and
+            // kParallelBlasChunkTriangles triangles, or one larger mesh alone (which bounds the copies held before packing), in the order their first
+            // instance appears; the loop below then packs each one where the serial build put it, so the packed arrays
+            // are byte-for-byte the serial ones.
+            constexpr size_t kParallelBlasBuilds = 8u;
+            constexpr uint64_t kParallelBlasChunkTriangles = 3u * 1024u * 1024u;
+            std::vector<uint32_t> blasJobs;  // first instance of each geometry, in instance order
+            {
+                std::unordered_map<MeshGeometryKey, uint32_t, MeshGeometryKeyHasher> seen;
+                for (uint32_t i = 0; i < input.meshCount; ++i) {
+                    const SceneAccelMeshInput& mesh = input.meshes[i];
+                    if (!mesh.vertexBuffer || !mesh.indexBuffer || mesh.indexCount / 3u == 0u ||
+                        ![mesh.vertexBuffer contents] || ![mesh.indexBuffer contents]) {
+                        continue;
                     }
-                    packedBlasNodes.push_back(dstNode);
+                    const MeshGeometryKey key{
+                        .vertexBuffer = (__bridge const void*)mesh.vertexBuffer,
+                        .indexBuffer = (__bridge const void*)mesh.indexBuffer,
+                        .vertexStride = mesh.vertexStride,
+                        .vertexCount = mesh.vertexCount,
+                        .indexCount = mesh.indexCount,
+                    };
+                    if (seen.emplace(key, i).second) {
+                        blasJobs.push_back(i);
+                    }
+                }
+            }
+            std::vector<BuiltBlas> chunkBlas;
+            size_t chunkBegin = 0u;
+            size_t chunkEnd = 0u;
+            size_t nextBlasJob = 0u;
+            auto buildChunkFrom = [&](size_t first) {
+                chunkBegin = first;
+                chunkEnd = first;
+                uint64_t triangles = 0u;
+                while (chunkEnd < blasJobs.size() && chunkEnd - chunkBegin < kParallelBlasBuilds) {
+                    const uint64_t next = input.meshes[blasJobs[chunkEnd]].indexCount / 3u;
+                    if (chunkEnd > chunkBegin && triangles + next > kParallelBlasChunkTriangles) {
+                        break;  // a chunk holds at most this many triangles, or one mesh of any size
+                    }
+                    triangles += next;
+                    ++chunkEnd;
+                }
+                chunkBlas.clear();
+                chunkBlas.resize(chunkEnd - chunkBegin);
+                BuiltBlas* results = chunkBlas.data();
+                const uint32_t* jobs = blasJobs.data() + chunkBegin;
+                const SceneAccelMeshInput* meshes = input.meshes;
+                const auto* build = &buildBlas;
+                dispatch_apply(chunkEnd - chunkBegin, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
+                    @autoreleasepool {
+                        (*build)(meshes[jobs[k]], results[k]);
+                    }
+                });
+            };
+            uint32_t triangleBaseOffset = 0;
+            for (uint32_t i = 0; i < input.meshCount; ++i) {
+                const SceneAccelMeshInput& mesh = input.meshes[i];
+                const uint32_t triCount = mesh.indexCount / 3u;
+                if (!mesh.vertexBuffer || !mesh.indexBuffer || triCount == 0) {
+                    instanceInfos.push_back({});
+                    instanceAabbs.push_back({{0,0,0}, {0,0,0}});
+                    continue;
                 }
 
-                // Pack primitive indices from tinyBVH
-                for (uint32_t p = 0; p < triCount; ++p) {
-                    packedBlasPrimIndices.push_back(blas.primIdx[p]);
+                const uint8_t* vbase = reinterpret_cast<const uint8_t*>([mesh.vertexBuffer contents]);
+                const uint32_t* indices = reinterpret_cast<const uint32_t*>([mesh.indexBuffer contents]);
+                if (!vbase || !indices) {
+                    instanceInfos.push_back({});
+                    instanceAabbs.push_back({{0,0,0}, {0,0,0}});
+                    triangleBaseOffset += triCount;
+                    continue;
                 }
+
+                const MeshGeometryKey geometryKey{
+                    .vertexBuffer = (__bridge const void*)mesh.vertexBuffer,
+                    .indexBuffer = (__bridge const void*)mesh.indexBuffer,
+                    .vertexStride = mesh.vertexStride,
+                    .vertexCount = mesh.vertexCount,
+                    .indexCount = mesh.indexCount,
+                };
+                uint32_t nodeBase = 0u;
+                uint32_t primBase = 0u;
+                uint32_t usedNodeCount = 0u;
+                simd::float3 localMin{};
+                simd::float3 localMax{};
+                auto shared = sharedBlasByGeometry.find(geometryKey);
+                if (shared != sharedBlasByGeometry.end()) {
+                    nodeBase = shared->second.nodeBase;
+                    primBase = shared->second.primBase;
+                    usedNodeCount = shared->second.usedNodeCount;
+                    localMin = shared->second.localMin;
+                    localMax = shared->second.localMax;
+                    ++sharedBlasInstanceCount;
+                } else {
+                    if (nextBlasJob >= chunkEnd) {
+                        buildChunkFrom(nextBlasJob);
+                    }
+                    BuiltBlas built = std::move(chunkBlas[nextBlasJob - chunkBegin]);
+                    ++nextBlasJob;
+                    localMin = built.localMin;
+                    localMax = built.localMax;
+                    nodeBase = static_cast<uint32_t>(packedBlasNodes.size());
+                    primBase = static_cast<uint32_t>(packedBlasPrimIndices.size());
+
+                    // tinyBVH uses node index 0 and 1 is typically reserved, start from node 2
+                    usedNodeCount = built.usedNodeCount;
+                    const uint32_t invalidIndex = std::numeric_limits<uint32_t>::max();
+                    for (uint32_t n = 0; n < usedNodeCount; ++n) {
+                        const tinybvh::BVH::BVHNode& srcNode = built.nodes[n];
+                        PathTracerShaderTypes::BvhNode dstNode{};
+                        dstNode.boundsMin = simd_make_float4(srcNode.aabbMin.x, srcNode.aabbMin.y, srcNode.aabbMin.z, 0.0f);
+                        dstNode.boundsMax = simd_make_float4(srcNode.aabbMax.x, srcNode.aabbMax.y, srcNode.aabbMax.z, 0.0f);
+                        if (srcNode.triCount > 0) {
+                            // Leaf nodes refer to triangle ranges; no child nodes.
+                            dstNode.leftChild = invalidIndex;
+                            dstNode.rightChild = invalidIndex;
+                            dstNode.primitiveOffset = srcNode.leftFirst;
+                            dstNode.primitiveCount = srcNode.triCount;
+                        } else {
+                            // Interior nodes reference children relative to this mesh's node segment.
+                            uint32_t leftChildIndex = nodeBase + srcNode.leftFirst;
+                            uint32_t rightChildIndex = nodeBase + srcNode.leftFirst + 1;
+                            if (srcNode.leftFirst >= usedNodeCount) {
+                                leftChildIndex = invalidIndex;
+                            }
+                            if ((srcNode.leftFirst + 1u) >= usedNodeCount) {
+                                rightChildIndex = invalidIndex;
+                            }
+                            dstNode.leftChild = leftChildIndex;
+                            dstNode.rightChild = rightChildIndex;
+                            dstNode.primitiveOffset = 0;
+                            dstNode.primitiveCount = 0;
+                        }
+                        packedBlasNodes.push_back(dstNode);
+                    }
+
+                    // Pack primitive indices from tinyBVH
+                    for (uint32_t p = 0; p < triCount; ++p) {
+                        packedBlasPrimIndices.push_back(built.primIdx[p]);
+                    }
+                    sharedBlasByGeometry.emplace(geometryKey,
+                                                 SharedBlas{nodeBase, primBase, usedNodeCount, localMin, localMax});
+                }
+                instancePrimitiveCount += triCount;
 
                 // Transform local AABB to world space for TLAS
                 simd::float4 corners[8] = {
@@ -499,6 +684,9 @@ public:
                 triangleBaseOffset += triCount;
             }
             m_buildStats.blasBuildMs = (CFAbsoluteTimeGetCurrent() - blasStart) * 1000.0;
+            NSLog(@"[SoftwareBVH] %zu BLAS built for %u mesh instances; %u instances share the BLAS of an earlier "
+                  @"instance with the same vertex and index buffers (%.1f ms)",
+                  sharedBlasByGeometry.size(), input.meshCount, sharedBlasInstanceCount, m_buildStats.blasBuildMs);
 
             // Build TLAS over instance AABBs
             const CFAbsoluteTime tlasStart = CFAbsoluteTimeGetCurrent();
@@ -603,7 +791,7 @@ public:
             outProvider.software.nodeCount = 0;
             outProvider.software.primitiveCount = 0;
 
-            m_primitiveCount = static_cast<uint32_t>(packedBlasPrimIndices.size());
+            m_primitiveCount = instancePrimitiveCount;
             m_buildStats.primitiveCount = m_primitiveCount;
             m_buildStats.instanceCount = static_cast<uint32_t>(instanceInfos.size());
             m_buildStats.blasCount = static_cast<uint32_t>(instanceInfos.size());
@@ -1104,12 +1292,15 @@ public:
         m_incrementalPrimitiveDescs = nil;
         m_incrementalBlasSizes.clear();
         m_incrementalTotalBlasBytes = 0u;
+        m_incrementalOriginalBlasBytes = 0u;
         m_incrementalUniqueGeometryBytes = 0u;
         m_incrementalMaxScratch = 0u;
         m_incrementalMaxBlasScratch = 0u;
         m_incrementalTlasScratch = 0u;
         m_incrementalTotalPrimitiveCount = 0u;
         m_incrementalBuildPolicy = SceneAccelBuildPolicy::SoftwareReference;
+        m_incrementalBlasFinalSizes.clear();
+        m_incrementalCompactionWarning.clear();
         m_incrementalBlasSourceMeshIndices.clear();
         m_incrementalInstanceToBlasIndex.clear();
         m_incrementalCurrentBatch = 0u;
@@ -1137,7 +1328,6 @@ public:
             return true;
         }
 
-        const uint32_t meshCount = input.meshCount;
         const HardwareBuildPlan plan = BuildHardwareBuildPlan(input);
         m_incrementalBuildPolicy = SelectHardwareBuildPolicy(input, plan);
         const MTLAccelerationStructureUsage accelerationUsage =
@@ -1192,6 +1382,10 @@ public:
             m_incrementalMaxScratch =
                 std::max(m_incrementalMaxScratch, sizes.buildScratchBufferSize);
             m_incrementalTotalBlasBytes += static_cast<uint64_t>(sizes.accelerationStructureSize);
+            m_incrementalOriginalBlasBytes +=
+                static_cast<uint64_t>(sizes.accelerationStructureSize);
+            m_incrementalBlasFinalSizes.push_back(
+                static_cast<uint64_t>(sizes.accelerationStructureSize));
 
             id<MTLAccelerationStructure> blas =
                 [input.device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
@@ -1318,6 +1512,40 @@ public:
                     return fallbackAndComplete();
                 }
                 ++m_incrementalCurrentBatch;
+                if (ShouldCompactBuildPolicy(m_incrementalBuildPolicy)) {
+                    const NSUInteger completedBatch = m_incrementalCurrentBatch - 1u;
+                    constexpr NSUInteger kBlasBatchSize = kIncrementalBlasBatchSize;
+                    const NSUInteger batchStart = completedBatch * kBlasBatchSize;
+                    const NSUInteger batchEnd =
+                        std::min<NSUInteger>(m_blasHandles.count, batchStart + kBlasBatchSize);
+                    for (NSUInteger i = batchStart; i < batchEnd; ++i) {
+                        id<MTLAccelerationStructure> original =
+                            (id<MTLAccelerationStructure>)m_blasHandles[i];
+                        const uint64_t originalBytes =
+                            (i < m_incrementalBlasFinalSizes.size())
+                                ? m_incrementalBlasFinalSizes[i]
+                                : static_cast<uint64_t>(original ? original.allocatedSize : 0u);
+                        id<MTLAccelerationStructure> compacted = original;
+                        uint64_t compactedBytes = originalBytes;
+                        if (CompactAccelerationStructureIfBeneficial(m_incrementalInput.device,
+                                                                    queue,
+                                                                    original,
+                                                                    static_cast<NSUInteger>(originalBytes),
+                                                                    &compacted,
+                                                                    &compactedBytes)) {
+                            if (compacted && compacted != original) {
+                                [m_blasHandles replaceObjectAtIndex:i withObject:compacted];
+                            }
+                            if (i < m_incrementalBlasFinalSizes.size()) {
+                                m_incrementalBlasFinalSizes[i] = compactedBytes;
+                            }
+                        } else if (m_incrementalCompactionWarning.find("BLAS compaction unavailable") ==
+                                   std::string::npos) {
+                            m_incrementalCompactionWarning +=
+                                "; BLAS compaction unavailable for at least one structure, using un-compacted AS";
+                        }
+                    }
+                }
                 outProgress.blasBatchesDone = static_cast<uint32_t>(m_incrementalCurrentBatch);
                 outProgress.blasBatchesTotal = static_cast<uint32_t>(m_incrementalBatchCount);
                 if (m_incrementalCurrentBatch >= m_incrementalBatchCount) {
@@ -1468,6 +1696,16 @@ public:
             m_buildStats.blasScratchMemoryBytes = static_cast<uint64_t>(m_incrementalMaxBlasScratch);
             m_buildStats.tlasScratchMemoryBytes = static_cast<uint64_t>(m_incrementalTlasScratch);
             m_buildStats.retainedScratchMemoryBytes = 0u;
+            if (ShouldCompactBuildPolicy(m_incrementalBuildPolicy)) {
+                uint64_t compactedBlasBytes = 0u;
+                for (uint64_t bytes : m_incrementalBlasFinalSizes) {
+                    compactedBlasBytes += bytes;
+                }
+                if (compactedBlasBytes > 0u) {
+                    m_buildStats.blasMemoryBytes = compactedBlasBytes;
+                    m_incrementalTotalBlasBytes = compactedBlasBytes;
+                }
+            }
             HardwareBuildPlan completedPlan{};
             completedPlan.instanceToBlasIndex = m_incrementalInstanceToBlasIndex;
             completedPlan.instancePrimitiveCount = m_incrementalTotalPrimitiveCount;
@@ -1476,6 +1714,51 @@ public:
                                         m_incrementalBuildPolicy,
                                         completedPlan,
                                         m_incrementalInput);
+            if (!m_incrementalCompactionWarning.empty()) {
+                m_buildStats.buildPolicyReason += m_incrementalCompactionWarning;
+            }
+            if (ShouldCompactBuildPolicy(m_incrementalBuildPolicy) &&
+                m_incrementalOriginalBlasBytes > 0u &&
+                m_buildStats.blasMemoryBytes > 0u) {
+                m_buildStats.blasCompactionRatio =
+                    static_cast<double>(m_buildStats.blasMemoryBytes) /
+                    static_cast<double>(m_incrementalOriginalBlasBytes);
+            } else {
+                m_buildStats.blasCompactionRatio = 1.0;
+            }
+
+            if (ShouldCompactBuildPolicy(m_incrementalBuildPolicy) && m_tlas) {
+                id<MTLAccelerationStructure> compactedTlas = m_tlas;
+                uint64_t compactedTlasBytes = m_incrementalTlasSizeBytes;
+                if (CompactAccelerationStructureIfBeneficial(m_incrementalInput.device,
+                                                            queue,
+                                                            m_tlas,
+                                                            static_cast<NSUInteger>(m_incrementalTlasSizeBytes),
+                                                            &compactedTlas,
+                                                            &compactedTlasBytes)) {
+                    if (compactedTlas) {
+                        m_tlas = compactedTlas;
+                    }
+                    if (m_incrementalTlasSizeBytes > 0u && compactedTlasBytes > 0u) {
+                        m_buildStats.tlasCompactionRatio =
+                            static_cast<double>(compactedTlasBytes) /
+                            static_cast<double>(m_incrementalTlasSizeBytes);
+                    } else {
+                        m_buildStats.tlasCompactionRatio = 1.0;
+                    }
+                    m_incrementalTlasSizeBytes = compactedTlasBytes;
+                    m_buildStats.tlasMemoryBytes = compactedTlasBytes;
+                } else {
+                    m_buildStats.tlasCompactionRatio = 1.0;
+                    if (m_buildStats.buildPolicyReason.find("TLAS compaction unavailable") ==
+                        std::string::npos) {
+                        m_buildStats.buildPolicyReason +=
+                            "; TLAS compaction unavailable, using un-compacted AS";
+                    }
+                }
+            } else {
+                m_buildStats.tlasCompactionRatio = 1.0;
+            }
 
             uint64_t totalBlasAllocatedBytes = 0u;
             for (id<MTLAccelerationStructure> blasHandle in m_blasHandles) {
@@ -1508,6 +1791,14 @@ public:
 
 #if PT_DEBUG_TOOLS || PT_MNEE_SWRT_RAYS || PT_MNEE_OCCLUSION_PARITY
             if (m_softwareFallback) {
+                HardwareRtResources savedHardware = outProvider.hardware;
+                PathTracerShaderTypes::IntersectionMode savedMode = outProvider.mode;
+                m_softwareFallback->rebuild(m_incrementalInput, outProvider);
+                outProvider.hardware = savedHardware;
+                outProvider.mode = savedMode;
+            }
+#else
+            if (m_incrementalInput.buildSoftwareFallbackForHardwareDebug && m_softwareFallback) {
                 HardwareRtResources savedHardware = outProvider.hardware;
                 PathTracerShaderTypes::IntersectionMode savedMode = outProvider.mode;
                 m_softwareFallback->rebuild(m_incrementalInput, outProvider);
@@ -1547,6 +1838,7 @@ public:
         m_incrementalBlasSizes.clear();
         m_incrementalStage = IncrementalStage::Idle;
         m_incrementalTotalBlasBytes = 0u;
+        m_incrementalOriginalBlasBytes = 0u;
         m_incrementalUniqueGeometryBytes = 0u;
         m_incrementalMaxScratch = 0u;
         m_incrementalMaxBlasScratch = 0u;
@@ -1554,6 +1846,8 @@ public:
         m_incrementalTotalPrimitiveCount = 0u;
         m_incrementalBlasSourceMeshIndices.clear();
         m_incrementalInstanceToBlasIndex.clear();
+        m_incrementalBlasFinalSizes.clear();
+        m_incrementalCompactionWarning.clear();
         m_incrementalCurrentBatch = 0u;
         m_incrementalBatchCount = 0u;
         m_incrementalBlasStart = 0.0;
@@ -1735,7 +2029,7 @@ private:
                 releaseHardwareResources();
                 return false;
             }
-            PumpMainThreadEventsBriefly();
+            LoadEventPump::PumpIfDue();
         }
         m_buildStats.blasBuildMs = (CFAbsoluteTimeGetCurrent() - blasStart) * 1000.0;
 
@@ -1899,6 +2193,14 @@ private:
             outProvider.hardware = savedHardware;
             outProvider.mode = savedMode;
         }
+#else
+        if (input.buildSoftwareFallbackForHardwareDebug && m_softwareFallback) {
+            HardwareRtResources savedHardware = outProvider.hardware;
+            PathTracerShaderTypes::IntersectionMode savedMode = outProvider.mode;
+            m_softwareFallback->rebuild(input, outProvider);
+            outProvider.hardware = savedHardware;
+            outProvider.mode = savedMode;
+        }
 #endif
 
         NSLog(@"MetalRtAccel::buildHardware - TLAS ready (blasCount=%u, instanceCount=%u, primitiveCount=%u)",
@@ -1969,12 +2271,15 @@ private:
     std::vector<uint32_t> m_incrementalInstanceToBlasIndex;
     IncrementalStage m_incrementalStage = IncrementalStage::Idle;
     uint64_t m_incrementalTotalBlasBytes = 0u;
+    uint64_t m_incrementalOriginalBlasBytes = 0u;
     uint64_t m_incrementalUniqueGeometryBytes = 0u;
     NSUInteger m_incrementalMaxScratch = 0u;
     NSUInteger m_incrementalMaxBlasScratch = 0u;
     NSUInteger m_incrementalTlasScratch = 0u;
     uint32_t m_incrementalTotalPrimitiveCount = 0u;
     SceneAccelBuildPolicy m_incrementalBuildPolicy = SceneAccelBuildPolicy::SoftwareReference;
+    std::vector<uint64_t> m_incrementalBlasFinalSizes;
+    std::string m_incrementalCompactionWarning;
     NSUInteger m_incrementalCurrentBatch = 0u;
     NSUInteger m_incrementalBatchCount = 0u;
     CFAbsoluteTime m_incrementalBlasStart = 0.0;

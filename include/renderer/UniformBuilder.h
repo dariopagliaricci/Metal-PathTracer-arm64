@@ -30,7 +30,12 @@ public:
         const Accumulation& accumulation,
         const SceneResources& scene,
         CGSize renderSize);
-    
+
+    /// True when every research and debug gate is 0, so the default-features hardware
+    /// megakernel (gates folded at compile time) renders the same features as the general one.
+    /// The direct-light mode is not a gate and may have any value.
+    static bool usesOnlyDefaultFeatures(const PathTracerShaderTypes::PathtraceUniforms& uniforms);
+
     /// Build display uniforms for tonemapping
     /// @param settings Render settings
     /// @return Populated DisplayUniforms struct

@@ -291,9 +291,16 @@ metrics in the PR and explain why the new result is correct.
 5. Open a pull request against `main`. The PR description should summarize what
    changed, why it changed, which paths are affected, and any remaining risk.
 
-6. CI currently builds a source-only public headless configuration on `macos-14`
+6. CI currently builds a source-only public headless configuration on `macos-26`
    with OIDN disabled and runs `PathTracerHeadless --help`. PRs should pass CI
    before review proceeds.
+
+**How accepted pull requests reach a release.** Development happens in a private line, and each release is
+imported into this repository as a single snapshot commit. Pull requests still follow the workflow above: open
+them against `main`, pass CI, and expect review here. When a pull request is accepted, the maintainer carries the
+change into the development line, and it ships with the next release, whose changelog credits the author and the
+pull request. Changes that only concern this repository, such as documentation or CI, may be merged here directly
+between releases.
 
 ---
 

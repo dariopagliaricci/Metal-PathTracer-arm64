@@ -27,6 +27,20 @@ constexpr sampler environmentSamplerNearest(filter::nearest,
                                             address::repeat,
                                             coord::normalized);
 constant float kEpsilon = 1e-3f;
+// Internal marker shared by precise path and shadow queries.
+constant float kInterfaceMinT = 1.0e-6f;
+
+// Tungsten-source closures, texture features and transport. Pipelines.mm specializes every kernel on this constant:
+// the legacy set is built with false and compiles none of the source paths (it is the code main compiles); the
+// source set is built with true the first time a scene opts into source features. Gate source-only code on one of
+// these predicates, never directly on the material or uniform fields.
+#include "../shared/source_features.h"
+inline bool source_transport_enabled(constant PathtraceUniforms& uniforms) {
+    return kSourceFeatures && uniforms.sourceTransport != 0u;
+}
+inline bool source_opacity_present(constant PathtraceUniforms& uniforms) {
+    return kSourceFeatures && uniforms.sourceOpacityPresent != 0u;
+}
 constant float kRayOriginEpsilon = 1e-4f;
 constant float kSssThroughputCutoff = 1e-3f;
 constant float3 kLuminanceWeights = float3(0.2126f, 0.7152f, 0.0722f);
@@ -37,7 +51,6 @@ constant uint kBvhTraversalStackSize = 128u;
 constant float kHardwareOcclusionEpsilon = 5.0e-3f;
 constant float kAreaPrimitiveHitSlop = 2.0e-3f;
 constant float kSpecularNeePdfFloor = 1.0e-4f;
-constant float kSpecularNeeInvPdfClamp = 1.0e4f;
 constant float kMisWeightClampMin = 1.0e-4f;
 constant float kMisWeightClampMax = 0.9999f;
 constant uint kParityReasonHitMiss = 1u;
@@ -70,8 +83,18 @@ constant uint kDebugViewRestirSvgfVariance = 15u;
 constant uint kDebugViewRestirNanInfMask = 16u;
 constant uint kDebugViewRestirQueueStageFailure = 17u;
 constant uint kDebugViewRadianceCache = 18u;
-constant uint kWavefrontFlagEnvLodActive = 1u << 0;
+constant uint kDebugViewCausticTransport = 19u;
 constant uint kWavefrontFlagLastScatterDelta = 1u << 1;
+constant uint kWavefrontFlagPreviousMeshNee = 1u << 2;
+// The last delta scatter had no specular connection (see use_visible_emitter_mis).
+// Bit 3 is skipped because the alpha-skip path mixes path and ray flag bits.
+constant uint kWavefrontFlagLastDeltaUnpaired = 1u << 4;
+// The last scatter was in the medium (lastBsdfPdf is its phase pdf), and volume NEE ran for the rect lights there.
+constant uint kWavefrontFlagLastScatterVolume = 1u << 5;
+constant uint kWavefrontFlagVolumeRectNee = 1u << 6;
+// Existing WavefrontRay.flags tracks whether its differential is a valid
+// Pavilion planar-delta prefix; no additional queued-ray fields are needed.
+constant uint kWavefrontRayFlagPavilionSmoothDifferentials = 1u << 3;
 constant uint kDebugEventScatter = 0u;
 constant uint kDebugEventBackground = 1u;
 constant uint kDebugEventVisibleEmitter = 2u;
@@ -117,26 +140,38 @@ constant uint kDebugEventWorldReuseAudit = 43u;
 constant uint kDebugEventWorldReuseWeights = 44u;
 constant uint kDebugEventCacheReuseAudit = 45u;
 constant uint kDebugEventCacheReuseWeights = 46u;
+constant uint kDebugEventRisAuditRng = 47u;
+constant uint kDebugEventDirectLightAuditMaterialExt = 48u;
+constant uint kDebugEventRisAuditCandidate = 49u;
 constant uint kDirectLightModeLegacyRect = 0u;
 constant uint kDirectLightModeBaselineEmissive = 1u;
 constant uint kDirectLightModeRis = 2u;
 constant uint kDirectLightModeRisSpatialReuse = 3u;
+static_assert(kDirectLightModeRisSpatialReuse == 3u, "default_feature_gates_off() in common.metal tests 3u");
 constant uint kDirectLightModeRisTemporalReuse = 4u;
 constant uint kDirectLightModeRisWorldReuse = 5u;
+static_assert(kDirectLightModeRisWorldReuse == 5u, "default_feature_gates_off() in common.metal tests 5u");
 constant uint kDirectLightModeRisRegirCache = 6u;
 constant uint kDirectLightModeRestirDi = 7u;
 constant uint kDirectLightModeRestirDiRegirHybrid = 8u;
 constant uint kRestirGiModeOff = 0u;
-constant uint kRestirGiModeDiffusePrototype = 1u;
+constant uint kRestirGiModeProductionDiffuse = 1u;
 constant uint kPathGuidingModeOff = 0u;
 constant uint kPathGuidingModePrototype = 1u;
 constant uint kRestirPtModeOff = 0u;
-constant uint kRestirPtModeResearch = 1u;
-constant uint kRestirPtModeExperimentalPathReuse = 2u;
+constant uint kRestirPtModeProductionReservoirCapture = 1u;
+constant uint kRestirPtModeProductionPathReuse = 2u;
+constant uint kRestirPtModeEnhancedUnbiased = 3u;
+constant uint kRestirPtModeEnhancedBiased = 4u;
 constant uint kRadianceCacheModeOff = 0u;
 constant uint kRadianceCacheModePrototype = 1u;
 constant uint kWavefrontShadowFlagEnvironment = 1u << 0;
 constant uint kWavefrontShadowFlagEmissivePrimitive = 1u << 1;
+constant uint kWavefrontShadowFlagRectangleLight = 1u << 2;
+// Spare bits in the existing queued shadow flags; no new buffer fields.
+constant uint kWavefrontShadowFlagInterfacePrecision = 1u << 5;
+constant uint kWavefrontShadowFlagDirectional = 1u << 3;
+constant uint kWavefrontShadowFlagPavilionReceiver = 1u << 4;
 constant int kDirectLightAuditKindRect = 0;
 constant int kDirectLightAuditKindEmissivePrimitive = 1;
 

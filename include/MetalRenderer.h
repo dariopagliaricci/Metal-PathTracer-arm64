@@ -17,6 +17,7 @@ class MetalRenderer {
 public:
     struct RuntimeStatsSnapshot {
         bool available = false;
+        bool lastCommandBufferCompleted = true;
         uint32_t sampleCount = 0;
         double frameTimeMs = 0.0;
         uint64_t pathSegmentCount = 0;
@@ -36,6 +37,18 @@ public:
         bool hardwareRaytracingAvailable = false;
         bool hardwareRaytracingFallbackActive = false;
         std::string hardwareRaytracingFallbackReason;
+        std::string megakernelIntegratePipeline;
+        // Whole-render random-walk subsurface counters, PathtraceStats::sssWalkStats layout.
+        uint64_t sssWalkStats[5] = {};
+        // The same counts per material that walked, with the material's name and the render's step limit.
+        struct SssWalkMaterialStats {
+            std::string material;
+            uint64_t stats[5] = {};
+        };
+        std::vector<SssWalkMaterialStats> sssWalkMaterials;
+        uint32_t sssMaxSteps = 0;
+        std::string wavefrontDirectLightFallback;
+        std::string wavefrontMegakernelFallback;
         std::string deviceName;
         uint64_t deviceRecommendedMaxWorkingSetBytes = 0;
         bool deviceSupportsRaytracing = false;
@@ -45,11 +58,16 @@ public:
         bool deviceSupportsMetalFX = false;
         bool deviceSupportsMLBackend = false;
         std::string accelerationBuildPolicy;
+        std::string accelerationBuildPolicyReason;
+        std::string accelerationCompactionPolicy;
         std::string accelerationIdentityStrategy;
         std::string accelerationIntersectionFunctionStrategy;
         bool accelerationIdentityStable = false;
         bool accelerationCustomIntersectionFunctionsSupported = false;
         bool accelerationCustomIntersectionFunctionsEnabled = false;
+        double accelerationBlasCompactionRatio = 0.0;
+        double accelerationTlasCompactionRatio = 0.0;
+        std::string accelerationTraversalCoverage;
         uint32_t intersectionMode = 0;
         uint32_t accelerationPrimitiveCount = 0;
         uint32_t accelerationInstanceCount = 0;
@@ -86,11 +104,15 @@ public:
         uint64_t restirDiReservoirBytesEach = 0;
         uint64_t restirDiVisibilityBytes = 0;
         uint64_t restirDiDebugBytes = 0;
+        std::string restirDiPathStatus;
         uint64_t transportMemoryBytesTotal = 0;
         uint64_t transportMemoryBytesPrivate = 0;
         uint64_t transportMemoryBytesShared = 0;
         uint64_t transportMemoryBytesStaging = 0;
         uint32_t transportMemoryRecordCount = 0;
+        uint32_t transportMemoryAllocatorBackedRecordCount = 0;
+        uint32_t transportMemoryFrameGraphBackedRecordCount = 0;
+        uint32_t transportMemoryOwnershipGapRecordCount = 0;
         uint32_t transportMemoryInvalidatedRecordCount = 0;
         uint64_t primaryRayCount = 0;
         uint64_t hardwareRayCount = 0;
@@ -128,6 +150,9 @@ public:
         std::vector<std::string> passGraphExecutedPasses;
         std::vector<std::string> passGraphSkippedPasses;
         std::vector<std::string> passGraphFailedPasses;
+        bool passGraphTimingAvailable = false;
+        std::vector<std::string> passGraphTimingNames;
+        std::vector<double> passGraphTimingMs;
         std::vector<std::string> passGraphNames;
         std::vector<std::string> passGraphTypes;
         std::vector<std::string> passGraphExecutions;
@@ -147,6 +172,7 @@ public:
         std::vector<std::string> passGraphResourceTargetOwners;
         std::vector<std::string> passGraphResourceFeatureGates;
         std::vector<std::string> passGraphResourceDebugReadbackPolicies;
+        std::vector<std::string> passGraphResourceClearLoadPolicies;
         std::vector<std::string> passGraphResourceMigrationRisks;
         std::vector<int32_t> passGraphResourceFirstPasses;
         std::vector<int32_t> passGraphResourceLastPasses;
@@ -182,6 +208,8 @@ public:
         std::vector<uint32_t> transportMemoryInvalidationCounts;
         std::vector<uint32_t> transportMemoryHotPath;
         std::vector<uint32_t> transportMemoryTemporaryShared;
+        std::vector<uint32_t> transportMemoryFrameGraphOwned;
+        std::vector<uint32_t> transportMemoryAllocatorOwned;
         uint32_t mlBackendMode = 0;
         bool mlBackendRequested = false;
         bool mlBackendActive = false;
@@ -198,6 +226,7 @@ public:
         bool pipelineRuntimeSourceCompilation = true;
         bool pipelineFunctionConstantsUsed = false;
         bool pipelineMetalBinaryArchiveUsed = false;
+        bool pipelineMetalBinaryArchiveSerialized = false;
         bool pipelineHarvestedCompilationReady = false;
         uint64_t pipelineShaderSourceBytes = 0;
         double pipelineLibraryCompileMs = 0.0;
@@ -206,6 +235,7 @@ public:
         uint32_t pipelineFailedPipelineCount = 0;
         std::string pipelineCacheStrategy;
         std::string pipelineSpecializationStrategy;
+        std::string pipelineBinaryArchivePath;
         std::vector<std::string> pipelineCompileKeys;
         std::vector<std::string> pipelineCompileFunctions;
         std::vector<std::string> pipelineCompileStages;
@@ -232,6 +262,9 @@ public:
         uint64_t mneeEnvChainMaxBounceCount = 0;
         uint64_t mneeRectAddedCount = 0;
         uint64_t mneeContributionCount = 0;
+        uint64_t restirDiRegirCandidateCount = 0;
+        uint64_t restirDiRegirAcceptedCount = 0;
+        uint64_t restirDiRegirFallbackCount = 0;
         uint64_t restirGiCandidateCount = 0;
         uint64_t restirGiReservoirUpdateCount = 0;
         uint64_t restirGiAcceptCount = 0;
@@ -250,12 +283,34 @@ public:
         uint64_t restirPtReuseAppliedCount = 0;
         uint64_t restirPtReuseRejectedInvalidCount = 0;
         uint64_t restirPtReuseFallbackCount = 0;
+        uint64_t restirPtEnhancedCandidateCount = 0;
+        uint64_t restirPtEnhancedInitialSelectedCount = 0;
+        uint64_t restirPtEnhancedTemporalAcceptedCount = 0;
+        uint64_t restirPtEnhancedTemporalRejectedCount = 0;
+        uint64_t restirPtEnhancedSpatialAcceptedCount = 0;
+        uint64_t restirPtEnhancedSpatialRejectedCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftGeometryCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftMaterialCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftPdfCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftVisibilityCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftInvertibilityCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftUnsupportedCount = 0;
+        uint64_t restirPtEnhancedDuplicateScoreSum = 0;
+        uint64_t restirPtEnhancedBiasedCCapApplicationCount = 0;
+        uint64_t restirPtEnhancedVectorWeightUseCount = 0;
+        uint64_t restirPtEnhancedReplayCompactionInputCount = 0;
+        uint64_t restirPtEnhancedReplayCompactionOutputCount = 0;
+        uint64_t restirPtEnhancedFallbackCount = 0;
+        uint64_t restirPtEnhancedCanonicalSampleCount = 0;
+        uint64_t restirPtEnhancedPathLengthHistogram[8] = {};
+        uint64_t restirPtEnhancedReconnectionDepthHistogram[8] = {};
         uint64_t radianceCacheQueryCount = 0;
         uint64_t radianceCacheHitCount = 0;
         uint64_t radianceCacheMissCount = 0;
         uint64_t radianceCacheTrainCount = 0;
         uint64_t radianceCacheFallbackCount = 0;
         uint64_t radianceCacheInvalidCount = 0;
+        uint64_t radianceCacheStats[PathTracer::RadianceCacheTraining::kStatCount] = {};
         uint64_t causticEyeVertexCount = 0;
         uint64_t causticLightVertexCount = 0;
         uint64_t causticConnectionCandidateCount = 0;
@@ -271,6 +326,8 @@ public:
         uint64_t spectralMaterialLookupCount = 0;
         uint64_t spectralDispersionEventCount = 0;
         uint64_t spectralFallbackCount = 0;
+        uint64_t spectralCollapseCount = 0;
+        uint64_t spectralWavelengthChannelSampleCount = 0;
         std::vector<float> maxThroughputByBounce;
     };
 

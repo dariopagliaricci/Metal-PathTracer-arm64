@@ -8,12 +8,15 @@ namespace PathTracer {
 namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
+constexpr double kPiD = 3.14159265358979323846;
 
 inline float Luminance(const float* rgba) {
     return 0.2126f * rgba[0] + 0.7152f * rgba[1] + 0.0722f * rgba[2];
 }
 
-void BuildAliasTable(const std::vector<float>& probabilities,
+// Vose alias table, built in double and normalised by the actual sum of the
+// probabilities, so it samples in proportion to them.
+void BuildAliasTable(const std::vector<double>& probabilities,
                      std::vector<uint32_t>& aliasOut,
                      std::vector<float>& thresholdOut) {
     const size_t count = probabilities.size();
@@ -23,16 +26,19 @@ void BuildAliasTable(const std::vector<float>& probabilities,
         return;
     }
 
-    std::vector<float> scaled(count, 0.0f);
+    const double sum = std::accumulate(probabilities.begin(), probabilities.end(), 0.0);
+    const double scale = sum > 0.0 ? static_cast<double>(count) / sum : 0.0;
+
+    std::vector<double> scaled(count, 0.0);
     std::vector<size_t> small;
     std::vector<size_t> large;
     small.reserve(count);
     large.reserve(count);
 
     for (size_t i = 0; i < count; ++i) {
-        const float scaledValue = probabilities[i] * static_cast<float>(count);
+        const double scaledValue = probabilities[i] * scale;
         scaled[i] = scaledValue;
-        if (scaledValue < 1.0f) {
+        if (scaledValue < 1.0) {
             small.push_back(i);
         } else {
             large.push_back(i);
@@ -44,11 +50,11 @@ void BuildAliasTable(const std::vector<float>& probabilities,
         small.pop_back();
         size_t& largeIndex = large.back();
 
-        thresholdOut[smallIndex] = std::clamp(scaled[smallIndex], 0.0f, 1.0f);
+        thresholdOut[smallIndex] = static_cast<float>(std::clamp(scaled[smallIndex], 0.0, 1.0));
         aliasOut[smallIndex] = static_cast<uint32_t>(largeIndex);
-        scaled[largeIndex] = (scaled[largeIndex] + scaled[smallIndex]) - 1.0f;
+        scaled[largeIndex] = (scaled[largeIndex] + scaled[smallIndex]) - 1.0;
 
-        if (scaled[largeIndex] < 1.0f - 1e-7f) {
+        if (scaled[largeIndex] < 1.0) {
             small.push_back(largeIndex);
             large.pop_back();
         }
@@ -89,29 +95,35 @@ bool BuildEnvImportanceDistribution(const float* rgba32,
     }
 
     const size_t texelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
-    const float dTheta = kPi / static_cast<float>(height);
-    const float dPhi = (2.0f * kPi) / static_cast<float>(width);
+    const double dTheta = kPiD / static_cast<double>(height);
+    const double dPhi = (2.0 * kPiD) / static_cast<double>(width);
 
+    // Weights, row sums and the total accumulate in double: a float32 running
+    // total over the 8.4M texels of a 4k map comes out ~5% low, which made
+    // texelPdf integrate to ~1.05 while the alias tables sample by row sums.
+    std::vector<double> cellSolidAngles(height, 0.0);
     std::vector<float> weights(texelCount, 0.0f);
-    std::vector<float> rowWeights(height, 0.0f);
-    float totalWeight = 0.0f;
+    std::vector<double> rowWeights(height, 0.0);
+    double totalWeight = 0.0;
 
     for (uint32_t y = 0; y < height; ++y) {
-        const float theta = (static_cast<float>(y) + 0.5f) * dTheta;
-        const float sinTheta = std::sin(theta);
-        const float cellSolidAngle = std::max(sinTheta, 0.0f) * dTheta * dPhi;
+        const double theta = (static_cast<double>(y) + 0.5) * dTheta;
+        const double cellSolidAngle = std::max(std::sin(theta), 0.0) * dTheta * dPhi;
+        cellSolidAngles[y] = cellSolidAngle;
+        double rowWeight = 0.0;
         for (uint32_t x = 0; x < width; ++x) {
             const size_t index = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
             const size_t rgbaIndex = index * 4ull;
-            const float luminance = Luminance(&rgba32[rgbaIndex]);
-            const float weight = std::max(luminance, 0.0f) * cellSolidAngle;
-            weights[index] = weight;
-            rowWeights[y] += weight;
-            totalWeight += weight;
+            const double luminance = Luminance(&rgba32[rgbaIndex]);
+            const double weight = std::isfinite(luminance) ? std::max(luminance, 0.0) * cellSolidAngle : 0.0;
+            weights[index] = static_cast<float>(weight);
+            rowWeight += static_cast<double>(weights[index]);
         }
+        rowWeights[y] = rowWeight;
+        totalWeight += rowWeight;
     }
 
-    if (totalWeight <= 0.0f) {
+    if (!(totalWeight > 0.0) || !std::isfinite(totalWeight)) {
         if (error) {
             *error = "Environment map contains no positive radiance";
         }
@@ -121,32 +133,30 @@ bool BuildEnvImportanceDistribution(const float* rgba32,
     outDist->width = width;
     outDist->height = height;
     outDist->aliasCount = static_cast<uint32_t>(texelCount);
-    outDist->totalWeight = totalWeight;
+    outDist->totalWeight = static_cast<float>(totalWeight);
 
-    std::vector<float> marginalProb(height, 0.0f);
+    std::vector<double> marginalProb(height, 0.0);
     for (uint32_t y = 0; y < height; ++y) {
-        marginalProb[y] = rowWeights[y] > 0.0f ? (rowWeights[y] / totalWeight) : 0.0f;
+        marginalProb[y] = rowWeights[y] / totalWeight;
     }
     BuildAliasTable(marginalProb, outDist->marginalAlias, outDist->marginalThreshold);
 
     outDist->conditionalAlias.assign(texelCount, 0u);
     outDist->conditionalThreshold.assign(texelCount, 0.0f);
 
+    std::vector<double> conditionalProb(width, 0.0);
+    std::vector<uint32_t> aliasRow;
+    std::vector<float> thresholdRow;
     for (uint32_t y = 0; y < height; ++y) {
         const size_t rowOffset = static_cast<size_t>(y) * static_cast<size_t>(width);
-        std::vector<float> conditionalProb(width, 0.0f);
-        if (rowWeights[y] > 0.0f) {
-            const float invRowWeight = 1.0f / rowWeights[y];
+        if (rowWeights[y] > 0.0) {
             for (uint32_t x = 0; x < width; ++x) {
-                conditionalProb[x] = weights[rowOffset + x] * invRowWeight;
+                conditionalProb[x] = static_cast<double>(weights[rowOffset + x]) / rowWeights[y];
             }
         } else {
-            const float uniform = width > 0 ? 1.0f / static_cast<float>(width) : 0.0f;
-            std::fill(conditionalProb.begin(), conditionalProb.end(), uniform);
+            std::fill(conditionalProb.begin(), conditionalProb.end(), 1.0 / static_cast<double>(width));
         }
 
-        std::vector<uint32_t> aliasRow;
-        std::vector<float> thresholdRow;
         BuildAliasTable(conditionalProb, aliasRow, thresholdRow);
         for (uint32_t x = 0; x < width; ++x) {
             const size_t index = rowOffset + x;
@@ -155,15 +165,18 @@ bool BuildEnvImportanceDistribution(const float* rgba32,
         }
     }
 
+    // texelPdf is the solid-angle density of the alias sampler (a texel drawn
+    // with probability weight / totalWeight, uniform over its cell).
     outDist->texelPdf.assign(texelCount, 0.0f);
     for (uint32_t y = 0; y < height; ++y) {
-        const float theta = (static_cast<float>(y) + 0.5f) * dTheta;
-        const float sinTheta = std::sin(theta);
-        const float cellSolidAngle = std::max(sinTheta, 0.0f) * dTheta * dPhi;
+        const double cellSolidAngle = cellSolidAngles[y];
+        if (!(cellSolidAngle > 0.0)) {
+            continue;
+        }
         for (uint32_t x = 0; x < width; ++x) {
             const size_t index = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
-            const float probability = weights[index] / totalWeight;
-            outDist->texelPdf[index] = (cellSolidAngle > 0.0f) ? (probability / cellSolidAngle) : 0.0f;
+            const double probability = static_cast<double>(weights[index]) / totalWeight;
+            outDist->texelPdf[index] = static_cast<float>(probability / cellSolidAngle);
         }
     }
 
@@ -202,17 +215,22 @@ EnvImportanceSample SampleEnvironmentCpu(const EnvImportanceDistribution& dist,
     const size_t rowOffset = static_cast<size_t>(row) * static_cast<size_t>(dist.width);
     float colThreshold = dist.conditionalThreshold[rowOffset + col];
     uint32_t colAlias = dist.conditionalAlias[rowOffset + col];
+    // Reuse the selection draw by remapping its chosen alias interval, leaving
+    // a uniform texel offset without consuming another random number.
+    float jitterX = colFrac / std::max(colThreshold, 1.0e-7f);
     if (colFrac >= colThreshold) {
+        jitterX = (colFrac - colThreshold) / std::max(1.0f - colThreshold, 1.0e-7f);
         col = std::min(colAlias, dist.width - 1u);
     }
 
-    float jitterX = uConditional - std::floor(uConditional);
+    jitterX = std::clamp(jitterX, 0.0f, 0.99999994f);
     float jitterY = uJitter;
     float fx = (static_cast<float>(col) + jitterX) / static_cast<float>(dist.width);
     float fy = (static_cast<float>(row) + jitterY) / static_cast<float>(dist.height);
 
     float theta = fy * kPi;
-    float phi = fx * (2.0f * kPi);
+    // Inverse of the unchanged radiance/PDF longitude lookup.
+    float phi = (fx - 0.5f) * (2.0f * kPi);
 
     float sinTheta = std::sin(theta);
     float cosTheta = std::cos(theta);

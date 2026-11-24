@@ -265,7 +265,7 @@ inline bool path_guiding_reweight_sample_for_direction(const MaterialData materi
         return false;
     }
 
-    BsdfEvalResult eval = evaluate_bsdf(material,
+    BsdfEvalResult eval = material_closure_eval(material,
                                         position,
                                         axis,
                                         wo,
@@ -319,7 +319,7 @@ inline bool restir_reweight_bsdf_sample_for_direction(const MaterialData materia
         return false;
     }
 
-    BsdfEvalResult eval = evaluate_bsdf(material,
+    BsdfEvalResult eval = material_closure_eval(material,
                                         position,
                                         axis,
                                         wo,
@@ -431,7 +431,7 @@ inline bool apply_path_guiding_prototype(constant PathtraceUniforms& uniforms,
                                          thread uint& rngState,
                                          thread BsdfSampleResult& sample) {
     (void)pixelCoord;
-    if (uniforms.pathGuidingMode != kPathGuidingModePrototype) {
+    if (PT_DEFAULT_OFF(uniforms.pathGuidingMode) != kPathGuidingModePrototype) {
         return false;
     }
     if (!path_guiding_candidate_valid(sample, material, depth, specularOnly)) {
@@ -491,7 +491,7 @@ inline bool apply_path_guiding_prototype(constant PathtraceUniforms& uniforms,
                                                            sample.direction,
                                                            bsdfMixturePdf,
                                                            clampParams,
-                                                           uniforms.sssMode,
+                                                           PT_DEFAULT_OFF(uniforms.sssMode),
                                                            diffuseOcclusion,
                                                            specularOnly,
                                                            bsdfMixtureSample)) {
@@ -501,13 +501,13 @@ inline bool apply_path_guiding_prototype(constant PathtraceUniforms& uniforms,
         }
 
         if (rand_uniform(rngState) < guideChoiceProbability) {
-            BsdfEvalResult eval = evaluate_bsdf(material,
+            BsdfEvalResult eval = material_closure_eval(material,
                                                 position,
                                                 query.normal,
                                                 wo,
                                                 guidedSample.direction,
                                                 clampParams,
-                                                uniforms.sssMode,
+                                                PT_DEFAULT_OFF(uniforms.sssMode),
                                                 diffuseOcclusion,
                                                 specularOnly);
             const float guidedBsdfPdf = (eval.directionalPdf > 0.0f) ? eval.directionalPdf : eval.pdf;
@@ -522,7 +522,7 @@ inline bool apply_path_guiding_prototype(constant PathtraceUniforms& uniforms,
                                                            guidedSample.direction,
                                                            guidedMixturePdf,
                                                            clampParams,
-                                                           uniforms.sssMode,
+                                                           PT_DEFAULT_OFF(uniforms.sssMode),
                                                            diffuseOcclusion,
                                                            specularOnly,
                                                            guidedBsdfSample)) {

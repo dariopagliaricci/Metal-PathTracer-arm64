@@ -28,6 +28,7 @@ struct SceneAccelBuildInput {
     uint32_t sphereCount = 0;
     const SceneAccelMeshInput* meshes = nullptr;
     uint32_t meshCount = 0;
+    bool buildSoftwareFallbackForHardwareDebug = false;
 };
 
 struct SceneAccelConfig {
@@ -69,6 +70,7 @@ struct SceneAccelBuildStats {
     uint64_t retainedScratchMemoryBytes = 0;  // Scratch still resident after build.
     std::string buildPolicyLabel;
     std::string buildPolicyReason;
+    std::string compactionPolicy;
     std::string metalUsageFlags;
     std::string identityStrategy;
     std::string intersectionFunctionStrategy;

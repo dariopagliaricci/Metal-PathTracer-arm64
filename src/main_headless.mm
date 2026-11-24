@@ -4,9 +4,11 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <locale>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -17,20 +19,78 @@
 #include <unordered_set>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "MetalRenderer.h"
 #include "headless/EmbreeHeadlessRenderer.h"
+#include "renderer/SettingsUtils.h"
 #include "headless/MetalHeadlessRenderer.h"
 #include "headless/IHeadlessRenderer.h"
 #include "renderer/RenderSettings.h"
+#include "renderer/SpectralSensor.h"
 #include "renderer/ImageWriter.h"
 #include "renderer/OidnCpuDenoiser.h"
 #include "renderer/MetalContext.h"
+#include "renderer/Pipelines.h"
 #include "renderer/SceneManager.h"
 #include "renderer/SceneResources.h"
 
 namespace fs = std::filesystem;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kMiB = 1024.0 * 1024.0;
+
+bool EnvFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return false;
+    }
+    std::string lower;
+    for (const char* p = value; *p; ++p) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+    }
+    return lower != "0" && lower != "false" && lower != "no";
+}
+
+bool WavefrontShadeIndirectEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_INDIRECT");
+    return enabled;
+}
+
+bool WavefrontShadeIndirectProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_INDIRECT_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeSurfaceProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_SURFACE_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeMetadataProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_METADATA_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeScalarProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_SCALAR_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeBsdfProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_BSDF_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeClosureProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_CLOSURE_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadowIndirectEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADOW_INDIRECT");
+    return enabled;
+}
 
 uint64_t CurrentAllocatedSizeBytes(id<MTLDevice> device) {
     if (!device) {
@@ -59,6 +119,12 @@ enum class RenderProfile {
     Final = 3,
     Reference = 4,
     Debug = 5,
+};
+
+enum class RenderMode {
+    Auto = 0,
+    MetalFinalFrame = 1,
+    CpuReferenceHeadless = 2,
 };
 
 struct CliOptions {
@@ -96,6 +162,8 @@ struct CliOptions {
 
     float envIntensity = 0.0f;
     bool envIntensitySet = false;
+    float envBackgroundScale = 1.0f;
+    bool envBackgroundScaleSet = false;
 
     uint32_t tonemapMode = 0;
     bool tonemapSet = false;
@@ -123,6 +191,22 @@ struct CliOptions {
     bool wavefrontSchedulingPolicySet = false;
     bool wavefrontCompactionEnabled = true;
     bool wavefrontCompactionEnabledSet = false;
+    bool wavefrontShadeIndirectEnabled = false;
+    bool wavefrontShadeIndirectEnabledSet = false;
+    bool wavefrontShadeIndirectProbeEnabled = false;
+    bool wavefrontShadeIndirectProbeEnabledSet = false;
+    bool wavefrontShadeSurfaceProbeEnabled = false;
+    bool wavefrontShadeSurfaceProbeEnabledSet = false;
+    bool wavefrontShadeMetadataProbeEnabled = false;
+    bool wavefrontShadeMetadataProbeEnabledSet = false;
+    bool wavefrontShadeScalarProbeEnabled = false;
+    bool wavefrontShadeScalarProbeEnabledSet = false;
+    bool wavefrontShadeClosureProbeEnabled = false;
+    bool wavefrontShadeClosureProbeEnabledSet = false;
+    bool wavefrontShadeBsdfProbeEnabled = false;
+    bool wavefrontShadeBsdfProbeEnabledSet = false;
+    bool wavefrontShadowIndirectEnabled = false;
+    bool wavefrontShadowIndirectEnabledSet = false;
     PathTracer::RenderSettings::DirectLightMode directLightMode =
         PathTracer::RenderSettings::DirectLightMode::LegacyRect;
     bool directLightModeSet = false;
@@ -198,6 +282,8 @@ struct CliOptions {
     bool spectralDispersionStrengthSet = false;
     bool spectralDebug = false;
     bool spectralDebugSet = false;
+    uint32_t spectralWavelengthsPerPath = 3;
+    bool spectralWavelengthsPerPathSet = false;
     PathTracer::RenderSettings::MlBackendMode mlBackendMode =
         PathTracer::RenderSettings::MlBackendMode::Off;
     bool mlBackendModeSet = false;
@@ -239,6 +325,8 @@ struct CliOptions {
     bool restirDebugMetricsJsonProvided = false;
     std::string cameraSearchReportPath;
     bool cameraSearchReportProvided = false;
+    RenderMode renderMode = RenderMode::Auto;
+    bool renderModeSet = false;
     RenderProfile renderProfile = RenderProfile::Custom;
     bool renderProfileSet = false;
     bool outputMetadata = true;
@@ -274,8 +362,13 @@ struct CliOptions {
     bool denoiseUseNormalSet = false;
     bool denoiseHdr = true;
     bool denoiseHdrSet = false;
+    bool writeDenoiseGuides = false;
     bool svgfDenoiseEnabled = false;
     bool svgfDenoiseEnabledSet = false;
+    bool svgfDenoiseDirect = true;
+    bool svgfDenoiseDirectSet = false;
+    bool svgfDenoiseIndirect = true;
+    bool svgfDenoiseIndirectSet = false;
     uint32_t svgfAtrousIterations = 1;
     bool svgfAtrousIterationsSet = false;
     float svgfNormalSigma = 64.0f;
@@ -316,6 +409,7 @@ struct CliOptions {
     bool dumpMaterialTexturesDirProvided = false;
 
     HeadlessBackend backend = HeadlessBackend::Metal;
+    bool backendSet = false;
 #if PT_DEBUG_TOOLS
     bool debugPath = false;
     bool debugPathSet = false;
@@ -354,32 +448,42 @@ void PrintUsage(const char* exe) {
               << "  --height=<int>                Override render height (>=8)\n"
               << "  --sppTotal=<int>              Total samples to accumulate (default 1024)\n"
               << "  --spp=<int>                   Alias for --sppTotal\n"
+              << "  --renderMode=<metal_final_frame|cpu_reference_headless>\n"
+              << "                                 Select user-facing render intention before expert overrides\n"
               << "  --renderProfile=<custom|preview|lookdev|final|reference|debug>\n"
               << "                                 Apply explicit production defaults before CLI overrides\n"
               << "  --maxDepth=<int>              Override max path depth\n"
               << "  --threads=<int>               Max worker threads (Embree only)\n"
-              << "  --seed=<int>                  Fixed RNG seed (0 = random)\n"
+              << "  --seed=<int>                  RNG seed base (including 0)\n"
               << "  --enableSoftwareRayTracing[=0|1]  Force software tracing kernels\n"
               << "  --force-hwrt[=0|1]             Require Metal hardware ray tracing\n"
               << "  --force-swrt[=0|1]             Require Metal software BVH tracing\n"
               << "  --executionMode=<megakernel|wavefront>  Select Metal execution path (default megakernel)\n"
               << "  --wavefront-policy=<preview|final|offline|research>  Wavefront scheduling policy\n"
               << "  --wavefront-compaction=<0|1>   Enable explicit wavefront queue compaction pass\n"
+              << "  --wavefront-shade-indirect=<0|1> Enable guarded shade active-count indirect debug path\n"
+              << "  --wavefront-shade-indirect-probe=<0|1> Run non-mutating shade active-count indirect probe before direct shade\n"
+              << "  --wavefront-shade-surface-probe=<0|1> Run non-mutating shade surface-resolution indirect probe before direct shade\n"
+              << "  --wavefront-shade-metadata-probe=<0|1> Run non-mutating material-only closure-metadata indirect probe before direct shade\n"
+              << "  --wavefront-shade-scalar-probe=<0|1> Run non-mutating material-only scalar indirect probe before direct shade\n"
+              << "  --wavefront-shade-closure-probe=<0|1> Run non-mutating shade closure-metadata indirect probe before direct shade\n"
+              << "  --wavefront-shade-bsdf-probe=<0|1> Run non-mutating shade BSDF-sampling indirect probe before direct shade\n"
+              << "  --wavefront-shadow-indirect=<0|1> Enable guarded compact shadow active-count indirect path\n"
               << "  --enableMnee[=0|1]             Enable MNEE caustics (default 0)\n"
               << "  --enableSpecularNee[=0|1]      Enable specular NEE (default 1)\n\n"
-              << "R2/R3/R4/R5/R6/R7 direct-light and guiding controls:\n"
+              << "Direct-light and guiding controls:\n"
               << "  --directLightMode=<legacy|baseline_emissive|ris|ris_spatial|ris_temporal|ris_world|ris_regir|restir_di|restir_di_regir_hybrid>\n"
               << "                                 Select direct-light path (default legacy)\n"
               << "  --ris-m=<int>                  RIS candidate count used when directLightMode=ris/ris_spatial/ris_temporal/ris_world/ris_regir/restir_di/restir_di_regir_hybrid (default 8)\n"
-              << "  --spatial-reuse-k=<int>        R3 same-frame neighbor count for directLightMode=ris_spatial (default 4)\n"
-              << "  --world-reuse-cell-size=<float> R5/R6 checkpoint world-grid cell size for directLightMode=ris_world/ris_regir (default 0.5)\n"
-              << "  --restirGiMode=<off|restir_gi_prototype|restir_gi_diffuse>  Gated production BSDF-backed diffuse/PBR indirect reuse (default off)\n"
+              << "  --spatial-reuse-k=<int>        Same-frame neighbor count for directLightMode=ris_spatial (default 4)\n"
+              << "  --world-reuse-cell-size=<float> World-grid cell size for directLightMode=ris_world/ris_regir (default 0.5)\n"
+              << "  --restirGiMode=<off|restir_gi_production|restir_gi_diffuse>  Production BSDF-backed diffuse/PBR indirect reuse (default off)\n"
               << "  --pathGuidingMode=<off|path_guiding>  Gated MIS path guiding with world-grid directional bins (default off)\n"
               << "  --pathGuidingStrength=<float>  Guided strategy probability scale in [0,1] (default 0.35)\n"
               << "  --pathGuidingCellSize=<float>  World-space path guiding cell size (default 1.0)\n"
               << "  --pathGuidingTrainingInterval=<int>  Train guiding every N frames (default 1)\n"
-              << "  --restirPtMode=<off|restir_pt_research|restir_pt_experimental_path_reuse>  Gated production path-reservoir capture/reuse modes (default off)\n"
-              << "  --restirPtMaxReservoirs=<int>  Max R8 path reservoir captures per frame (default 4096)\n"
+              << "  --restirPtMode=<off|restir_pt_reservoir_capture|restir_pt_path_reuse|restir_pt_enhanced_unbiased|restir_pt_enhanced_biased>  Production path-reservoir capture/reuse modes (default off)\n"
+              << "  --restirPtMaxReservoirs=<int>  Max path reservoir captures per frame (default 4096)\n"
               << "  --restirPtDebug[=0|1]         Enable PT reservoir debug counter path (default 0)\n"
               << "  --restirPtReuseStrength=<float>  Production path reuse strength in [0,1] (default 0.25)\n"
               << "  --radianceCacheMode=<off|radiance_cache>  Gated rough-indirect radiance cache (default off)\n"
@@ -388,7 +492,7 @@ void PrintUsage(const char* exe) {
               << "  --radianceCacheMinConfidence=<float>  Minimum cache confidence in [0,1] (default 0.35)\n"
               << "  --radianceCacheTrainingInterval=<int>  Train cache every N frames (default 1)\n"
               << "  --radianceCacheMaxRadiance=<float>  Quantized cache radiance clamp (default 16)\n"
-              << "  --causticTransportMode=<off|path_space>  Gated path-space caustic transport prototype (default off)\n"
+              << "  --causticTransportMode=<off|path_space>  Gated path-space caustic connection transport (default off)\n"
               << "  --causticMaxVertices=<int>  Bounded caustic path vertex budget (default 4096)\n"
               << "  --volumeTransportMode=<off|homogeneous>  Gated homogeneous participating medium (default off)\n"
               << "  --volumeSigmaA=<r,g,b>       Homogeneous absorption coefficients\n"
@@ -403,8 +507,9 @@ void PrintUsage(const char* exe) {
               << "  --spectralMaxNm=<float>      Spectral sampling upper bound in nm (default 720)\n"
               << "  --spectralDispersionStrength=<float>  Cauchy-style dielectric dispersion scale\n"
               << "  --spectralDebug[=0|1]        Enable spectral diagnostics metadata (default 0)\n"
+              << "  --spectralWavelengthsPerPath=<1|3>  Wavelengths carried per path in spectral mode (default 3)\n"
               << "  --bias-check[=0|1]             Compare M=1 RIS against baseline emissive NEE for the current scene\n\n"
-              << "R2 closure controls:\n"
+              << "RIS closure controls:\n"
               << "  --validate-ris[=0|1]           Run RIS closure harness for the current scene\n"
               << "  --validate-ris-frames=<int>    Frame count used for RIS closure harness (default 512)\n"
               << "  --validate-ris-reference=<path> Baseline reference PFM used for RIS comparison\n"
@@ -422,12 +527,14 @@ void PrintUsage(const char* exe) {
               << "  --max-texture-bytes=<bytes>    Texture budget cap used with --budget-policy\n\n"
               << "Environment overrides:\n"
               << "  --envRotation=<deg>           Environment rotation in degrees\n"
-              << "  --envIntensity=<float>        Environment intensity multiplier\n\n"
+              << "  --envIntensity=<float>        Environment intensity multiplier\n"
+              << "  --envBackgroundScale=<float>  Depth-zero HDR background capture calibration (default 1)\n\n"
               << "Backend selection:\n"
               << "  --backend=<metal|embree>       Headless backend (default metal)\n"
               << "  --enableEmbree[=0|1]           Alias for --backend embree\n\n"
               << "Tonemapping overrides (for LDR outputs):\n"
-              << "  --tonemap=<1|2|3|4>           1=Linear, 2=ACES, 3=Reinhard, 4=Hable\n"
+              << "  --tonemap=<1|2|3|4|5|6>       1=Linear, 2=ACES, 3=Reinhard, 4=Hable, 5=Exponential,\n"
+              << "                                 6=Filmic (Tungsten; built-in gamma, no sRGB/gamma encode)\n"
               << "  --exposure=<float>            Exposure in stops\n\n"
               << "Offline beauty controls:\n"
               << "  --firefly-clamp-mode=<off|luminance|maxcomponent>\n"
@@ -442,14 +549,18 @@ void PrintUsage(const char* exe) {
               << "  --denoise[=0|1]               Run OIDN as a CPU postprocess after rendering\n"
               << "  --denoise-use-albedo[=0|1]    Use albedo guide AOV when available (default 1)\n"
               << "  --denoise-use-normal[=0|1]    Use normal guide AOV when available (default 1)\n"
+              << "  --writeDenoiseGuides[=0|1]    Also write the OIDN albedo/normal guides as <output>_albedo.exr /\n"
+              << "                                <output>_normal.exr (linear), e.g. to denoise merged chunk renders\n"
               << "  --denoise-hdr[=0|1]           Treat denoise input as linear HDR radiance (default 1)\n"
               << "  --svgfDenoise[=0|1]           Run Metal SVGF spatiotemporal variance-guided denoise (default 0)\n"
+              << "  --svgf-denoise-direct[=0|1]   Include direct-light component in split SVGF denoise (default 1)\n"
+              << "  --svgf-denoise-indirect[=0|1] Include indirect-light component in split SVGF denoise (default 1)\n"
               << "  --svgf-atrous-iterations=<n>  A-trous filter iterations for --svgfDenoise (1-5, default 1)\n"
               << "  --svgf-normal-sigma=<float>   Normal edge weight for --svgfDenoise (default 64)\n"
               << "  --svgf-albedo-sigma=<float>   Albedo edge weight for --svgfDenoise (default 16)\n"
               << "  --svgf-luminance-sigma=<float> Luminance edge weight for --svgfDenoise (default 4)\n"
-              << "  --mlBackendMode=<off|reconstruction_noop> Optional ML reconstruction backend contract (default off)\n"
-              << "  --mlModelPackage=<path>        Optional model package path recorded in metrics\n"
+              << "  --mlBackendMode=<off|reconstruction_noop|reconstruction_tiny> Optional ML reconstruction backend (default off)\n"
+              << "  --mlModelPackage=<path>        PTMLRECONv1 package for reconstruction_tiny\n"
               << "  --mlDebug[=0|1]                Include ML backend debug/capability reporting\n"
               << "  --pbrMetrics[=0|1]            Print and write PBR metrics sidecar JSON\n"
               << "  --pbrMetricsJson=<path>       Override PBR metrics JSON path\n"
@@ -465,11 +576,11 @@ void PrintUsage(const char* exe) {
               << "  --tileSize=<w,h>              Tile dimensions recorded in tile manifests\n"
               << "  --materialMrDebugJson=<path>  Write first-hit Material_MR debug JSON\n"
               << "  --directLightAuditJson=<path> Write deterministic per-light NEE audit JSON\n"
-              << "  --restirDebug[=0|1]           Enable R16 ReSTIR debug inspector plumbing (default 0)\n"
-              << "  --restirDebugView=<beauty|candidate_source_id|reservoir_confidence|regir_cell_id|path_guiding_used_mask|restir_pt_reuse_mask|svgf_variance|nan_inf_mask>\n"
+              << "  --restirDebug[=0|1]           Enable ReSTIR debug inspector plumbing (default 0)\n"
+              << "  --restirDebugView=<beauty|candidate_source_id|reservoir_confidence|regir_cell_id|path_guiding_used_mask|restir_pt_reuse_mask|svgf_variance|nan_inf_mask|radiance_cache|caustic_transport>\n"
               << "                                 Select derived ReSTIR debug output view (default beauty)\n"
               << "  --restirDebugCounters[=0|1]   Include ReSTIR debug counter audit state (default 0)\n"
-              << "  --restirDebugMetricsJson=<path> Write compact R16 debug inspector JSON\n"
+              << "  --restirDebugMetricsJson=<path> Write compact debug inspector JSON\n"
               << "  --cameraSearchReport=<path>   Write runtime landmark/projection JSON for camera search\n"
               << "  --verbose                     Print progress updates with percentage and ETA\n"
               << "  --debug-landmarks            Dump runtime landmark transforms and render emissive markers\n"
@@ -585,6 +696,58 @@ std::optional<uint32_t> JsonUInt32(NSDictionary* dictionary, NSString* key) {
     return static_cast<uint32_t>(std::max<long long>([(NSNumber*)value longLongValue], 0));
 }
 
+std::optional<uint64_t> JsonUInt64(NSDictionary* dictionary, NSString* key) {
+    id value = [dictionary objectForKey:key];
+    if (![value isKindOfClass:[NSNumber class]]) {
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(std::max<long long>([(NSNumber*)value longLongValue], 0));
+}
+
+std::optional<float> JsonFloat(NSDictionary* dictionary, NSString* key) {
+    id value = [dictionary objectForKey:key];
+    if (![value isKindOfClass:[NSNumber class]]) {
+        return std::nullopt;
+    }
+    return static_cast<float>([(NSNumber*)value doubleValue]);
+}
+
+std::optional<bool> JsonBool(NSDictionary* dictionary, NSString* key) {
+    id value = [dictionary objectForKey:key];
+    if (![value isKindOfClass:[NSNumber class]]) {
+        return std::nullopt;
+    }
+    return [(NSNumber*)value boolValue] ? true : false;
+}
+
+bool ApplyBudgetPolicyName(const std::string& value, CliOptions& options, std::string& error) {
+    if (value == "strict") {
+        options.budgetPolicy = PathTracer::TextureBudgetPolicy::Strict;
+    } else if (value == "warn") {
+        options.budgetPolicy = PathTracer::TextureBudgetPolicy::Warn;
+    } else if (value == "ignore") {
+        options.budgetPolicy = PathTracer::TextureBudgetPolicy::Ignore;
+    } else {
+        error = "Invalid budget_policy in JSON: " + value;
+        return false;
+    }
+    return true;
+}
+
+bool ApplyPilotModeName(const std::string& value, CliOptions& options, std::string& error) {
+    if (value == "full_clamped") {
+        options.pilotMode = PathTracer::PilotMode::FullClamped;
+    } else if (value == "geo_only") {
+        options.pilotMode = PathTracer::PilotMode::GeoOnly;
+    } else if (value == "albedo_only") {
+        options.pilotMode = PathTracer::PilotMode::AlbedoOnly;
+    } else {
+        error = "Invalid pilot_mode in JSON: " + value;
+        return false;
+    }
+    return true;
+}
+
 bool ApplyRenderProfileName(const std::string& value, CliOptions& options, std::string& error) {
     std::string lower;
     lower.reserve(value.size());
@@ -611,6 +774,61 @@ bool ApplyRenderProfileName(const std::string& value, CliOptions& options, std::
     return true;
 }
 
+bool ApplyRenderModeName(const std::string& value, CliOptions& options, std::string& error) {
+    std::string lower;
+    lower.reserve(value.size());
+    for (char c : value) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower == "auto") {
+        options.renderMode = RenderMode::Auto;
+        options.renderModeSet = false;
+    } else if (lower == "metal_final_frame") {
+        options.renderMode = RenderMode::MetalFinalFrame;
+        options.renderModeSet = true;
+    } else if (lower == "cpu_reference_headless") {
+        options.renderMode = RenderMode::CpuReferenceHeadless;
+        options.renderModeSet = true;
+    } else {
+        error = "Invalid render_mode in JSON: " + value;
+        return false;
+    }
+    return true;
+}
+
+bool ApplyRenderModeDefaults(CliOptions& options, std::string& error) {
+    if (!options.renderModeSet) {
+        options.renderMode =
+            options.backend == HeadlessBackend::Embree ? RenderMode::CpuReferenceHeadless
+                                                       : RenderMode::MetalFinalFrame;
+        return true;
+    }
+
+    switch (options.renderMode) {
+        case RenderMode::MetalFinalFrame:
+            if (options.backendSet && options.backend != HeadlessBackend::Metal) {
+                error = "--renderMode=metal_final_frame requires --backend=metal";
+                return false;
+            }
+            options.backend = HeadlessBackend::Metal;
+            break;
+        case RenderMode::CpuReferenceHeadless:
+            if (options.backendSet && options.backend != HeadlessBackend::Embree) {
+                error = "--renderMode=cpu_reference_headless requires --backend=embree";
+                return false;
+            }
+            options.backend = HeadlessBackend::Embree;
+            break;
+        case RenderMode::Auto:
+        default:
+            options.renderMode =
+                options.backend == HeadlessBackend::Embree ? RenderMode::CpuReferenceHeadless
+                                                           : RenderMode::MetalFinalFrame;
+            break;
+    }
+    return true;
+}
+
 bool ApplyRenderQueueDictionary(NSDictionary* root, CliOptions& options, std::string& error) {
     if (NSDictionary* queueItem = JsonObject(root, @"queue_item")) {
         root = queueItem;
@@ -629,6 +847,12 @@ bool ApplyRenderQueueDictionary(NSDictionary* root, CliOptions& options, std::st
             error = "Invalid backend in render queue item JSON: " + *backend;
             return false;
         }
+        options.backendSet = true;
+    }
+    if (auto renderMode = JsonString(root, @"render_mode")) {
+        if (!ApplyRenderModeName(*renderMode, options, error)) {
+            return false;
+        }
     }
     if (auto output = JsonString(root, @"output")) {
         options.outputPath = *output;
@@ -644,6 +868,59 @@ bool ApplyRenderQueueDictionary(NSDictionary* root, CliOptions& options, std::st
     if (auto profile = JsonString(root, @"render_profile")) {
         if (!ApplyRenderProfileName(*profile, options, error)) {
             return false;
+        }
+    }
+    if (auto outputMetadata = JsonBool(root, @"output_metadata")) {
+        options.outputMetadata = *outputMetadata;
+        options.outputMetadataSet = true;
+    }
+    if (auto outputMetadataJson = JsonString(root, @"output_metadata_json")) {
+        options.outputMetadataJsonPath = *outputMetadataJson;
+        options.outputMetadataJsonProvided = true;
+    }
+    if (auto settingsJson = JsonString(root, @"settings_json")) {
+        options.settingsJsonPath = *settingsJson;
+        options.settingsJsonProvided = true;
+    }
+    if (auto queueJson = JsonString(root, @"render_queue_item_json")) {
+        options.renderQueueItemJsonPath = *queueJson;
+        options.renderQueueItemJsonProvided = true;
+    }
+    if (auto debugBundle = JsonString(root, @"debug_bundle_dir")) {
+        options.debugBundleDir = *debugBundle;
+        options.debugBundleDirProvided = true;
+    }
+    if (auto checkpointJson = JsonString(root, @"checkpoint_manifest_json")) {
+        options.checkpointManifestJsonPath = *checkpointJson;
+        options.checkpointManifestJsonProvided = true;
+    }
+    if (auto tileJson = JsonString(root, @"tile_manifest_json")) {
+        options.tileManifestJsonPath = *tileJson;
+        options.tileManifestJsonProvided = true;
+    }
+    if (auto pbrMetrics = JsonBool(root, @"pbr_metrics")) {
+        options.pbrMetrics = *pbrMetrics;
+    }
+    if (auto pbrMetricsJson = JsonString(root, @"pbr_metrics_json")) {
+        options.pbrMetricsJsonPath = *pbrMetricsJson;
+        options.pbrMetricsJsonProvided = true;
+    }
+    if (NSDictionary* tileSize = JsonObject(root, @"tile_size")) {
+        if (auto width = JsonUInt32(tileSize, @"width")) {
+            options.tileWidth = std::max(*width, 1u);
+            options.tileSizeSet = true;
+        }
+        if (auto height = JsonUInt32(tileSize, @"height")) {
+            options.tileHeight = std::max(*height, 1u);
+            options.tileSizeSet = true;
+        }
+        if (options.tileSizeSet) {
+            if (options.tileWidth == 0u) {
+                options.tileWidth = 512u;
+            }
+            if (options.tileHeight == 0u) {
+                options.tileHeight = 512u;
+            }
         }
     }
 
@@ -664,6 +941,42 @@ bool ApplyRenderQueueDictionary(NSDictionary* root, CliOptions& options, std::st
         if (auto seed = JsonUInt32(settings, @"fixed_rng_seed")) {
             options.seed = *seed;
             options.seedSet = true;
+        }
+        if (auto compact = JsonBool(settings, @"wavefront_compaction_enabled")) {
+            options.wavefrontCompactionEnabled = *compact;
+            options.wavefrontCompactionEnabledSet = true;
+        }
+        if (auto shadeIndirect = JsonBool(settings, @"wavefront_shade_indirect_enabled")) {
+            options.wavefrontShadeIndirectEnabled = *shadeIndirect;
+            options.wavefrontShadeIndirectEnabledSet = true;
+        }
+        if (auto shadeProbe = JsonBool(settings, @"wavefront_shade_indirect_probe_enabled")) {
+            options.wavefrontShadeIndirectProbeEnabled = *shadeProbe;
+            options.wavefrontShadeIndirectProbeEnabledSet = true;
+        }
+        if (auto surfaceProbe = JsonBool(settings, @"wavefront_shade_surface_probe_enabled")) {
+            options.wavefrontShadeSurfaceProbeEnabled = *surfaceProbe;
+            options.wavefrontShadeSurfaceProbeEnabledSet = true;
+        }
+        if (auto metadataProbe = JsonBool(settings, @"wavefront_shade_metadata_probe_enabled")) {
+            options.wavefrontShadeMetadataProbeEnabled = *metadataProbe;
+            options.wavefrontShadeMetadataProbeEnabledSet = true;
+        }
+        if (auto scalarProbe = JsonBool(settings, @"wavefront_shade_scalar_probe_enabled")) {
+            options.wavefrontShadeScalarProbeEnabled = *scalarProbe;
+            options.wavefrontShadeScalarProbeEnabledSet = true;
+        }
+        if (auto closureProbe = JsonBool(settings, @"wavefront_shade_closure_probe_enabled")) {
+            options.wavefrontShadeClosureProbeEnabled = *closureProbe;
+            options.wavefrontShadeClosureProbeEnabledSet = true;
+        }
+        if (auto bsdfProbe = JsonBool(settings, @"wavefront_shade_bsdf_probe_enabled")) {
+            options.wavefrontShadeBsdfProbeEnabled = *bsdfProbe;
+            options.wavefrontShadeBsdfProbeEnabledSet = true;
+        }
+        if (auto shadowIndirect = JsonBool(settings, @"wavefront_shadow_indirect_enabled")) {
+            options.wavefrontShadowIndirectEnabled = *shadowIndirect;
+            options.wavefrontShadowIndirectEnabledSet = true;
         }
         if (auto execution = JsonString(settings, @"execution_mode")) {
             if (*execution == "wavefront") {
@@ -695,6 +1008,262 @@ bool ApplyRenderQueueDictionary(NSDictionary* root, CliOptions& options, std::st
             }
             options.wavefrontSchedulingPolicySet = true;
         }
+        if (auto direct = JsonString(settings, @"direct_light_mode")) {
+            if (*direct == "legacy" || *direct == "legacy_rect") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::LegacyRect;
+            } else if (*direct == "baseline_emissive") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::BaselineEmissive;
+            } else if (*direct == "ris") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::Ris;
+            } else if (*direct == "ris_spatial") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::RisSpatialReuse;
+            } else if (*direct == "ris_temporal") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::RisTemporalReuse;
+            } else if (*direct == "ris_world") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::RisWorldReuse;
+            } else if (*direct == "ris_regir") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::RisRegirCache;
+            } else if (*direct == "restir_di") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::RestirDi;
+            } else if (*direct == "restir_di_regir_hybrid") {
+                options.directLightMode = PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+            } else {
+                error = "Invalid direct_light_mode in render queue item JSON: " + *direct;
+                return false;
+            }
+            options.directLightModeSet = true;
+        }
+        if (auto risM = JsonUInt32(settings, @"ris_candidate_count")) {
+            options.risCandidateCount = std::max(*risM, 1u);
+            options.risCandidateCountSet = true;
+        }
+        if (auto specNee = JsonBool(settings, @"enable_specular_nee")) {
+            options.enableSpecularNee = *specNee;
+            options.enableSpecularNeeSet = true;
+        }
+        if (auto mnee = JsonBool(settings, @"enable_mnee")) {
+            options.enableMnee = *mnee;
+            options.enableMneeSet = true;
+        }
+        if (auto restirGi = JsonString(settings, @"restir_gi_mode")) {
+            if (*restirGi == "off") {
+                options.restirGiMode = PathTracer::RenderSettings::RestirGiMode::Off;
+            } else if (*restirGi == "restir_gi_production" || *restirGi == "production_diffuse") {
+                options.restirGiMode = PathTracer::RenderSettings::RestirGiMode::ProductionDiffuse;
+            } else {
+                error = "Invalid restir_gi_mode in render queue item JSON: " + *restirGi;
+                return false;
+            }
+            options.restirGiModeSet = true;
+        }
+        if (auto guiding = JsonString(settings, @"path_guiding_mode")) {
+            if (*guiding == "off") {
+                options.pathGuidingMode = PathTracer::RenderSettings::PathGuidingMode::Off;
+            } else if (*guiding == "prototype" || *guiding == "path_guiding") {
+                options.pathGuidingMode = PathTracer::RenderSettings::PathGuidingMode::Prototype;
+            } else {
+                error = "Invalid path_guiding_mode in render queue item JSON: " + *guiding;
+                return false;
+            }
+            options.pathGuidingModeSet = true;
+        }
+        if (auto restirPt = JsonString(settings, @"restir_pt_mode")) {
+            if (*restirPt == "off") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::Off;
+            } else if (*restirPt == "reservoir_capture" ||
+                       *restirPt == "production_reservoir_capture" ||
+                       *restirPt == "restir_pt_reservoir_capture") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::ProductionReservoirCapture;
+            } else if (*restirPt == "path_reuse" ||
+                       *restirPt == "production_path_reuse" ||
+                       *restirPt == "restir_pt_path_reuse") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::ProductionPathReuse;
+            } else if (*restirPt == "enhanced_unbiased" ||
+                       *restirPt == "restir_pt_enhanced_unbiased") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased;
+            } else if (*restirPt == "enhanced_biased" ||
+                       *restirPt == "restir_pt_enhanced_biased") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::EnhancedBiased;
+            } else {
+                error = "Invalid restir_pt_mode in render queue item JSON: " + *restirPt;
+                return false;
+            }
+            options.restirPtModeSet = true;
+        }
+        if (auto cache = JsonString(settings, @"radiance_cache_mode")) {
+            if (*cache == "off") {
+                options.radianceCacheMode = PathTracer::RenderSettings::RadianceCacheMode::Off;
+            } else if (*cache == "production" || *cache == "prototype" || *cache == "radiance_cache") {
+                options.radianceCacheMode = PathTracer::RenderSettings::RadianceCacheMode::Production;
+            } else {
+                error = "Invalid radiance_cache_mode in render queue item JSON: " + *cache;
+                return false;
+            }
+            options.radianceCacheModeSet = true;
+        }
+        if (auto caustic = JsonString(settings, @"caustic_transport_mode")) {
+            if (*caustic == "off") {
+                options.causticTransportMode = PathTracer::RenderSettings::CausticTransportMode::Off;
+            } else if (*caustic == "path_space") {
+                options.causticTransportMode =
+                    PathTracer::RenderSettings::CausticTransportMode::PathSpacePrototype;
+            } else {
+                error = "Invalid caustic_transport_mode in render queue item JSON: " + *caustic;
+                return false;
+            }
+            options.causticTransportModeSet = true;
+        }
+        if (auto spectral = JsonString(settings, @"spectral_rendering_mode")) {
+            if (*spectral == "off") {
+                options.spectralRenderingMode = PathTracer::RenderSettings::SpectralRenderingMode::Off;
+            } else if (*spectral == "hero_wavelength") {
+                options.spectralRenderingMode = PathTracer::RenderSettings::SpectralRenderingMode::HeroWavelength;
+            } else {
+                error = "Invalid spectral_rendering_mode in render queue item JSON: " + *spectral;
+                return false;
+            }
+            options.spectralRenderingModeSet = true;
+        }
+        if (auto wavelengths = JsonUInt32(settings, @"spectral_wavelengths_per_path")) {
+            if (*wavelengths != 1u && *wavelengths != 3u) {
+                error = "Invalid spectral_wavelengths_per_path in render queue item JSON (expected 1 or 3)";
+                return false;
+            }
+            options.spectralWavelengthsPerPath = *wavelengths;
+            options.spectralWavelengthsPerPathSet = true;
+        }
+        if (auto ml = JsonString(settings, @"ml_backend_mode")) {
+            if (*ml == "off") {
+                options.mlBackendMode = PathTracer::RenderSettings::MlBackendMode::Off;
+            } else if (*ml == "reconstruction_noop") {
+                options.mlBackendMode = PathTracer::RenderSettings::MlBackendMode::ReconstructionNoOp;
+            } else if (*ml == "reconstruction_tiny") {
+                options.mlBackendMode = PathTracer::RenderSettings::MlBackendMode::ReconstructionTiny;
+            } else {
+                error = "Invalid ml_backend_mode in render queue item JSON: " + *ml;
+                return false;
+            }
+            options.mlBackendModeSet = true;
+        }
+        if (auto mlPackage = JsonString(settings, @"ml_model_package_path")) {
+            options.mlModelPackagePath = *mlPackage;
+            options.mlModelPackagePathSet = true;
+        }
+        if (auto mlDebug = JsonBool(settings, @"ml_debug_enabled")) {
+            options.mlDebug = *mlDebug;
+            options.mlDebugSet = true;
+        }
+        if (auto restirDebug = JsonBool(settings, @"restir_debug_enabled")) {
+            options.restirDebug = *restirDebug;
+            options.restirDebugSet = true;
+        }
+        if (auto restirDebugView = JsonString(settings, @"restir_debug_view")) {
+            if (*restirDebugView == "beauty") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::Beauty;
+            } else if (*restirDebugView == "candidate_source") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::CandidateSourceId;
+            } else if (*restirDebugView == "reservoir_confidence") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::ReservoirConfidence;
+            } else if (*restirDebugView == "regir_cell") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::ReGIRCellId;
+            } else if (*restirDebugView == "path_guiding_mask") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::PathGuidingUsedMask;
+            } else if (*restirDebugView == "restir_pt_reuse") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::RestirPTReuseMask;
+            } else if (*restirDebugView == "svgf_variance") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::SVGFVariance;
+            } else if (*restirDebugView == "nan_inf") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::NaNInfMask;
+            } else if (*restirDebugView == "queue_stage_failure") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::QueueStageFailure;
+            } else if (*restirDebugView == "radiance_cache") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::RadianceCache;
+            } else if (*restirDebugView == "caustic_transport") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::CausticTransport;
+            } else {
+                error = "Invalid restir_debug_view in render queue item JSON: " + *restirDebugView;
+                return false;
+            }
+            options.restirDebugViewSet = true;
+        }
+        if (NSDictionary* environment = JsonObject(settings, @"environment")) {
+            if (auto rotation = JsonFloat(environment, @"rotation_radians")) {
+                options.envRotationDegrees = *rotation * static_cast<float>(180.0 / kPi);
+                options.envRotationSet = true;
+            }
+            if (auto intensity = JsonFloat(environment, @"intensity")) {
+                options.envIntensity = *intensity;
+                options.envIntensitySet = true;
+            }
+            if (auto scale = JsonFloat(environment, @"background_scale")) {
+                if (!std::isfinite(*scale) || *scale < 0.0f) {
+                    error = "environment.background_scale expects a finite nonnegative float";
+                    return false;
+                }
+                options.envBackgroundScale = *scale;
+                options.envBackgroundScaleSet = true;
+            }
+        }
+        if (NSDictionary* tonemap = JsonObject(settings, @"tonemap")) {
+            if (auto mode = JsonUInt32(tonemap, @"mode")) {
+                options.tonemapMode = *mode;
+                options.tonemapSet = true;
+            }
+            if (auto exposure = JsonFloat(tonemap, @"exposure")) {
+                options.exposure = *exposure;
+                options.exposureSet = true;
+            }
+        }
+        if (NSDictionary* offline = JsonObject(settings, @"offline_post")) {
+            if (auto denoise = JsonBool(offline, @"denoise_enabled")) {
+                options.denoiseEnabled = *denoise;
+                options.denoiseEnabledSet = true;
+            }
+            if (auto hdr = JsonBool(offline, @"denoise_hdr")) {
+                options.denoiseHdr = *hdr;
+                options.denoiseHdrSet = true;
+            }
+            if (auto albedo = JsonBool(offline, @"denoise_use_albedo")) {
+                options.denoiseUseAlbedo = *albedo;
+                options.denoiseUseAlbedoSet = true;
+            }
+            if (auto normal = JsonBool(offline, @"denoise_use_normal")) {
+                options.denoiseUseNormal = *normal;
+                options.denoiseUseNormalSet = true;
+            }
+            if (auto svgf = JsonBool(offline, @"svgf_denoise_enabled")) {
+                options.svgfDenoiseEnabled = *svgf;
+                options.svgfDenoiseEnabledSet = true;
+            }
+            if (auto svgfDirect = JsonBool(offline, @"svgf_denoise_direct")) {
+                options.svgfDenoiseDirect = *svgfDirect;
+                options.svgfDenoiseDirectSet = true;
+            }
+            if (auto svgfIndirect = JsonBool(offline, @"svgf_denoise_indirect")) {
+                options.svgfDenoiseIndirect = *svgfIndirect;
+                options.svgfDenoiseIndirectSet = true;
+            }
+        }
+        if (NSDictionary* resource = JsonObject(settings, @"resource_policy")) {
+            if (auto budget = JsonString(resource, @"budget_policy")) {
+                if (!ApplyBudgetPolicyName(*budget, options, error)) {
+                    return false;
+                }
+            }
+            if (auto pilot = JsonString(resource, @"pilot_mode")) {
+                if (!ApplyPilotModeName(*pilot, options, error)) {
+                    return false;
+                }
+            }
+            if (auto textureMaxDim = JsonUInt32(resource, @"texture_max_dim")) {
+                options.textureMaxDim = *textureMaxDim;
+                options.textureMaxDimSet = *textureMaxDim > 0u;
+            }
+            if (auto maxTextureBytes = JsonUInt64(resource, @"max_texture_bytes")) {
+                options.maxTextureBytes = *maxTextureBytes;
+                options.maxTextureBytesSet = *maxTextureBytes > 0u;
+            }
+        }
     }
     return true;
 }
@@ -705,6 +1274,37 @@ bool ApplyRenderQueueJson(const fs::path& path, CliOptions& options, std::string
         return false;
     }
     return ApplyRenderQueueDictionary(root, options, error);
+}
+
+bool ApplyCheckpointJson(const fs::path& path, CliOptions& options, std::string& error) {
+    NSDictionary* root = ReadJsonDictionary(path, error);
+    if (!root) {
+        return false;
+    }
+    const auto schema = JsonString(root, @"schema_version");
+    if (!schema || *schema != "pathtracer.render_checkpoint.v1") {
+        error = "Unsupported checkpoint schema in " + path.string() +
+                " (expected pathtracer.render_checkpoint.v1)";
+        return false;
+    }
+    const auto kind = JsonString(root, @"checkpoint_kind");
+    if (!kind || *kind != "completed_single_frame") {
+        error = "Unsupported checkpoint kind in " + path.string() +
+                " (expected completed_single_frame)";
+        return false;
+    }
+    const auto resumePolicy = JsonString(root, @"resume_policy");
+    if (!resumePolicy || *resumePolicy != "full_frame_rerender_from_checkpoint_manifest") {
+        error = "Unsupported checkpoint resume_policy in " + path.string() +
+                " (expected full_frame_rerender_from_checkpoint_manifest)";
+        return false;
+    }
+    NSDictionary* queueItem = JsonObject(root, @"queue_item");
+    if (!queueItem) {
+        error = "Checkpoint manifest is missing queue_item for deterministic resume: " + path.string();
+        return false;
+    }
+    return ApplyRenderQueueDictionary(queueItem, options, error);
 }
 
 bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string& error) {
@@ -848,6 +1448,15 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.scene = value;
             options.sceneProvided = true;
+        } else if (arg == "--renderMode" || arg == "--render-mode") {
+            if (!requireValue(arg.c_str())) {
+                return false;
+            }
+            if (!ApplyRenderModeName(value, options, error)) {
+                error = "Invalid value for " + arg +
+                        " (expected metal_final_frame or cpu_reference_headless)";
+                return false;
+            }
         } else if (arg == "--renderProfile" || arg == "--render-profile") {
             if (!requireValue(arg.c_str())) {
                 return false;
@@ -994,14 +1603,29 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                 error = "Invalid float for --envIntensity";
                 return false;
             }
+        } else if (arg == "--envBackgroundScale") {
+            if (!requireValue("--envBackgroundScale")) return false;
+            try {
+                size_t parsedLength = 0u;
+                const float parsed = std::stof(value, &parsedLength);
+                if (parsedLength != value.size() || !std::isfinite(parsed) || parsed < 0.0f) {
+                    error = "--envBackgroundScale expects a finite nonnegative float";
+                    return false;
+                }
+                options.envBackgroundScale = parsed;
+                options.envBackgroundScaleSet = true;
+            } catch (...) {
+                error = "--envBackgroundScale expects a finite nonnegative float";
+                return false;
+            }
         } else if (arg == "--tonemap") {
             if (!requireValue("--tonemap")) {
                 return false;
             }
             try {
                 int parsed = std::stoi(value);
-                if (parsed < 1 || parsed > 4) {
-                    error = "--tonemap must be in [1,4]";
+                if (parsed < 1 || parsed > 6) {
+                    error = "--tonemap must be in [1,6]";
                     return false;
                 }
                 options.tonemapMode = static_cast<uint32_t>(parsed);
@@ -1081,6 +1705,30 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.svgfDenoiseEnabled = flag;
             options.svgfDenoiseEnabledSet = true;
+        } else if (arg == "--svgf-denoise-direct" || arg == "--svgfDenoiseDirect") {
+            std::string boolValue = value;
+            if (!hasInlineValue) {
+                boolValue.clear();
+            }
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --svgf-denoise-direct";
+                return false;
+            }
+            options.svgfDenoiseDirect = flag;
+            options.svgfDenoiseDirectSet = true;
+        } else if (arg == "--svgf-denoise-indirect" || arg == "--svgfDenoiseIndirect") {
+            std::string boolValue = value;
+            if (!hasInlineValue) {
+                boolValue.clear();
+            }
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --svgf-denoise-indirect";
+                return false;
+            }
+            options.svgfDenoiseIndirect = flag;
+            options.svgfDenoiseIndirectSet = true;
         } else if (arg == "--svgf-atrous-iterations" || arg == "--svgfAtrousIterations") {
             if (!requireValue(arg.c_str())) {
                 return false;
@@ -1269,6 +1917,84 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.wavefrontCompactionEnabled = flag;
             options.wavefrontCompactionEnabledSet = true;
+        } else if (arg == "--wavefront-shade-indirect" || arg == "--wavefrontShadeIndirect") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-indirect (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeIndirectEnabled = flag;
+            options.wavefrontShadeIndirectEnabledSet = true;
+        } else if (arg == "--wavefront-shade-indirect-probe" ||
+                   arg == "--wavefrontShadeIndirectProbe") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-indirect-probe (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeIndirectProbeEnabled = flag;
+            options.wavefrontShadeIndirectProbeEnabledSet = true;
+        } else if (arg == "--wavefront-shade-surface-probe" ||
+                   arg == "--wavefrontShadeSurfaceProbe") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-surface-probe (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeSurfaceProbeEnabled = flag;
+            options.wavefrontShadeSurfaceProbeEnabledSet = true;
+        } else if (arg == "--wavefront-shade-metadata-probe" ||
+                   arg == "--wavefrontShadeMetadataProbe") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-metadata-probe (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeMetadataProbeEnabled = flag;
+            options.wavefrontShadeMetadataProbeEnabledSet = true;
+        } else if (arg == "--wavefront-shade-scalar-probe" ||
+                   arg == "--wavefrontShadeScalarProbe") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-scalar-probe (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeScalarProbeEnabled = flag;
+            options.wavefrontShadeScalarProbeEnabledSet = true;
+        } else if (arg == "--wavefront-shade-closure-probe" ||
+                   arg == "--wavefrontShadeClosureProbe") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-closure-probe (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeClosureProbeEnabled = flag;
+            options.wavefrontShadeClosureProbeEnabledSet = true;
+        } else if (arg == "--wavefront-shade-bsdf-probe" ||
+                   arg == "--wavefrontShadeBsdfProbe") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shade-bsdf-probe (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadeBsdfProbeEnabled = flag;
+            options.wavefrontShadeBsdfProbeEnabledSet = true;
+        } else if (arg == "--wavefront-shadow-indirect" || arg == "--wavefrontShadowIndirect") {
+            std::string boolValue = hasInlineValue ? value : std::string();
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --wavefront-shadow-indirect (expected 0/1/true/false)";
+                return false;
+            }
+            options.wavefrontShadowIndirectEnabled = flag;
+            options.wavefrontShadowIndirectEnabledSet = true;
         } else if (arg == "--directLightMode") {
             if (!requireValue("--directLightMode")) {
                 return false;
@@ -1326,14 +2052,16 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             if (lower == "off" || lower == "0" || lower == "disabled") {
                 options.restirGiMode = PathTracer::RenderSettings::RestirGiMode::Off;
-            } else if (lower == "restir_gi_prototype" ||
+            } else if (lower == "restir_gi_production" ||
+                       lower == "production_diffuse" ||
+                       lower == "restir_gi_prototype" ||
                        lower == "restir_gi_diffuse" ||
                        lower == "restir_gi" ||
                        lower == "diffuse_prototype" ||
                        lower == "1") {
-                options.restirGiMode = PathTracer::RenderSettings::RestirGiMode::DiffusePrototype;
+                options.restirGiMode = PathTracer::RenderSettings::RestirGiMode::ProductionDiffuse;
             } else {
-                error = "Invalid value for --restirGiMode (expected off, restir_gi_prototype, or restir_gi_diffuse)";
+                error = "Invalid value for --restirGiMode (expected off, restir_gi_production, or restir_gi_diffuse)";
                 return false;
             }
             options.restirGiModeSet = true;
@@ -1405,19 +2133,31 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             if (lower == "off" || lower == "0" || lower == "disabled") {
                 options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::Off;
-            } else if (lower == "restir_pt_research" ||
+            } else if (lower == "restir_pt_reservoir_capture" ||
+                       lower == "restir_pt_capture" ||
+                       lower == "restir_pt_research" ||
                        lower == "restir_pt_scaffold" ||
                        lower == "research" ||
                        lower == "1") {
-                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::Research;
-            } else if (lower == "restir_pt_experimental_path_reuse" ||
-                       lower == "restir_pt_path_reuse" ||
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::ProductionReservoirCapture;
+            } else if (lower == "restir_pt_path_reuse" ||
+                       lower == "restir_pt_production_path_reuse" ||
+                       lower == "restir_pt_experimental_path_reuse" ||
                        lower == "experimental_path_reuse" ||
                        lower == "path_reuse" ||
                        lower == "2") {
-                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::ExperimentalPathReuse;
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::ProductionPathReuse;
+            } else if (lower == "restir_pt_enhanced_unbiased" ||
+                       lower == "enhanced_unbiased" ||
+                       lower == "restir_pt_enhanced" ||
+                       lower == "3") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased;
+            } else if (lower == "restir_pt_enhanced_biased" ||
+                       lower == "enhanced_biased" ||
+                       lower == "4") {
+                options.restirPtMode = PathTracer::RenderSettings::RestirPtMode::EnhancedBiased;
             } else {
-                error = "Invalid value for --restirPtMode (expected off, restir_pt_research, or restir_pt_experimental_path_reuse)";
+                error = "Invalid value for --restirPtMode (expected off, restir_pt_reservoir_capture, restir_pt_path_reuse, restir_pt_enhanced_unbiased, or restir_pt_enhanced_biased)";
                 return false;
             }
             options.restirPtModeSet = true;
@@ -1531,6 +2271,12 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                 options.radianceCacheMaxRadianceSet = true;
             } catch (...) {
                 error = "Invalid float for --radianceCacheMaxRadiance";
+                return false;
+            }
+            if (!(options.radianceCacheMaxRadiance > 0.0f) ||
+                options.radianceCacheMaxRadiance > PathTracer::RadianceCacheTraining::kMaxRadianceLimit) {
+                error = "--radianceCacheMaxRadiance must be in (0, 1023]: the radiance cache stores up to 1024 "
+                        "samples per cell in fixed point, and a larger maximum leaves too little resolution";
                 return false;
             }
         } else if (arg == "--radianceCacheDebug" || arg == "--radiance-cache-debug") {
@@ -1762,6 +2508,16 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.spectralDebug = flag;
             options.spectralDebugSet = true;
+        } else if (arg == "--spectralWavelengthsPerPath" || arg == "--spectral-wavelengths-per-path") {
+            if (!requireValue(arg.c_str())) {
+                return false;
+            }
+            if (value != "1" && value != "3") {
+                error = "Invalid value for --spectralWavelengthsPerPath (expected 1 or 3)";
+                return false;
+            }
+            options.spectralWavelengthsPerPath = value == "1" ? 1u : 3u;
+            options.spectralWavelengthsPerPathSet = true;
         } else if (arg == "--mlBackendMode" || arg == "--ml-backend-mode") {
             if (!requireValue(arg.c_str())) {
                 return false;
@@ -1777,8 +2533,13 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                        lower == "reconstruction-noop" || lower == "1") {
                 options.mlBackendMode =
                     PathTracer::RenderSettings::MlBackendMode::ReconstructionNoOp;
+            } else if (lower == "tiny" || lower == "reconstruction_tiny" ||
+                       lower == "reconstruction-tiny" || lower == "custom_metal_tiny" ||
+                       lower == "custom-metal-tiny" || lower == "2") {
+                options.mlBackendMode =
+                    PathTracer::RenderSettings::MlBackendMode::ReconstructionTiny;
             } else {
-                error = "Invalid value for --mlBackendMode (expected off or reconstruction_noop)";
+                error = "Invalid value for --mlBackendMode (expected off, reconstruction_noop, or reconstruction_tiny)";
                 return false;
             }
             options.mlBackendModeSet = true;
@@ -2071,6 +2832,17 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.forcePureHWRTForGlass = flag;
             options.forcePureHWRTForGlassSet = true;
+        } else if (arg == "--writeDenoiseGuides") {
+            std::string boolValue = value;
+            if (!hasInlineValue) {
+                boolValue.clear();
+            }
+            bool flag = true;
+            if (!ParseBoolFlag(boolValue, true, flag)) {
+                error = "Invalid value for --writeDenoiseGuides";
+                return false;
+            }
+            options.writeDenoiseGuides = flag;
         } else if (arg == "--debugDisableNormalMap") {
             std::string boolValue = value;
             if (!hasInlineValue) {
@@ -2253,6 +3025,8 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                 options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::QueueStageFailure;
             } else if (lower == "radiance_cache" || lower == "cache") {
                 options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::RadianceCache;
+            } else if (lower == "caustic_transport" || lower == "caustics" || lower == "caustic") {
+                options.restirDebugView = PathTracer::RenderSettings::RestirDebugView::CausticTransport;
             } else {
                 error = "Invalid value for --restirDebugView";
                 return false;
@@ -2340,6 +3114,7 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                 error = "Invalid value for --backend (expected metal or embree)";
                 return false;
             }
+            options.backendSet = true;
         } else if (arg == "--enableEmbree") {
             std::string boolValue = value;
             if (!hasInlineValue) {
@@ -2351,6 +3126,7 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
                 return false;
             }
             options.backend = flag ? HeadlessBackend::Embree : HeadlessBackend::Metal;
+            options.backendSet = true;
         } else {
             error = "Unknown option: " + arg;
             return false;
@@ -2362,7 +3138,10 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
         return false;
     }
     if (options.resumeCheckpointJsonProvided &&
-        !ApplyRenderQueueJson(fs::path(options.resumeCheckpointJsonPath), options, error)) {
+        !ApplyCheckpointJson(fs::path(options.resumeCheckpointJsonPath), options, error)) {
+        return false;
+    }
+    if (!ApplyRenderModeDefaults(options, error)) {
         return false;
     }
 
@@ -2452,6 +3231,24 @@ const char* DirectLightModeLabel(PathTracer::RenderSettings::DirectLightMode mod
     return "unknown";
 }
 
+// The direct-light mode the backend runs: on Metal, homogeneous volumes demote ReSTIR DI to baseline_emissive
+// (RestirDiDemotedByVolume); Embree ignores volumes and runs the requested mode.
+PathTracer::RenderSettings::DirectLightMode RunDirectLightMode(const CliOptions& options,
+                                                               const PathTracer::RenderSettings& settings) {
+    return options.backend == HeadlessBackend::Metal ? PathTracer::MetalDirectLightMode(settings)
+                                                     : settings.directLightMode;
+}
+
+// Direct-light mode the backend could not run as requested because of the medium, for the render metadata: "none",
+// or "<mode> ran as baseline_emissive".
+std::string VolumeDirectLightFallbackLabel(const CliOptions& options, const PathTracer::RenderSettings& settings) {
+    const PathTracer::RenderSettings::DirectLightMode ran = RunDirectLightMode(options, settings);
+    if (ran == settings.directLightMode) {
+        return "none";
+    }
+    return std::string(DirectLightModeLabel(settings.directLightMode)) + " ran as " + DirectLightModeLabel(ran);
+}
+
 const char* WavefrontSchedulingPolicyLabel(
     PathTracer::RenderSettings::WavefrontSchedulingPolicy policy) {
     switch (policy) {
@@ -2471,8 +3268,8 @@ const char* RestirGiModeLabel(PathTracer::RenderSettings::RestirGiMode mode) {
     switch (mode) {
         case PathTracer::RenderSettings::RestirGiMode::Off:
             return "off";
-        case PathTracer::RenderSettings::RestirGiMode::DiffusePrototype:
-            return "restir_gi_prototype";
+        case PathTracer::RenderSettings::RestirGiMode::ProductionDiffuse:
+            return "restir_gi_production";
     }
     return "unknown";
 }
@@ -2491,12 +3288,21 @@ const char* RestirPtModeLabel(PathTracer::RenderSettings::RestirPtMode mode) {
     switch (mode) {
         case PathTracer::RenderSettings::RestirPtMode::Off:
             return "off";
-        case PathTracer::RenderSettings::RestirPtMode::Research:
-            return "restir_pt_research";
-        case PathTracer::RenderSettings::RestirPtMode::ExperimentalPathReuse:
-            return "restir_pt_experimental_path_reuse";
+        case PathTracer::RenderSettings::RestirPtMode::ProductionReservoirCapture:
+            return "restir_pt_reservoir_capture";
+        case PathTracer::RenderSettings::RestirPtMode::ProductionPathReuse:
+            return "restir_pt_path_reuse";
+        case PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased:
+            return "restir_pt_enhanced_unbiased";
+        case PathTracer::RenderSettings::RestirPtMode::EnhancedBiased:
+            return "restir_pt_enhanced_biased";
     }
     return "unknown";
+}
+
+bool RestirPtEnhancedActive(PathTracer::RenderSettings::RestirPtMode mode) {
+    return mode == PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased ||
+           mode == PathTracer::RenderSettings::RestirPtMode::EnhancedBiased;
 }
 
 const char* RadianceCacheModeLabel(PathTracer::RenderSettings::RadianceCacheMode mode) {
@@ -2555,6 +3361,42 @@ const char* RenderProfileMaturityLabel(RenderProfile profile) {
     }
 }
 
+const char* RenderModeLabel(RenderMode mode) {
+    switch (mode) {
+        case RenderMode::MetalFinalFrame:
+            return "metal_final_frame";
+        case RenderMode::CpuReferenceHeadless:
+            return "cpu_reference_headless";
+        case RenderMode::Auto:
+        default:
+            return "auto";
+    }
+}
+
+const char* RenderModeMaturityLabel(RenderMode mode) {
+    switch (mode) {
+        case RenderMode::MetalFinalFrame:
+            return "current_aligned_scope_limited";
+        case RenderMode::CpuReferenceHeadless:
+            return "current_foundation";
+        case RenderMode::Auto:
+        default:
+            return "inferred_from_backend";
+    }
+}
+
+const char* RenderModeContextLabel(RenderMode mode) {
+    switch (mode) {
+        case RenderMode::MetalFinalFrame:
+            return "headless_or_controlled_final_frame";
+        case RenderMode::CpuReferenceHeadless:
+            return "headless_offline_reference";
+        case RenderMode::Auto:
+        default:
+            return "inferred";
+    }
+}
+
 const char* VolumeTransportModeLabel(PathTracer::RenderSettings::VolumeTransportMode mode) {
     switch (mode) {
         case PathTracer::RenderSettings::VolumeTransportMode::Off:
@@ -2599,6 +3441,20 @@ const char* MlBackendModeLabel(PathTracer::RenderSettings::MlBackendMode mode) {
             return "off";
         case PathTracer::RenderSettings::MlBackendMode::ReconstructionNoOp:
             return "reconstruction_noop";
+        case PathTracer::RenderSettings::MlBackendMode::ReconstructionTiny:
+            return "reconstruction_tiny";
+    }
+    return "unknown";
+}
+
+const char* MlBackendConfiguredProvider(PathTracer::RenderSettings::MlBackendMode mode) {
+    switch (mode) {
+        case PathTracer::RenderSettings::MlBackendMode::Off:
+            return "disabled";
+        case PathTracer::RenderSettings::MlBackendMode::ReconstructionNoOp:
+            return "MLBackend.NoOp";
+        case PathTracer::RenderSettings::MlBackendMode::ReconstructionTiny:
+            return "MLBackend.CustomMetal.TinyReconstruction";
     }
     return "unknown";
 }
@@ -2637,6 +3493,8 @@ const char* RestirDebugViewLabel(PathTracer::RenderSettings::RestirDebugView vie
             return "queue_stage_failure";
         case PathTracer::RenderSettings::RestirDebugView::RadianceCache:
             return "radiance_cache";
+        case PathTracer::RenderSettings::RestirDebugView::CausticTransport:
+            return "caustic_transport";
     }
     return "unknown";
 }
@@ -3048,6 +3906,73 @@ void EnsureSceneDirectiveAssetPipelineReport(const CliOptions& options,
         report.stats.vertexCount += mesh.vertices.size();
         report.stats.indexCount += mesh.indices.size();
     }
+    auto addSupportMatrix = [&](std::string area, std::string status, std::string details) {
+        PathTracer::AssetSupportMatrixEntry entry{};
+        entry.area = std::move(area);
+        entry.status = std::move(status);
+        entry.details = std::move(details);
+        report.supportMatrix.push_back(std::move(entry));
+    };
+    addSupportMatrix("geometry",
+                     "supported",
+                     "scene directives support primitives plus referenced OBJ, PLY, glTF, and GLB meshes");
+    addSupportMatrix("transforms",
+                     "supported",
+                     "mesh directive transforms are preserved in renderer-native scene records");
+    addSupportMatrix("cameras",
+                     "supported",
+                     "scene directive camera records drive the shared renderer camera settings");
+    addSupportMatrix("textures",
+                     "supported",
+                     "referenced material textures use the shared SceneResources texture loader and budget policy");
+    addSupportMatrix("materials",
+                     "partial",
+                     "scene directives map renderer-native material records; full external DCC material graphs are out of scope");
+    addSupportMatrix("lights",
+                     "partial",
+                     "renderer-native emissive/directional/primitive lights are supported; external punctual-light imports require glTF diagnostics or conversion");
+    addSupportMatrix("animation",
+                     "unsupported",
+                     "scene directives are static and do not evaluate animation, skinning, or morph targets");
+    addSupportMatrix("ktx2_mip_compression",
+                     "supported",
+                     "KTX2/DDS/raster texture policy is handled by the shared texture loader");
+    addSupportMatrix("assimp_formats",
+                     "external_tool",
+                     "Assimp-supported static formats should be converted through PathTracerImport before scene directive use");
+    addSupportMatrix("usd_materialx",
+                     "out_of_scope",
+                     "USD and MaterialX are not runtime import targets in the current pipeline");
+    const auto& texturePolicy = resources.textureLoadPolicy();
+    report.texturePolicy.residencyPolicy =
+        "material textures are registered once by stable source key and promoted to private Metal textures when a device is available";
+    report.texturePolicy.mipPolicy =
+        "runtime image textures generate mip chains; KTX2/DDS source mip chains are preserved when present";
+    report.texturePolicy.compressionPolicy =
+        "KTX2 and supported DDS block-compressed textures stay compressed; common raster inputs decode to RGBA texture storage";
+    auto budgetPolicyLabel = [](PathTracer::TextureBudgetPolicy policy) {
+        switch (policy) {
+            case PathTracer::TextureBudgetPolicy::Strict: return "strict";
+            case PathTracer::TextureBudgetPolicy::Warn: return "warn";
+            case PathTracer::TextureBudgetPolicy::Ignore: return "ignore";
+        }
+        return "strict";
+    };
+    auto pilotModeLabel = [](PathTracer::PilotMode mode) {
+        switch (mode) {
+            case PathTracer::PilotMode::FullClamped: return "full_clamped";
+            case PathTracer::PilotMode::GeoOnly: return "geo_only";
+            case PathTracer::PilotMode::AlbedoOnly: return "albedo_only";
+        }
+        return "full_clamped";
+    };
+    report.texturePolicy.budgetPolicy =
+        std::string(budgetPolicyLabel(texturePolicy.policy)) + "; pilot_mode=" +
+        pilotModeLabel(texturePolicy.pilotMode);
+    report.texturePolicy.determinismPolicy =
+        "texture identity is derived from manifest output hashes, file paths, embedded data hashes, or declared scene references";
+    report.texturePolicy.maxDimension = texturePolicy.maxDimension;
+    report.texturePolicy.maxTextureBytes = texturePolicy.maxTextureBytes;
 
     auto addDiagnostic = [&](std::string severity,
                              std::string category,
@@ -3288,6 +4213,8 @@ ResolvedCameraPose ResolveCameraPose(const PathTracer::RenderSettings& settings)
     return pose;
 }
 
+bool WriteTextFileAtomic(const fs::path& path, const std::string& text, std::string& error);
+
 void WriteCameraSearchReportJson(const fs::path& jsonPath,
                                  const ResolvedCameraPose& camera,
                                  const RuntimeLandmark* scooter,
@@ -3300,11 +4227,7 @@ void WriteCameraSearchReportJson(const fs::path& jsonPath,
                                  const std::vector<const RuntimeMeshSnapshot*>& facadeCandidates,
                                  float aspect,
                                  std::string& error) {
-    std::ofstream out(jsonPath);
-    if (!out.is_open()) {
-        error = "Failed to open camera search report: " + jsonPath.string();
-        return;
-    }
+    std::ostringstream out;
     out << std::fixed << std::setprecision(9);
     out << "{\n";
     out << "  \"camera\": {\n";
@@ -3379,8 +4302,10 @@ void WriteCameraSearchReportJson(const fs::path& jsonPath,
     out << "  }\n";
     out << "}\n";
     if (!out.good()) {
-        error = "Failed while writing camera search report: " + jsonPath.string();
+        error = "Failed while composing camera search report: " + jsonPath.string();
+        return;
     }
+    (void)WriteTextFileAtomic(jsonPath, out.str(), error);
 }
 
 void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& settings) {
@@ -3408,6 +4333,9 @@ void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& se
     if (options.envIntensitySet) {
         settings.environmentIntensity = std::max(options.envIntensity, 0.0f);
     }
+    if (options.envBackgroundScaleSet) {
+        settings.environmentBackgroundScale = options.envBackgroundScale;
+    }
     if (options.enableSoftwareRayTracingSet) {
         settings.enableSoftwareRayTracing = options.enableSoftwareRayTracing;
     }
@@ -3431,6 +4359,30 @@ void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& se
     }
     if (options.wavefrontCompactionEnabledSet) {
         settings.wavefrontCompactionEnabled = options.wavefrontCompactionEnabled;
+    }
+    if (options.wavefrontShadeIndirectEnabledSet) {
+        settings.wavefrontShadeIndirectEnabled = options.wavefrontShadeIndirectEnabled;
+    }
+    if (options.wavefrontShadeIndirectProbeEnabledSet) {
+        settings.wavefrontShadeIndirectProbeEnabled = options.wavefrontShadeIndirectProbeEnabled;
+    }
+    if (options.wavefrontShadeSurfaceProbeEnabledSet) {
+        settings.wavefrontShadeSurfaceProbeEnabled = options.wavefrontShadeSurfaceProbeEnabled;
+    }
+    if (options.wavefrontShadeMetadataProbeEnabledSet) {
+        settings.wavefrontShadeMetadataProbeEnabled = options.wavefrontShadeMetadataProbeEnabled;
+    }
+    if (options.wavefrontShadeScalarProbeEnabledSet) {
+        settings.wavefrontShadeScalarProbeEnabled = options.wavefrontShadeScalarProbeEnabled;
+    }
+    if (options.wavefrontShadeClosureProbeEnabledSet) {
+        settings.wavefrontShadeClosureProbeEnabled = options.wavefrontShadeClosureProbeEnabled;
+    }
+    if (options.wavefrontShadeBsdfProbeEnabledSet) {
+        settings.wavefrontShadeBsdfProbeEnabled = options.wavefrontShadeBsdfProbeEnabled;
+    }
+    if (options.wavefrontShadowIndirectEnabledSet) {
+        settings.wavefrontShadowIndirectEnabled = options.wavefrontShadowIndirectEnabled;
     }
     if (options.directLightModeSet) {
         settings.directLightMode = options.directLightMode;
@@ -3549,6 +4501,9 @@ void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& se
     if (options.spectralDebugSet) {
         settings.spectralDebug = options.spectralDebug;
     }
+    if (options.spectralWavelengthsPerPathSet) {
+        settings.spectralWavelengthsPerPath = options.spectralWavelengthsPerPath;
+    }
     if (options.mlBackendModeSet) {
         settings.mlBackendMode = options.mlBackendMode;
     }
@@ -3647,6 +4602,12 @@ void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& se
     if (options.svgfDenoiseEnabledSet) {
         settings.svgfDenoiseEnabled = options.svgfDenoiseEnabled;
     }
+    if (options.svgfDenoiseDirectSet) {
+        settings.svgfDenoiseDirect = options.svgfDenoiseDirect;
+    }
+    if (options.svgfDenoiseIndirectSet) {
+        settings.svgfDenoiseIndirect = options.svgfDenoiseIndirect;
+    }
     if (options.svgfAtrousIterationsSet) {
         settings.svgfAtrousIterations = std::clamp(options.svgfAtrousIterations, 1u, 5u);
     }
@@ -3700,7 +4661,6 @@ void ApplyCliOverrides(const CliOptions& options, PathTracer::RenderSettings& se
         settings.debugMaxEntries = std::max<uint32_t>(settings.debugMaxEntries, 256u);
     }
     if (options.directLightAuditJsonProvided) {
-        settings.enablePathDebug = true;
         settings.debugDirectLightAudit = true;
         settings.debugMaxEntries = std::max<uint32_t>(settings.debugMaxEntries, 512u);
     }
@@ -3852,18 +4812,6 @@ const char* WorkingColorSpaceLabel(const PathTracer::RenderSettings& settings) {
     return (settings.workingColorSpace == PathTracer::RenderSettings::WorkingColorSpace::ACEScg)
         ? "ACEScg"
         : "Linear sRGB";
-}
-
-const char* FireflyClampModeLabel(CliOptions::FireflyClampMode mode) {
-    switch (mode) {
-        case CliOptions::FireflyClampMode::Luminance:
-            return "luminance";
-        case CliOptions::FireflyClampMode::MaxComponent:
-            return "maxcomponent";
-        case CliOptions::FireflyClampMode::Off:
-        default:
-            return "off";
-    }
 }
 
 fs::path AppendStemSuffix(const fs::path& path, const std::string& suffix) {
@@ -4038,7 +4986,7 @@ void PrintLargeSceneReport(const PathTracer::SceneResources& resources,
         std::cout << "[LargeScene] recommendedMaxWorkingSetSize="
                   << FormatMemoryMiB(recommendedBytes)
                   << " prebuildUsage=" << std::fixed << std::setprecision(2)
-                  << ((geometryBytes + textureBytes + accelBytes) * 100.0 /
+                  << (static_cast<double>(geometryBytes + textureBytes + accelBytes) * 100.0 /
                       static_cast<double>(recommendedBytes))
                   << "%"
                   << std::endl;
@@ -4203,10 +5151,33 @@ void PrintEmbreeCpuSceneReport(const PathTracer::SceneResources& resources) {
               << std::endl;
 }
 
+// Names every subsurface material that will not scatter under the surface with the settings of this render (the GUI
+// prints the same lines when it activates a scene).
+void PrintSubsurfaceMaterialReport(const PathTracer::SceneResources& resources,
+                                   const PathTracer::RenderSettings& settings) {
+    for (const std::string& line : PathTracer::SubsurfaceNotScatteringDiagnostics(resources, settings)) {
+        std::cout << "[SSS] " << line << std::endl;
+    }
+}
+
 void PrintEmissiveInventoryReport(const PathTracer::SceneResources& resources) {
     std::cout << "[Scene] Emissive primitives: " << resources.emissivePrimitiveCount() << std::endl;
     std::cout << "[Scene] Total emitted power: " << std::fixed << std::setprecision(4)
               << resources.totalEmittedPower() << std::endl;
+    const auto& byMaterial = resources.emittedPowerByMaterial();
+    if (!byMaterial.empty()) {
+        constexpr size_t kShown = 8u;
+        const float total = resources.totalEmittedPower();
+        std::cout << "[Scene] Emitted power by material (" << std::min(byMaterial.size(), kShown) << " largest of "
+                  << byMaterial.size() << "):";
+        for (size_t i = 0; i < byMaterial.size() && i < kShown; ++i) {
+            const auto& entry = byMaterial[i];
+            std::cout << (i > 0 ? ";" : "") << " " << resources.materialName(entry.materialIndex) << " "
+                      << std::setprecision(3) << entry.power << " (" << entry.primitiveCount << " primitives, "
+                      << std::setprecision(1) << (total > 0.0f ? 100.0f * entry.power / total : 0.0f) << "%)";
+        }
+        std::cout << std::setprecision(4) << std::endl;
+    }
     if (resources.skippedTexturedEmissivePrimitiveCount() > 0u) {
         std::cout << "[Scene] Emissive primitives skipped (textured emission): "
                   << resources.skippedTexturedEmissivePrimitiveCount() << std::endl;
@@ -4339,11 +5310,7 @@ bool WriteRisThresholdsJson(const fs::path& jsonPath,
                             double psnrMin,
                             double rmseMax,
                             std::string& error) {
-    std::ofstream out(jsonPath);
-    if (!out.is_open()) {
-        error = "Failed to open RIS thresholds JSON for writing: " + jsonPath.string();
-        return false;
-    }
+    std::ostringstream out;
     out << std::fixed << std::setprecision(9);
     out << "{\n";
     out << "  \"scene\": \"" << JsonEscapeInline(scene) << "\",\n";
@@ -4355,10 +5322,10 @@ bool WriteRisThresholdsJson(const fs::path& jsonPath,
     out << "  \"note\": \"Current Metal --validate-ris threshold record for the active official R2 emissive-primitive closure scene; see docs/RESTIR_R2_CLOSEOUT.md for validity rationale\"\n";
     out << "}\n";
     if (!out.good()) {
-        error = "Failed while writing RIS thresholds JSON: " + jsonPath.string();
+        error = "Failed while composing RIS thresholds JSON: " + jsonPath.string();
         return false;
     }
-    return true;
+    return WriteTextFileAtomic(jsonPath, out.str(), error);
 }
 
 struct ImagePbrMetrics {
@@ -4507,7 +5474,9 @@ simd::float3 HashDebugColor(uint32_t value) {
                             static_cast<float>((x >> 16u) & 0xffu) / 255.0f);
 }
 
+// directLightMode: the mode the backend ran (RunDirectLightMode), not the requested one.
 void ApplyRestirDebugView(const PathTracer::RenderSettings& settings,
+                          PathTracer::RenderSettings::DirectLightMode directLightMode,
                           HeadlessRenderOutput& output) {
     using RestirDebugView = PathTracer::RenderSettings::RestirDebugView;
     const size_t expectedValues =
@@ -4521,15 +5490,19 @@ void ApplyRestirDebugView(const PathTracer::RenderSettings& settings,
     }
 
     const bool risActive =
-        settings.directLightMode != PathTracer::RenderSettings::DirectLightMode::LegacyRect &&
-        settings.directLightMode != PathTracer::RenderSettings::DirectLightMode::BaselineEmissive;
-    const bool worldActive = RestirWorldModeActive(settings.directLightMode);
+        directLightMode != PathTracer::RenderSettings::DirectLightMode::LegacyRect &&
+        directLightMode != PathTracer::RenderSettings::DirectLightMode::BaselineEmissive;
+    const bool worldActive = RestirWorldModeActive(directLightMode);
     const bool pathGuidingUsed = output.pbrMetrics.pathGuidingUsedCount > 0u;
     const bool restirPtReuseUsed = output.pbrMetrics.restirPtReuseAppliedCount > 0u;
     const bool radianceCacheUsed = output.pbrMetrics.radianceCacheHitCount > 0u;
+    const bool causticTransportUsed =
+        output.pbrMetrics.causticEyeVertexCount > 0u ||
+        output.pbrMetrics.causticConnectionCandidateCount > 0u ||
+        output.pbrMetrics.causticDeltaChainCount > 0u;
     const bool svgfActive = settings.svgfDenoiseEnabled;
     const uint32_t modeSeed =
-        static_cast<uint32_t>(settings.directLightMode) * 17u +
+        static_cast<uint32_t>(directLightMode) * 17u +
         static_cast<uint32_t>(settings.restirGiMode) * 31u +
         static_cast<uint32_t>(settings.pathGuidingMode) * 47u +
         static_cast<uint32_t>(settings.restirPtMode) * 59u +
@@ -4613,6 +5586,27 @@ void ApplyRestirDebugView(const PathTracer::RenderSettings& settings,
                                               : simd_make_float3(0.35f, 0.08f, train);
                     break;
                 }
+                case RestirDebugView::CausticTransport: {
+                    const float connection =
+                        output.pbrMetrics.causticEyeVertexCount > 0u
+                            ? std::clamp(static_cast<float>(output.pbrMetrics.causticConnectionCandidateCount) /
+                                             static_cast<float>(output.pbrMetrics.causticEyeVertexCount),
+                                         0.0f,
+                                         1.0f)
+                            : 0.0f;
+                    const float delta =
+                        output.pbrMetrics.causticEyeVertexCount > 0u
+                            ? std::clamp(static_cast<float>(output.pbrMetrics.causticDeltaChainCount) /
+                                             static_cast<float>(output.pbrMetrics.causticEyeVertexCount),
+                                         0.0f,
+                                         1.0f)
+                            : 0.0f;
+                    const float classified =
+                        output.pbrMetrics.causticDebugClassificationCount > 0u ? 0.75f : 0.0f;
+                    color = causticTransportUsed ? simd_make_float3(connection, classified, delta)
+                                                 : simd_make_float3(0.10f, 0.10f, 0.10f);
+                    break;
+                }
                 case RestirDebugView::Beauty:
                     break;
             }
@@ -4662,7 +5656,7 @@ void WriteJsonStringArray(std::ofstream& outFile, const std::vector<std::string>
     outFile << "]";
 }
 
-void WriteAssetPipelineReportJson(std::ofstream& outFile,
+void WriteAssetPipelineReportJson(std::ostream& outFile,
                                   const PathTracer::SceneResources& resources) {
     const auto& report = resources.assetPipelineReport();
     outFile << "  \"asset_pipeline\": {\n";
@@ -4694,6 +5688,49 @@ void WriteAssetPipelineReportJson(std::ofstream& outFile,
     outFile << "      \"warnings\": " << report.stats.warningCount << ",\n";
     outFile << "      \"errors\": " << report.stats.errorCount << "\n";
     outFile << "    },\n";
+    outFile << "    \"support_matrix\": [";
+    for (size_t i = 0; i < report.supportMatrix.size(); ++i) {
+        if (i > 0) {
+            outFile << ", ";
+        }
+        const auto& entry = report.supportMatrix[i];
+        outFile << "{\"area\":\"" << JsonEscape(entry.area)
+                << "\",\"status\":\"" << JsonEscape(entry.status)
+                << "\",\"details\":\"" << JsonEscape(entry.details) << "\"}";
+    }
+    outFile << "],\n";
+    outFile << "    \"stable_resource_ids\": [";
+    for (size_t i = 0; i < report.stableResourceIds.size(); ++i) {
+        if (i > 0) {
+            outFile << ", ";
+        }
+        const auto& entry = report.stableResourceIds[i];
+        outFile << "{\"resource_type\":\"" << JsonEscape(entry.resourceType)
+                << "\",\"name\":\"" << JsonEscape(entry.name)
+                << "\",\"source_index\":" << entry.sourceIndex
+                << ",\"stable_id\":\"" << JsonEscape(entry.stableId) << "\"}";
+    }
+    outFile << "],\n";
+    outFile << "    \"texture_policy\": {"
+            << "\"residency_policy\":\"" << JsonEscape(report.texturePolicy.residencyPolicy)
+            << "\",\"mip_policy\":\"" << JsonEscape(report.texturePolicy.mipPolicy)
+            << "\",\"compression_policy\":\"" << JsonEscape(report.texturePolicy.compressionPolicy)
+            << "\",\"budget_policy\":\"" << JsonEscape(report.texturePolicy.budgetPolicy)
+            << "\",\"determinism_policy\":\"" << JsonEscape(report.texturePolicy.determinismPolicy)
+            << "\",\"max_dimension\":" << report.texturePolicy.maxDimension
+            << ",\"max_texture_bytes\":" << report.texturePolicy.maxTextureBytes
+            << "},\n";
+    outFile << "    \"material_overrides\": [";
+    for (size_t i = 0; i < report.materialOverrides.size(); ++i) {
+        if (i > 0) {
+            outFile << ", ";
+        }
+        const auto& entry = report.materialOverrides[i];
+        outFile << "{\"target\":\"" << JsonEscape(entry.target)
+                << "\",\"action\":\"" << JsonEscape(entry.action)
+                << "\",\"reason\":\"" << JsonEscape(entry.reason) << "\"}";
+    }
+    outFile << "],\n";
     outFile << "    \"texture_color_spaces\": [";
     for (size_t i = 0; i < report.textureColorSpaces.size(); ++i) {
         if (i > 0) {
@@ -4731,6 +5768,10 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
                                    const PathTracer::RenderSettings& settings,
                                    uint32_t sppTotal,
                                    const fs::path& outputPath) {
+    out << "  \"render_mode\": \"" << RenderModeLabel(options.renderMode) << "\",\n";
+    out << "  \"render_mode_maturity\": \"" << RenderModeMaturityLabel(options.renderMode) << "\",\n";
+    out << "  \"render_mode_context\": \"" << RenderModeContextLabel(options.renderMode) << "\",\n";
+    out << "  \"render_mode_source\": \"" << (options.renderModeSet ? "explicit" : "inferred_from_backend") << "\",\n";
     out << "  \"render_profile\": \"" << RenderProfileLabel(options.renderProfile) << "\",\n";
     out << "  \"render_profile_maturity\": \"" << RenderProfileMaturityLabel(options.renderProfile) << "\",\n";
     out << "  \"scene\": \"" << JsonEscape(options.scene) << "\",\n";
@@ -4740,6 +5781,9 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
     out << "  \"spp_total\": " << sppTotal << ",\n";
     out << "  \"settings\": {\n";
     out << "    \"schema_version\": \"pathtracer.render_settings.v1\",\n";
+    out << "    \"serialization_scope\": \"documented_headless_product_contract_v1\",\n";
+    out << "    \"serialization_policy\": "
+        << "\"deterministic headless workflow settings, not a private RenderSettings ABI dump\",\n";
     out << "    \"render_width\": " << settings.renderWidth << ",\n";
     out << "    \"render_height\": " << settings.renderHeight << ",\n";
     out << "    \"max_depth\": " << settings.maxDepth << ",\n";
@@ -4753,29 +5797,94 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
         << WavefrontSchedulingPolicyLabel(settings.wavefrontSchedulingPolicy) << "\",\n";
     out << "    \"wavefront_compaction_enabled\": "
         << (settings.wavefrontCompactionEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_indirect_enabled\": "
+        << (settings.wavefrontShadeIndirectEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_indirect_probe_enabled\": "
+        << (settings.wavefrontShadeIndirectProbeEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_surface_probe_enabled\": "
+        << (settings.wavefrontShadeSurfaceProbeEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_metadata_probe_enabled\": "
+        << (settings.wavefrontShadeMetadataProbeEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_scalar_probe_enabled\": "
+        << (settings.wavefrontShadeScalarProbeEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_closure_probe_enabled\": "
+        << (settings.wavefrontShadeClosureProbeEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shade_bsdf_probe_enabled\": "
+        << (settings.wavefrontShadeBsdfProbeEnabled ? "true" : "false") << ",\n";
+    out << "    \"wavefront_shadow_indirect_enabled\": "
+        << (settings.wavefrontShadowIndirectEnabled ? "true" : "false") << ",\n";
     out << "    \"direct_light_mode\": \"" << DirectLightModeLabel(settings.directLightMode) << "\",\n";
     out << "    \"ris_candidate_count\": " << settings.risCandidateCount << ",\n";
     out << "    \"enable_specular_nee\": " << (settings.enableSpecularNee ? "true" : "false") << ",\n";
+    out << "    \"reference_point_exact_nee\": " << (settings.referencePointExactNee ? "true" : "false") << ",\n";
     out << "    \"enable_mnee\": " << (settings.enableMnee ? "true" : "false") << ",\n";
     out << "    \"restir_gi_mode\": \"" << RestirGiModeLabel(settings.restirGiMode) << "\",\n";
     out << "    \"path_guiding_mode\": \"" << PathGuidingModeLabel(settings.pathGuidingMode) << "\",\n";
     out << "    \"restir_pt_mode\": \"" << RestirPtModeLabel(settings.restirPtMode) << "\",\n";
+    const bool restirPtEnhancedRequested = RestirPtEnhancedActive(settings.restirPtMode);
+    const bool restirPtEnhancedActive = restirPtEnhancedRequested && options.backend == HeadlessBackend::Metal &&
+        settings.volumeTransportMode != PathTracer::RenderSettings::VolumeTransportMode::Homogeneous;
+    out << "    \"restir_pt_enhanced\": {\n";
+    out << "      \"active\": " << (restirPtEnhancedActive ? "true" : "false") << ",\n";
+    out << "      \"bias_mode\": \""
+        << (restirPtEnhancedActive ? "directional_reuse_heuristic_no_unbiased_guarantee_or_cCap"
+                : restirPtEnhancedRequested && options.backend == HeadlessBackend::Embree
+                    ? "ordinary_cpu_capture_reuse_no_enhanced_implementation" : "inactive")
+        << "\",\n";
+    out << "      \"paired_spatial_reuse\": false,\n";
+    out << "      \"footprint_reconnection\": false,\n";
+    out << "      \"duplication_decorrelation\": false,\n";
+    out << "      \"unified_di_gi\": false,\n";
+    out << "      \"vector_shading_weights\": false,\n";
+    out << "      \"dual_motion_vectors\": false,\n";
+    out << "      \"replay_compaction\": false,\n";
+    out << "      \"dispatch\": \"" << (!restirPtEnhancedRequested ? "inactive"
+        : options.backend == HeadlessBackend::Embree ? "ordinary_cpu_capture_reuse"
+        : restirPtEnhancedActive ? "fused_megakernel_or_wavefront_integrator" : "disabled_by_volume_fallback") << "\",\n";
+    out << "      \"implementation_scope\": \"" << (options.backend == HeadlessBackend::Embree
+        ? "ordinary_cpu_capture_reuse_no_enhanced_implementation"
+        : "fused_directional_reuse_heuristics_no_GRIS_equivalence_unbiased_guarantee_or_cCap") << "\",\n";
+    out << "      \"unsupported_paper_features\": [\"paired_spatial_reuse\", \"footprint_reconnection\", \"duplication_decorrelation\", \"unified_di_gi\", \"vector_shading_weights\", \"dual_motion_vectors\", \"replay_compaction\"]\n";
+    out << "    },\n";
     out << "    \"radiance_cache_mode\": \"" << RadianceCacheModeLabel(settings.radianceCacheMode) << "\",\n";
     out << "    \"caustic_transport_mode\": \"" << CausticTransportModeLabel(settings.causticTransportMode) << "\",\n";
     out << "    \"spectral_rendering_mode\": \""
         << SpectralRenderingModeLabel(settings.spectralRenderingMode) << "\",\n";
     out << "    \"spectral_texture_policy\": \""
         << SpectralTexturePolicyLabel(settings.spectralTexturePolicy) << "\",\n";
+    {
+        // White balance carried by the uniforms (UniformBuilder): 1 / E[s_c] over the clamped range, 0 when off.
+        const simd::float3 whiteBalance =
+            settings.spectralRenderingMode != PathTracer::RenderSettings::SpectralRenderingMode::Off
+                ? SpectralSensor::WhiteBalance(SpectralSensor::ClampRange(settings.spectralMinWavelengthNm,
+                                                                          settings.spectralMaxWavelengthNm))
+                : simd_make_float3(0.0f, 0.0f, 0.0f);
+        out << "    \"spectral_white_balance\": [" << whiteBalance.x << ", " << whiteBalance.y << ", "
+            << whiteBalance.z << "],\n";
+    }
+    out << "    \"spectral_wavelengths_per_path\": " << settings.spectralWavelengthsPerPath << ",\n";
+    out << "    \"spectral_sampling_strategy\": \""
+        << (settings.spectralWavelengthsPerPath == 1u ? "hero_wavelength_rotation_uniform_nm_c1"
+                                                      : "hero_wavelength_rotation_uniform_nm_c3") << "\",\n";
+    out << "    \"spectral_material_policy_contract\": "
+        << "\"explicit scene spectral* tokens use sampled 450/550/650nm triplets; "
+           "ordinary RGB assets are reported through spectral_fallback_count when spectral mode is enabled\",\n";
+    out << "    \"spectral_texture_conversion_policy\": "
+        << "\"RGB textures use rgb_reflectance_d65 approximation in spectral mode and are counted "
+           "as spectral fallbacks after texture sampling\",\n";
+    out << "    \"spectral_display_conversion\": "
+        << "\"sampled_reflectance_times_approx_rgb_sensor_basis_to_existing_output_transform\",\n";
     out << "    \"ml_backend_mode\": \"" << MlBackendModeLabel(settings.mlBackendMode) << "\",\n";
     out << "    \"ml_backend_provider\": \""
-        << (settings.mlBackendMode == PathTracer::RenderSettings::MlBackendMode::Off
-                ? "disabled"
-                : "MLBackend.NoOp")
-        << "\",\n";
+        << MlBackendConfiguredProvider(settings.mlBackendMode) << "\",\n";
     out << "    \"ml_model_package_path\": \"" << JsonEscape(settings.mlModelPackagePath) << "\",\n";
     out << "    \"ml_debug_enabled\": " << (settings.mlDebug ? "true" : "false") << ",\n";
     out << "    \"restir_debug_enabled\": " << (settings.restirDebugEnabled ? "true" : "false") << ",\n";
     out << "    \"restir_debug_view\": \"" << RestirDebugViewLabel(settings.restirDebugView) << "\",\n";
+    out << "    \"reconstruction_aov_contract_version\": "
+        << PathTracerShaderTypes::kReconstructionAovContractVersion << ",\n";
+    out << "    \"reconstruction_aov_contract_channels\": \""
+        << PathTracerShaderTypes::kReconstructionAovContractChannels << "\",\n";
     out << "    \"camera\": {\n";
     out << "      \"target\": [" << settings.cameraTarget.x << ", " << settings.cameraTarget.y << ", " << settings.cameraTarget.z << "],\n";
     out << "      \"distance\": " << settings.cameraDistance << ",\n";
@@ -4788,12 +5897,19 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
     out << "    \"environment\": {\n";
     out << "      \"path\": \"" << JsonEscape(settings.environmentMapPath) << "\",\n";
     out << "      \"rotation_radians\": " << settings.environmentRotation << ",\n";
-    out << "      \"intensity\": " << settings.environmentIntensity << "\n";
+    out << "      \"intensity\": " << settings.environmentIntensity << ",\n";
+    out << "      \"background_scale\": " << settings.environmentBackgroundScale << "\n";
     out << "    },\n";
     out << "    \"tonemap\": {\n";
     out << "      \"mode\": " << settings.tonemapMode << ",\n";
     out << "      \"aces_variant\": " << settings.acesVariant << ",\n";
     out << "      \"exposure\": " << settings.exposure << ",\n";
+    out << "      \"srgb_output_encoding\": " << (settings.srgbOutputEncoding ? "true" : "false") << ",\n";
+    const bool srgbTransfer = settings.srgbOutputEncoding ||
+                              (settings.tonemapMode == 2 && settings.acesVariant == 2);
+    out << "      \"output_transfer\": \""
+        << (settings.tonemapMode == 6 ? "filmic" : (srgbTransfer ? "srgb" : "gamma2.2")) << "\",\n";
+    out << "      \"reference_bloom_intensity\": " << settings.referenceBloomIntensity << ",\n";
     out << "      \"working_color_space\": \"" << WorkingColorSpaceLabel(settings) << "\"\n";
     out << "    },\n";
     out << "    \"offline_post\": {\n";
@@ -4801,7 +5917,9 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
     out << "      \"denoise_hdr\": " << (settings.denoiseHdr ? "true" : "false") << ",\n";
     out << "      \"denoise_use_albedo\": " << (settings.denoiseUseAlbedo ? "true" : "false") << ",\n";
     out << "      \"denoise_use_normal\": " << (settings.denoiseUseNormal ? "true" : "false") << ",\n";
-    out << "      \"svgf_denoise_enabled\": " << (settings.svgfDenoiseEnabled ? "true" : "false") << "\n";
+    out << "      \"svgf_denoise_enabled\": " << (settings.svgfDenoiseEnabled ? "true" : "false") << ",\n";
+    out << "      \"svgf_denoise_direct\": " << (settings.svgfDenoiseDirect ? "true" : "false") << ",\n";
+    out << "      \"svgf_denoise_indirect\": " << (settings.svgfDenoiseIndirect ? "true" : "false") << "\n";
     out << "    },\n";
     out << "    \"resource_policy\": {\n";
     out << "      \"budget_policy\": \"" << BudgetPolicyLabel(options.budgetPolicy) << "\",\n";
@@ -4810,6 +5928,41 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
     out << "      \"max_texture_bytes\": " << (options.maxTextureBytesSet ? options.maxTextureBytes : 0u) << "\n";
     out << "    }\n";
     out << "  }\n";
+}
+
+bool FsyncPath(const fs::path& path, std::string& error, const char* role) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        error = std::string("Failed to open ") + role + " for fsync: " + path.string();
+        return false;
+    }
+    const bool ok = (::fsync(fd) == 0);
+    ::close(fd);
+    if (!ok) {
+        error = std::string("Failed to fsync ") + role + ": " + path.string();
+        return false;
+    }
+    return true;
+}
+
+bool PublishTempFileAtomic(const fs::path& tmpPath,
+                           const fs::path& finalPath,
+                           std::string& error) {
+    if (!FsyncPath(tmpPath, error, "sidecar temp file")) {
+        return false;
+    }
+
+    std::error_code renameEc;
+    fs::rename(tmpPath, finalPath, renameEc);
+    if (renameEc) {
+        error = "Failed to publish sidecar file '" + finalPath.string() + "': " + renameEc.message();
+        return false;
+    }
+
+    const fs::path parent = finalPath.parent_path().empty() ? fs::path(".") : finalPath.parent_path();
+    std::string dirError;
+    (void)FsyncPath(parent, dirError, "sidecar directory");
+    return true;
 }
 
 bool WriteTextFileAtomic(const fs::path& path, const std::string& text, std::string& error) {
@@ -4837,15 +5990,50 @@ bool WriteTextFileAtomic(const fs::path& path, const std::string& text, std::str
         }
     }
 
-    std::error_code removeEc;
-    fs::remove(path, removeEc);
-    std::error_code renameEc;
-    fs::rename(tmpPath, path, renameEc);
-    if (renameEc) {
-        error = "Failed to publish sidecar file '" + path.string() + "': " + renameEc.message();
+    return PublishTempFileAtomic(tmpPath, path, error);
+}
+
+bool OpenAtomicSidecarStream(const fs::path& path,
+                             fs::path& tmpPath,
+                             std::ofstream& outFile,
+                             std::string& error,
+                             const char* label) {
+    if (!path.parent_path().empty()) {
+        std::error_code dirEc;
+        fs::create_directories(path.parent_path(), dirEc);
+        if (dirEc) {
+            error = std::string("Failed to create ") + label + " directory '" +
+                    path.parent_path().string() + "': " + dirEc.message();
+            return false;
+        }
+    }
+
+    tmpPath = path;
+    tmpPath += ".tmp";
+    outFile.open(tmpPath, std::ios::binary);
+    if (!outFile.is_open()) {
+        error = std::string("Failed to open ") + label + " temp file for writing: " +
+                tmpPath.string();
         return false;
     }
     return true;
+}
+
+bool PublishAtomicSidecarStream(std::ofstream& outFile,
+                                const fs::path& tmpPath,
+                                const fs::path& path,
+                                std::string& error,
+                                const char* label) {
+    if (!outFile.good()) {
+        error = std::string("Failed while writing ") + label + " temp file: " + tmpPath.string();
+        return false;
+    }
+    outFile.close();
+    if (!outFile) {
+        error = std::string("Failed while closing ") + label + " temp file: " + tmpPath.string();
+        return false;
+    }
+    return PublishTempFileAtomic(tmpPath, path, error);
 }
 
 std::string BuildRenderSettingsJson(const CliOptions& options,
@@ -4873,6 +6061,53 @@ std::string BuildRenderQueueItemJson(const CliOptions& options,
     return json.str();
 }
 
+// Random-walk subsurface outcomes over the whole render, in total and per material. Written on every render, so a walk
+// that ended because its mesh is not closed, or because it hit the step limit, is never only a debug counter.
+void WriteSssWalkJson(std::ostream& out, const HeadlessRenderOutput& output) {
+    namespace st = PathTracerShaderTypes;
+    const auto& perf = output.performance;
+    const auto* v = perf.sssWalkStats;
+    auto percent = [](uint64_t count, uint64_t walks) {
+        return walks > 0u ? 100.0 * static_cast<double>(count) / static_cast<double>(walks) : 0.0;
+    };
+    out << "    \"sss_walk\": {\"walks\": " << v[st::kSssWalkStatWalks] << ", \"exits\": " << v[st::kSssWalkStatExits]
+        << ", \"open_mesh\": " << v[st::kSssWalkStatOpenMesh] << ", \"absorbed\": " << v[st::kSssWalkStatAbsorbed]
+        << ", \"step_limit\": " << v[st::kSssWalkStatStepLimit]
+        << ", \"open_mesh_percent\": " << percent(v[st::kSssWalkStatOpenMesh], v[st::kSssWalkStatWalks])
+        << ", \"step_limit_percent\": " << percent(v[st::kSssWalkStatStepLimit], v[st::kSssWalkStatWalks])
+        << ", \"sss_max_steps\": " << perf.sssMaxSteps << ", \"materials\": [";
+    for (size_t i = 0; i < perf.sssWalkMaterials.size(); ++i) {
+        const auto& m = perf.sssWalkMaterials[i];
+        out << (i > 0 ? ", " : "") << "{\"name\": \"" << JsonEscape(m.material)
+            << "\", \"walks\": " << m.stats[st::kSssWalkStatWalks] << ", \"exits\": " << m.stats[st::kSssWalkStatExits]
+            << ", \"open_mesh\": " << m.stats[st::kSssWalkStatOpenMesh]
+            << ", \"absorbed\": " << m.stats[st::kSssWalkStatAbsorbed]
+            << ", \"step_limit\": " << m.stats[st::kSssWalkStatStepLimit] << "}";
+    }
+    out << "]},\n";
+}
+
+void PrintSssWalkLine(const HeadlessRenderOutput& output) {
+    namespace st = PathTracerShaderTypes;
+    const auto& perf = output.performance;
+    const auto* v = perf.sssWalkStats;
+    if (v[st::kSssWalkStatWalks] == 0u) {
+        return;
+    }
+    std::cout << "[SSS] random walks=" << v[st::kSssWalkStatWalks] << " exits=" << v[st::kSssWalkStatExits]
+              << " openMesh=" << v[st::kSssWalkStatOpenMesh] << " absorbed=" << v[st::kSssWalkStatAbsorbed]
+              << " stepLimit=" << v[st::kSssWalkStatStepLimit] << " (sssMaxSteps=" << perf.sssMaxSteps
+              << "; openMesh and stepLimit walks end their path with no light)" << std::endl;
+    for (const auto& m : perf.sssWalkMaterials) {
+        const std::string line = PathTracer::SubsurfaceWalkLossDiagnostic(
+            m.material, m.stats[st::kSssWalkStatWalks], m.stats[st::kSssWalkStatOpenMesh],
+            m.stats[st::kSssWalkStatStepLimit], perf.sssMaxSteps);
+        if (!line.empty()) {
+            std::cout << "[SSS] " << line << std::endl;
+        }
+    }
+}
+
 std::string BuildOutputMetadataJson(const CliOptions& options,
                                     const PathTracer::RenderSettings& settings,
                                     const PathTracer::SceneResources& resources,
@@ -4889,6 +6124,14 @@ std::string BuildOutputMetadataJson(const CliOptions& options,
     json << "  \"sidecar_write_policy\": \"atomic_temp_rename\",\n";
     WriteRenderSettingsObjectJson(json, options, settings, output.samples, outputPath);
     json << ",\n";
+    const uint32_t exactPointCount = resources.zeroRadiusReferencePointLightCount();
+    const uint32_t stochasticAnalyticCount = resources.analyticLightCount(true);
+    json << "  \"reference_point_nee_population\": {\"zero_radius_reference_points\": " << exactPointCount
+         << ", \"stochastic_analytic_lights\": " << stochasticAnalyticCount
+         << ", \"exact_active\": " << (settings.referencePointExactNee && exactPointCount > 0u ? "true" : "false")
+         << ", \"wavefront_shadow_stride\": " << (PathTracerShaderTypes::kWavefrontShadowCapacityMultiplier +
+             (settings.referencePointExactNee ? exactPointCount : 0u)) << "},\n";
+
     if (rawOutputPath) {
         json << "  \"raw_output\": \"" << JsonEscape(rawOutputPath->string()) << "\",\n";
     }
@@ -4896,6 +6139,12 @@ std::string BuildOutputMetadataJson(const CliOptions& options,
         json << "  \"denoised_output\": \"" << JsonEscape(denoisedOutputPath->string()) << "\",\n";
     }
     json << "  \"resolution\": {\"width\": " << output.width << ", \"height\": " << output.height << "},\n";
+    json << "  \"spectral_last_frame_stats\": {\"wavelength_sample_count\": "
+         << output.pbrMetrics.spectralWavelengthSampleCount
+         << ", \"spectral_wavelength_channel_sample_count\": "
+         << output.pbrMetrics.spectralWavelengthChannelSampleCount
+         << ", \"spectral_collapse_count\": " << output.pbrMetrics.spectralCollapseCount
+         << ", \"dispersion_event_count\": " << output.pbrMetrics.spectralDispersionEventCount << "},\n";
     json << "  \"timing\": {\"total_seconds\": " << output.totalSeconds
          << ", \"avg_ms_per_sample\": " << output.avgMsPerSample << "},\n";
     json << "  \"device_capabilities\": {\n";
@@ -4908,6 +6157,17 @@ std::string BuildOutputMetadataJson(const CliOptions& options,
          << (output.performance.hardwareRaytracingFallbackActive ? "true" : "false") << ",\n";
     json << "    \"hardware_raytracing_fallback_reason\": \""
          << JsonEscape(output.performance.hardwareRaytracingFallbackReason) << "\",\n";
+    json << "    \"megakernel_integrate_pipeline\": \""
+         << JsonEscape(output.performance.megakernelIntegratePipeline) << "\",\n";
+    json << "    \"shader_directory\": \""
+         << JsonEscape(PathTracer::ResolvedShaderDirectory()) << "\",\n";
+    WriteSssWalkJson(json, output);
+    json << "    \"wavefront_direct_light_fallback\": \""
+         << JsonEscape(output.performance.wavefrontDirectLightFallback) << "\",\n";
+    json << "    \"volume_direct_light_fallback\": \""
+         << JsonEscape(VolumeDirectLightFallbackLabel(options, settings)) << "\",\n";
+    json << "    \"wavefront_megakernel_fallback\": \""
+         << JsonEscape(output.performance.wavefrontMegakernelFallback) << "\",\n";
     json << "    \"acceleration_build_policy\": \""
          << JsonEscape(output.performance.accelerationBuildPolicy) << "\",\n";
     json << "    \"acceleration_identity_stable\": "
@@ -4927,7 +6187,9 @@ std::string BuildOutputMetadataJson(const CliOptions& options,
     json << "    \"total_estimated_memory_bytes\": " << memory.totalEstimatedMemoryBytes << ",\n";
     json << "    \"recommended_max_working_set_bytes\": " << memory.recommendedMaxWorkingSetSizeBytes << ",\n";
     json << "    \"budget_usage_percent\": " << memory.budgetUsagePercent << "\n";
-    json << "  }\n";
+    json << "  },\n";
+    WriteAssetPipelineReportJson(json, resources);
+    json << "  \"asset_pipeline_metadata_policy\": \"shared_scene_manifest_available_in_output_metadata_and_pbr_metrics\"\n";
     json << "}\n";
     return json.str();
 }
@@ -5033,6 +6295,10 @@ std::string BuildDebugBundleManifestJson(const fs::path& bundleDir,
     std::ostringstream json;
     json << "{\n";
     json << "  \"schema_version\": \"pathtracer.debug_bundle.v1\",\n";
+    json << "  \"bundle_scope\": \"completed_or_late_render_product_artifacts\",\n";
+    json << "  \"failure_context_policy\": "
+         << "\"early setup failures report through process status and batch summaries; "
+            "this manifest records artifacts published by the completed render path\",\n";
     json << "  \"bundle_dir\": \"" << JsonEscape(bundleDir.string()) << "\",\n";
     json << "  \"output\": \"" << JsonEscape(outputPath.string()) << "\",\n";
     json << "  \"artifact_integrity_policy\": "
@@ -5070,6 +6336,81 @@ std::string BuildDebugBundleManifestJson(const fs::path& bundleDir,
     return json.str();
 }
 
+// Radiance cache counters (whole render, RadianceCacheTraining::RadianceCacheStat layout) as one JSON object.
+void WriteRadianceCacheStatsJson(std::ostream& out, const HeadlessRenderOutput::PbrMetrics& metrics) {
+    namespace rct = PathTracer::RadianceCacheTraining;
+    const auto* v = metrics.radianceCacheStats;
+    auto luma = [](uint64_t fixed) { return static_cast<double>(fixed) / static_cast<double>(rct::kStatLumaScale); };
+    out << "{";
+    for (uint32_t i = 0u; i < rct::kStatFallbackReasonBase; ++i) {
+        out << "\"" << rct::StatName(i) << "\": ";
+        if (rct::StatIsLumaFixed(i)) {
+            out << std::setprecision(9) << luma(v[i]);
+        } else {
+            out << v[i];
+        }
+        out << ", ";
+    }
+    const double targetLuma = luma(v[rct::kStatTargetLumaFixed]);
+    out << "\"clamped_energy_fraction\": "
+        << (targetLuma > 0.0 ? luma(v[rct::kStatClampedLumaFixed]) / targetLuma : 0.0) << ", ";
+    out << "\"fallback_reasons\": {";
+    for (uint32_t r = 0u; r < rct::kStatFallbackReasonCount; ++r) {
+        out << (r ? ", " : "") << "\"" << rct::FallbackReasonName(r) << "\": " << v[rct::kStatFallbackReasonBase + r];
+    }
+    out << "}, \"depth\": [";
+    for (uint32_t d = 0u; d < rct::kStatDepthBins; ++d) {
+        const uint64_t queries = v[rct::kStatDepthQueryBase + d];
+        const uint64_t hits = v[rct::kStatDepthHitBase + d];
+        out << (d ? ", " : "") << "{\"depth\": " << d << ", \"queries\": " << queries << ", \"hits\": " << hits
+            << ", \"hit_rate\": " << (queries ? static_cast<double>(hits) / static_cast<double>(queries) : 0.0)
+            << ", \"mean_returned_luma\": "
+            << (hits ? luma(v[rct::kStatDepthHitLumaFixedBase + d]) / static_cast<double>(hits) : 0.0) << "}";
+    }
+    out << "], \"max_stored_sum\": {";
+    for (uint32_t c = 0u; c < rct::kStatMaxStoredSumCount; ++c) {
+        const uint64_t m = v[rct::kStatMaxStoredSumBase + c];
+        out << (c ? ", " : "") << "\"" << rct::MaxStoredSumName(c) << "\": {\"value\": " << m
+            << ", \"fraction_of_uint32_max\": " << static_cast<double>(m) / 4294967295.0 << "}";
+    }
+    out << "}, \"wrapped_sums\": " << v[rct::kStatWrappedSums] << "}";
+}
+
+void PrintRadianceCacheStatsLine(const HeadlessRenderOutput::PbrMetrics& metrics) {
+    namespace rct = PathTracer::RadianceCacheTraining;
+    const auto* v = metrics.radianceCacheStats;
+    uint64_t any = 0u;
+    for (uint32_t i = 0u; i < rct::kStatCount; ++i) {
+        any |= v[i];
+    }
+    if (any == 0u) {
+        return;
+    }
+    const double targetLuma = static_cast<double>(v[rct::kStatTargetLumaFixed]);
+    std::cout << "[PBR] radianceCacheStats(records=" << v[rct::kStatTrainRecords]
+              << ",accepted=" << v[rct::kStatTrainAccepted] << ",clamped=" << v[rct::kStatTrainClamped]
+              << ",rejectedNonFinite=" << v[rct::kStatTrainRejectedNonFinite]
+              << ",rejectedZeroThroughput=" << v[rct::kStatTrainRejectedZeroThroughput]
+              << ",saturated=" << v[rct::kStatTrainSaturated] << ",evictions=" << v[rct::kStatCellEvictions]
+              << ",clampedEnergyFraction="
+              << (targetLuma > 0.0 ? static_cast<double>(v[rct::kStatClampedLumaFixed]) / targetLuma : 0.0) << ")";
+    std::cout << " fallbackReasons(";
+    for (uint32_t r = 1u; r < rct::kStatFallbackReasonCount; ++r) {
+        std::cout << (r > 1u ? "," : "") << rct::FallbackReasonName(r) << "=" << v[rct::kStatFallbackReasonBase + r];
+    }
+    std::cout << ") depthQueriesHits(";
+    for (uint32_t d = 0u; d < rct::kStatDepthBins; ++d) {
+        std::cout << (d ? "," : "") << "d" << d << "=" << v[rct::kStatDepthQueryBase + d] << "/"
+                  << v[rct::kStatDepthHitBase + d];
+    }
+    std::cout << ") maxStoredSumOfUint32Max(";
+    for (uint32_t c = 0u; c < rct::kStatMaxStoredSumCount; ++c) {
+        std::cout << (c ? "," : "") << rct::MaxStoredSumName(c) << "="
+                  << static_cast<double>(v[rct::kStatMaxStoredSumBase + c]) / 4294967295.0;
+    }
+    std::cout << ",wrapped=" << v[rct::kStatWrappedSums] << ")" << std::endl;
+}
+
 bool WritePbrMetricsJson(const fs::path& jsonPath,
                          const CliOptions& options,
                          const PathTracer::RenderSettings& settings,
@@ -5080,17 +6421,86 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                          const HeadlessRenderOutput& output,
                          const ImagePbrMetrics& imageMetrics,
                          std::string& error) {
-    std::ofstream outFile(jsonPath);
+    if (!jsonPath.parent_path().empty()) {
+        std::error_code dirEc;
+        fs::create_directories(jsonPath.parent_path(), dirEc);
+        if (dirEc) {
+            error = "Failed to create metrics directory '" + jsonPath.parent_path().string() + "': " + dirEc.message();
+            return false;
+        }
+    }
+
+    fs::path tmpPath = jsonPath;
+    tmpPath += ".tmp";
+    std::ofstream outFile(tmpPath);
     if (!outFile.is_open()) {
-        error = "Failed to open metrics file for writing: " + jsonPath.string();
+        error = "Failed to open metrics temp file for writing: " + tmpPath.string();
         return false;
     }
+
+    const bool guardedShadeIndirect =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeIndirectEnabled || WavefrontShadeIndirectEnabled());
+    const bool guardedShadeIndirectProbe =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeIndirectProbeEnabled || WavefrontShadeIndirectProbeEnabled());
+    const bool guardedShadeSurfaceProbe =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeSurfaceProbeEnabled || WavefrontShadeSurfaceProbeEnabled());
+    const bool guardedShadeMetadataProbe =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeMetadataProbeEnabled || WavefrontShadeMetadataProbeEnabled());
+    const bool guardedShadeScalarProbe =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeScalarProbeEnabled || WavefrontShadeScalarProbeEnabled());
+    const bool guardedShadeBsdfProbe =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeBsdfProbeEnabled || WavefrontShadeBsdfProbeEnabled());
+    const bool guardedShadeClosureProbe =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadeClosureProbeEnabled || WavefrontShadeClosureProbeEnabled());
+    const bool guardedShadowIndirect =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront &&
+        (settings.wavefrontShadowIndirectEnabled || WavefrontShadowIndirectEnabled());
+    const PathTracer::SceneMemoryReport sceneMemory = resources.sceneMemoryReport();
+    const bool wavefrontExecution =
+        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront;
+    const char* shadeDispatchMode =
+        guardedShadeIndirect
+            ? "split_resolved_surface_active_count_indirect"
+            : (wavefrontExecution ? "direct_grid_exact_platform_limited" : "disabled_non_wavefront");
+    const char* shadowDispatchMode =
+        guardedShadowIndirect
+            ? "guarded_active_count_indexed_indirect"
+            : (wavefrontExecution ? "direct_grid_sparse_storage" : "disabled_non_wavefront");
+    const uint64_t renderPixelCount =
+        static_cast<uint64_t>(output.width) * static_cast<uint64_t>(output.height);
+    const uint64_t shadeDispatchedThreadCount =
+        guardedShadeIndirect
+            ? output.performance.wavefrontShadeProcessedCount
+            : renderPixelCount * output.performance.wavefrontShadeDispatchCount;
+    const uint64_t shadowDispatchedThreadCount =
+        guardedShadowIndirect
+            ? std::max(output.performance.wavefrontShadowProcessedCount,
+                       output.performance.wavefrontShadowRayEnqueueCount)
+            : renderPixelCount * output.performance.wavefrontShadowDispatchCount;
+    const uint64_t shadeInactiveLaneEstimate =
+        shadeDispatchedThreadCount > output.performance.wavefrontShadeProcessedCount
+            ? shadeDispatchedThreadCount - output.performance.wavefrontShadeProcessedCount
+            : 0u;
+    const uint64_t shadowInactiveLaneEstimate =
+        shadowDispatchedThreadCount > output.performance.wavefrontShadowProcessedCount
+            ? shadowDispatchedThreadCount - output.performance.wavefrontShadowProcessedCount
+            : 0u;
 
     outFile << std::fixed << std::setprecision(9);
     outFile << "{\n";
     outFile << "  \"scene\": \"" << JsonEscape(options.scene) << "\",\n";
     outFile << "  \"backend\": \"" << (options.backend == HeadlessBackend::Embree ? "embree" : "metal")
             << "\",\n";
+    outFile << "  \"render_mode\": \"" << RenderModeLabel(options.renderMode) << "\",\n";
+    outFile << "  \"render_mode_maturity\": \"" << RenderModeMaturityLabel(options.renderMode) << "\",\n";
+    outFile << "  \"render_mode_context\": \"" << RenderModeContextLabel(options.renderMode) << "\",\n";
     outFile << "  \"render_profile\": \"" << RenderProfileLabel(options.renderProfile) << "\",\n";
     outFile << "  \"render_profile_maturity\": \"" << RenderProfileMaturityLabel(options.renderProfile) << "\",\n";
     outFile << "  \"output\": \"" << JsonEscape(outputPath.string()) << "\",\n";
@@ -5102,6 +6512,9 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     }
     outFile << "  \"seed\": " << settings.fixedRngSeed << ",\n";
     outFile << "  \"settings\": {\n";
+    outFile << "    \"environment_intensity\": " << settings.environmentIntensity << ",\n";
+    outFile << "    \"environment_background_scale\": " << settings.environmentBackgroundScale << ",\n";
+    outFile << "    \"environment_background_scale_scope\": \"depth_zero_hdr_miss_only\",\n";
     outFile << "    \"execution_mode\": \""
             << (settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront
                     ? "wavefront"
@@ -5111,21 +6524,112 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << WavefrontSchedulingPolicyLabel(settings.wavefrontSchedulingPolicy) << "\",\n";
     outFile << "    \"wavefront_compaction_enabled\": "
             << (settings.wavefrontCompactionEnabled ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_indirect_enabled\": "
+            << (guardedShadeIndirect ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_indirect_probe_enabled\": "
+            << (guardedShadeIndirectProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_surface_probe_enabled\": "
+            << (guardedShadeSurfaceProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_metadata_probe_enabled\": "
+            << (guardedShadeMetadataProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_scalar_probe_enabled\": "
+            << (guardedShadeScalarProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_closure_probe_enabled\": "
+            << (guardedShadeClosureProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_bsdf_probe_enabled\": "
+            << (guardedShadeBsdfProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shadow_indirect_enabled\": "
+            << (guardedShadowIndirect ? "true" : "false") << ",\n";
     outFile << "    \"wavefront_overflow_policy\": \"clamp_and_report\",\n";
     outFile << "    \"wavefront_material_ray_sorting\": \"experimental_disabled\",\n";
-    outFile << "    \"wavefront_active_count_indirect_stages\": [\"intersect\"],\n";
-    outFile << "    \"wavefront_direct_grid_stages\": [\"shade\", \"shadow\"],\n";
+    outFile << "    \"wavefront_active_count_indirect_stages\": ";
+    {
+        std::vector<std::string> stages{"intersect"};
+        if (guardedShadeIndirectProbe) stages.emplace_back("shade_probe");
+        if (guardedShadeSurfaceProbe) stages.emplace_back("shade_surface_probe");
+        if (guardedShadeMetadataProbe) stages.emplace_back("shade_metadata_probe");
+        if (guardedShadeScalarProbe) stages.emplace_back("shade_scalar_probe");
+        if (guardedShadeClosureProbe) stages.emplace_back("shade_closure_probe");
+        if (guardedShadeBsdfProbe) stages.emplace_back("shade_bsdf_probe");
+        if (guardedShadeIndirect) {
+            stages.emplace_back("shade_resolve_surface_guarded");
+            stages.emplace_back("shade_resolved_guarded");
+        }
+        if (guardedShadowIndirect) stages.emplace_back("shadow_guarded");
+        WriteJsonStringArray(outFile, stages);
+    }
+    outFile << ",\n";
+    outFile << "    \"wavefront_direct_grid_stages\": ";
+    if (guardedShadeIndirect && guardedShadowIndirect) {
+        outFile << "[]";
+    } else if (guardedShadeIndirect) {
+        outFile << "[\"shadow\"]";
+    } else if (guardedShadowIndirect) {
+        outFile << "[\"shade\"]";
+    } else {
+        outFile << "[\"shade\", \"shadow\"]";
+    }
+    outFile << ",\n";
+    outFile << "    \"wavefront_guarded_only_stages\": ["
+            << "\"shade_indirect_negative_repro\","
+            << "\"shade_indirect_probe\","
+            << "\"shade_surface_probe\","
+            << "\"shade_metadata_probe\","
+            << "\"shade_scalar_probe\","
+            << "\"shade_closure_probe\","
+            << "\"shade_bsdf_probe\","
+            << "\"shadow_indirect_guard\"],\n";
+    outFile << "    \"wavefront_platform_limited_stages\": ";
+    outFile << (wavefrontExecution && !guardedShadeIndirect ? "[\"shade\"]" : "[]");
+    outFile << ",\n";
     outFile << "    \"wavefront_stage_dispatch_modes\": {"
             << "\"intersect\":\"active_count_indirect\","
-            << "\"shade\":\"direct_grid_fallback\","
-            << "\"shadow\":\"direct_grid_sparse_storage\"},\n";
-    outFile << "    \"wavefront_m1_bridge_status\": \"intersect active-count indirect is live; shade and sparse shadow storage remain explicitly reported until dense shade/shadow queues replace the direct-grid paths\",\n";
+            << "\"shade\":\"" << shadeDispatchMode << "\","
+            << "\"shadow\":\"" << shadowDispatchMode << "\"},\n";
+    outFile << "    \"wavefront_stage_fallback_reasons\": {"
+            << "\"intersect\":\"none\","
+            << "\"shade\":\""
+            << (guardedShadeIndirect
+                    ? "explicit_diagnostic_guard_requested_not_production_closure"
+                    : "exact_shade_active_count_indirect_reproduces_code_8_default_exact_direct_grid_platform_limited")
+            << "\",\"shadow\":\""
+            << (guardedShadowIndirect
+                    ? "explicit_guarded_indexed_shadow_dispatch_requested_not_default_promoted"
+                    : "sparse_shadow_storage_requires_indexed_sidecar_until_promotion_matrix_passes")
+            << "\"},\n";
+    outFile << "    \"wavefront_m1_shade_indirect_guard_available\": true,\n";
+    outFile << "    \"wavefront_m1_shade_indirect_guard_default_enabled\": false,\n";
+    outFile << "    \"wavefront_m1_shadow_indirect_guard_available\": true,\n";
+    outFile << "    \"wavefront_m1_shadow_indirect_promoted\": false,\n";
+    outFile << "    \"wavefront_m1_bridge_status\": \""
+            << (guardedShadeIndirect
+                    ? "M.1 reframed closure diagnostic active: shade is split into active-count indirect surface/material resolution plus active-count indirect resolved continuation by --wavefront-shade-indirect=1 or PT_ENABLE_WAVEFRONT_SHADE_INDIRECT=1; this remains a default-off Code 8 diagnostic and is not original shade active-count closure"
+                    : (guardedShadeIndirectProbe || guardedShadeSurfaceProbe || guardedShadeMetadataProbe || guardedShadeScalarProbe || guardedShadeClosureProbe || guardedShadeBsdfProbe)
+                        ? "M.1 reframed closure probe active: a non-mutating shade active-count indirect probe is enabled before the production direct-grid shade path; production shade remains exact direct-grid platform-limited"
+                    : guardedShadowIndirect
+                        ? "M.1 reframed closure shadow guard active: compact shadow index sidecar drives guarded active-count indexed shadow dispatch; guarded shadow remains default-off/not promoted and original shade indirect remains diagnostic"
+                    : "Milestone M.1 closed under the 2026-06-07 reframed stage-specific scheduling contract: intersect is active-count indirect, production shade is exact direct-grid platform-limited with residual metrics, default shadow is direct-grid sparse storage, and original shade active-count indirect remains a default-off Code 8 diagnostic")
+            << "\",\n";
     outFile << "    \"direct_light_mode\": \"" << DirectLightModeLabel(settings.directLightMode) << "\",\n";
     outFile << "    \"restir_gi_mode\": \"" << RestirGiModeLabel(settings.restirGiMode) << "\",\n";
     outFile << "    \"path_guiding_mode\": \"" << PathGuidingModeLabel(settings.pathGuidingMode) << "\",\n";
     outFile << "    \"path_guiding_strength\": " << settings.pathGuidingStrength << ",\n";
     outFile << "    \"path_guiding_cell_size\": " << settings.pathGuidingCellSize << ",\n";
     outFile << "    \"path_guiding_training_interval\": " << settings.pathGuidingTrainingInterval << ",\n";
+    outFile << "    \"path_guiding_provider\": \""
+            << (settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype
+                    ? "PathGuiding.WorldGrid"
+                    : "PathGuiding.NoOp")
+            << "\",\n";
+    outFile << "    \"path_guiding_provider_production\": "
+            << (settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype
+                    ? "true"
+                    : "false")
+            << ",\n";
+    outFile << "    \"path_guiding_storage\": \""
+            << (options.backend == HeadlessBackend::Embree ? "cpu_host_memory" : "private_transport_memory") << "\",\n";
+    outFile << "    \"path_guiding_query_contract\": [\"canGuide\", \"sampleDirection\", \"pdfDirection\", \"update\", \"confidence\", \"debugRecord\"],\n";
+    outFile << "    \"path_guiding_fallback_policy\": \"low_confidence_invalid_bin_or_unsupported_surface_fallback_to_bsdf_sampling\",\n";
     outFile << "    \"restir_pt_mode\": \"" << RestirPtModeLabel(settings.restirPtMode) << "\",\n";
     outFile << "    \"restir_pt_max_reservoirs\": " << settings.restirPtMaxReservoirs << ",\n";
     outFile << "    \"restir_pt_debug\": " << (settings.restirPtDebug ? "true" : "false") << ",\n";
@@ -5136,11 +6640,33 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"radiance_cache_min_confidence\": " << settings.radianceCacheMinConfidence << ",\n";
     outFile << "    \"radiance_cache_training_interval\": " << settings.radianceCacheTrainingInterval << ",\n";
     outFile << "    \"radiance_cache_max_radiance\": " << settings.radianceCacheMaxRadiance << ",\n";
-    outFile << "    \"radiance_cache_provider\": \"RadianceCache.WorldGrid\",\n";
-    outFile << "    \"radiance_cache_storage\": \"private_transport_memory\",\n";
+    const bool volumeHomogeneous =
+        settings.volumeTransportMode == PathTracer::RenderSettings::VolumeTransportMode::Homogeneous;
+    const bool metalVolumeHomogeneous = options.backend == HeadlessBackend::Metal && volumeHomogeneous;
+    const bool embreeVolumeIgnored = options.backend == HeadlessBackend::Embree && volumeHomogeneous;
+    const char* radianceCacheRefusal = PathTracer::RadianceCacheRefusalReason(settings);
+    const bool volumeRadianceCacheDisabled =
+        metalVolumeHomogeneous && PathTracer::RadianceCacheActive(settings);
+    outFile << "    \"radiance_cache_provider\": \""
+            << (settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Off
+                    ? "RadianceCache.NoOp"
+                    : radianceCacheRefusal ? "RadianceCache.Refused"
+                    : (volumeRadianceCacheDisabled ? "RadianceCache.DisabledByVolumeFallback"
+                                                   : "RadianceCache.WorldGrid"))
+            << "\",\n";
+    outFile << "    \"radiance_cache_refusal_reason\": \""
+            << (radianceCacheRefusal ? radianceCacheRefusal : "none") << "\",\n";
+    outFile << "    \"radiance_cache_provider_production\": "
+            << (settings.radianceCacheMode != PathTracer::RenderSettings::RadianceCacheMode::Off &&
+                        !radianceCacheRefusal && !volumeRadianceCacheDisabled
+                    ? "true"
+                    : "false")
+            << ",\n";
+    outFile << "    \"radiance_cache_storage\": \""
+            << (options.backend == HeadlessBackend::Embree ? "cpu_host_memory" : "private_transport_memory") << "\",\n";
     outFile << "    \"radiance_cache_query_contract\": [\"canQuery\", \"query\", \"train\", \"confidence\", \"variance\", \"cacheability\", \"invalidation\", \"debugRecord\"],\n";
     outFile << "    \"radiance_cache_fallback_policy\": \"confidence_or_bias_risk_fallback_to_path_tracing\",\n";
-    outFile << "    \"radiance_cache_reconstruction_confidence_source\": \"RadianceEstimate.radianceConfidence.w\",\n";
+    outFile << "    \"radiance_cache_reconstruction_confidence_source\": \"RadianceEstimate.radianceConfidence.w -> ReconstructionAOV confidence channel on cache hits\",\n";
     outFile << "    \"caustic_transport_mode\": \"" << CausticTransportModeLabel(settings.causticTransportMode) << "\",\n";
     outFile << "    \"caustic_max_vertices\": " << settings.causticMaxVertices << ",\n";
     outFile << "    \"volume_transport_mode\": \"" << VolumeTransportModeLabel(settings.volumeTransportMode) << "\",\n";
@@ -5152,6 +6678,7 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"volume_max_scattering_events\": " << settings.volumeMaxScatteringEvents << ",\n";
     outFile << "    \"volume_nee_enabled\": " << (settings.volumeNeeEnabled ? "true" : "false") << ",\n";
     outFile << "    \"volume_tracking_strategy\": \"homogeneous_exponential_distance_sampling; heterogeneous_future_null_ratio_delta_tracking\",\n";
+    outFile << "    \"volume_debug_aov_contract\": \"material_feature.xyzw = transmittance, scattering_depth, phase_function, volume_contribution_luminance when volumeDebug=1\",\n";
     outFile << "    \"restir_medium_query_support\": \"unsupported_fallback_to_surface_path\",\n";
     outFile << "    \"path_guiding_medium_query_support\": \"unsupported_fallback_to_phase_sampling\",\n";
     outFile << "    \"radiance_cache_medium_query_support\": \"unsupported_fallback_to_path_tracing\",\n";
@@ -5162,7 +6689,22 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"spectral_wavelength_range_nm\": ["
             << settings.spectralMinWavelengthNm << ", "
             << settings.spectralMaxWavelengthNm << "],\n";
-    outFile << "    \"spectral_sampling_strategy\": \"hero_wavelength_uniform_nm_deterministic_per_path\",\n";
+    {
+        // The white balance the uniforms carry (UniformBuilder): 1 / E[s_c] over the clamped range, 0 when off.
+        const simd::float3 whiteBalance =
+            settings.spectralRenderingMode != PathTracer::RenderSettings::SpectralRenderingMode::Off
+                ? SpectralSensor::WhiteBalance(SpectralSensor::ClampRange(settings.spectralMinWavelengthNm,
+                                                                          settings.spectralMaxWavelengthNm))
+                : simd_make_float3(0.0f, 0.0f, 0.0f);
+        outFile << "    \"spectral_white_balance\": [" << whiteBalance.x << ", " << whiteBalance.y << ", "
+                << whiteBalance.z << "],\n";
+    }
+    outFile << "    \"spectral_wavelengths_per_path\": " << settings.spectralWavelengthsPerPath << ",\n";
+    outFile << "    \"spectral_sampling_strategy\": \""
+            << (settings.spectralWavelengthsPerPath == 1u ? "hero_wavelength_rotation_uniform_nm_c1"
+                                                      : "hero_wavelength_rotation_uniform_nm_c3") << "\",\n";
+    outFile << "    \"spectral_material_policy_contract\": \"sampled_triplet material policy uses explicit 450/550/650nm scene triplets for IOR, absorption, conductor eta/k, emission, and reflectance; rgb_approx_d65 remains an auditable approximation\",\n";
+    outFile << "    \"spectral_texture_conversion_policy\": \"RGB textures use rgb_reflectance_d65 approximation in spectral mode and are counted as spectral fallbacks after texture sampling\",\n";
     outFile << "    \"spectral_display_conversion\": \"sampled_reflectance_times_approx_rgb_sensor_basis_to_existing_output_transform\",\n";
     outFile << "    \"spectral_dispersion_strength\": "
             << settings.spectralDispersionStrength << ",\n";
@@ -5170,15 +6712,20 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << (settings.spectralDebug ? "true" : "false") << ",\n";
     outFile << "    \"ml_backend_mode\": \"" << MlBackendModeLabel(settings.mlBackendMode) << "\",\n";
     outFile << "    \"ml_backend_provider\": \""
-            << (settings.mlBackendMode == PathTracer::RenderSettings::MlBackendMode::Off
-                    ? "disabled"
-                    : "MLBackend.NoOp")
-            << "\",\n";
+            << MlBackendConfiguredProvider(settings.mlBackendMode) << "\",\n";
     outFile << "    \"ml_model_package_path\": \""
             << JsonEscape(settings.mlModelPackagePath) << "\",\n";
-    outFile << "    \"ml_tensor_contract\": \"radiance,albedo,normal,depth,motion,variance,confidence -> reconstructed_radiance,confidence\",\n";
-    outFile << "    \"ml_capability_gate\": \"optional; default off; no-op backend preserves transport output\",\n";
+    outFile << "    \"ml_tensor_contract\": \"radiance,albedo,normal,depth,motion,variance,confidence -> reconstructed_radiance,confidence,validity\",\n";
+    outFile << "    \"ml_capability_gate\": \"optional; default off; reconstruction_tiny requires valid PTMLRECONv1 package and falls back visibly to non-neural output\",\n";
     outFile << "    \"ml_debug_enabled\": " << (settings.mlDebug ? "true" : "false") << ",\n";
+    outFile << "    \"reconstruction_aov_contract_version\": "
+            << PathTracerShaderTypes::kReconstructionAovContractVersion << ",\n";
+    outFile << "    \"reconstruction_aov_contract_channels\": \""
+            << PathTracerShaderTypes::kReconstructionAovContractChannels << "\",\n";
+    outFile << "    \"reconstruction_history_rejection\": \"camera_cut,resolution_or_scene_reset,reprojection_bounds,depth,normal,material_closure_features,specular_glossy_penalty\",\n";
+    outFile << "    \"reconstruction_confidence_inputs\": \"sample_count,radiance_second_moment_variance,temporal_history,svgf_variance,neighborhood_guide_confidence,radiance_cache_hit_confidence\",\n";
+    outFile << "    \"reconstruction_direct_indirect_split\": \"graph_owned_direct_and_indirect_radiance_aovs_with_independent_svgf_component_controls\",\n";
+    outFile << "    \"metalfx_reconstruction_backend\": \"unsupported_visible_fallback; capability probe is not a backend\",\n";
     outFile << "    \"restir_debug_enabled\": " << (settings.restirDebugEnabled ? "true" : "false") << ",\n";
     outFile << "    \"restir_debug_view\": \"" << RestirDebugViewLabel(settings.restirDebugView) << "\",\n";
     outFile << "    \"restir_debug_counters\": " << (settings.restirDebugCounters ? "true" : "false") << ",\n";
@@ -5188,18 +6735,22 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "  \"enable_mnee\": " << (settings.enableMnee ? "true" : "false") << ",\n";
     outFile << "  \"enable_specular_nee\": " << (settings.enableSpecularNee ? "true" : "false") << ",\n";
     outFile << "  \"offline_post\": {\n";
-    outFile << "    \"denoise_enabled\": " << (options.denoiseEnabled ? "true" : "false") << ",\n";
-    outFile << "    \"denoise_hdr\": " << (options.denoiseHdr ? "true" : "false") << ",\n";
-    outFile << "    \"denoise_use_albedo\": " << (options.denoiseUseAlbedo ? "true" : "false") << ",\n";
-    outFile << "    \"denoise_use_normal\": " << (options.denoiseUseNormal ? "true" : "false") << ",\n";
+    outFile << "    \"denoise_enabled\": " << (settings.denoiseEnabled ? "true" : "false") << ",\n";
+    outFile << "    \"denoise_hdr\": " << (settings.denoiseHdr ? "true" : "false") << ",\n";
+    outFile << "    \"denoise_use_albedo\": " << (settings.denoiseUseAlbedo ? "true" : "false") << ",\n";
+    outFile << "    \"denoise_use_normal\": " << (settings.denoiseUseNormal ? "true" : "false") << ",\n";
     outFile << "    \"svgf_denoise_enabled\": " << (settings.svgfDenoiseEnabled ? "true" : "false") << ",\n";
+    outFile << "    \"svgf_denoise_direct\": " << (settings.svgfDenoiseDirect ? "true" : "false") << ",\n";
+    outFile << "    \"svgf_denoise_indirect\": " << (settings.svgfDenoiseIndirect ? "true" : "false") << ",\n";
     outFile << "    \"svgf_atrous_iterations\": " << settings.svgfAtrousIterations << ",\n";
     outFile << "    \"svgf_normal_sigma\": " << settings.svgfNormalSigma << ",\n";
     outFile << "    \"svgf_albedo_sigma\": " << settings.svgfAlbedoSigma << ",\n";
     outFile << "    \"svgf_luminance_sigma\": " << settings.svgfLuminanceSigma << ",\n";
     outFile << "    \"firefly_clamp_stage\": \"per_sample_contribution\",\n";
-    outFile << "    \"firefly_clamp_mode\": \"" << FireflyClampModeLabel(options.fireflyClampMode) << "\",\n";
-    outFile << "    \"firefly_clamp_value\": " << options.fireflyClampValue << "\n";
+    outFile << "    \"firefly_clamp_mode\": \"" << (!settings.fireflyClampEnabled ? "off" :
+        settings.fireflyClampMode == PathTracer::RenderSettings::FireflyClampMode::MaxComponent
+            ? "maxcomponent" : "luminance") << "\",\n";
+    outFile << "    \"firefly_clamp_value\": " << settings.fireflyClampMaxContribution << "\n";
     outFile << "  },\n";
     outFile << "  \"spp\": " << output.samples << ",\n";
     WriteAssetPipelineReportJson(outFile, resources);
@@ -5224,10 +6775,84 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << output.performance.wavefrontSchedulingPolicy << ",\n";
     outFile << "    \"wavefront_compaction_enabled\": "
             << output.performance.wavefrontCompactionEnabled << ",\n";
+    outFile << "    \"wavefront_shade_indirect_enabled\": "
+            << (guardedShadeIndirect ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_indirect_probe_enabled\": "
+            << (guardedShadeIndirectProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_surface_probe_enabled\": "
+            << (guardedShadeSurfaceProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_metadata_probe_enabled\": "
+            << (guardedShadeMetadataProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_scalar_probe_enabled\": "
+            << (guardedShadeScalarProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_closure_probe_enabled\": "
+            << (guardedShadeClosureProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shade_bsdf_probe_enabled\": "
+            << (guardedShadeBsdfProbe ? "true" : "false") << ",\n";
+    outFile << "    \"wavefront_shadow_indirect_enabled\": "
+            << (guardedShadowIndirect ? "true" : "false") << ",\n";
     outFile << "    \"wavefront_overflow_policy\": \"clamp_and_report\",\n";
     outFile << "    \"wavefront_material_ray_sorting\": \"experimental_disabled\",\n";
-    outFile << "    \"wavefront_active_count_indirect_stages\": [\"intersect\"],\n";
-    outFile << "    \"wavefront_direct_grid_stages\": [\"shade\", \"shadow\"],\n";
+    outFile << "    \"wavefront_active_count_indirect_stages\": ";
+    {
+        std::vector<std::string> stages{"intersect"};
+        if (guardedShadeIndirectProbe) stages.emplace_back("shade_probe");
+        if (guardedShadeSurfaceProbe) stages.emplace_back("shade_surface_probe");
+        if (guardedShadeMetadataProbe) stages.emplace_back("shade_metadata_probe");
+        if (guardedShadeScalarProbe) stages.emplace_back("shade_scalar_probe");
+        if (guardedShadeClosureProbe) stages.emplace_back("shade_closure_probe");
+        if (guardedShadeBsdfProbe) stages.emplace_back("shade_bsdf_probe");
+        if (guardedShadeIndirect) {
+            stages.emplace_back("shade_resolve_surface_guarded");
+            stages.emplace_back("shade_resolved_guarded");
+        }
+        if (guardedShadowIndirect) stages.emplace_back("shadow_guarded");
+        WriteJsonStringArray(outFile, stages);
+    }
+    outFile << ",\n";
+    outFile << "    \"wavefront_direct_grid_stages\": ";
+    if (guardedShadeIndirect && guardedShadowIndirect) {
+        outFile << "[]";
+    } else if (guardedShadeIndirect) {
+        outFile << "[\"shadow\"]";
+    } else if (guardedShadowIndirect) {
+        outFile << "[\"shade\"]";
+    } else {
+        outFile << "[\"shade\", \"shadow\"]";
+    }
+    outFile << ",\n";
+    outFile << "    \"wavefront_guarded_only_stages\": ["
+            << "\"shade_indirect_negative_repro\","
+            << "\"shade_indirect_probe\","
+            << "\"shade_surface_probe\","
+            << "\"shade_metadata_probe\","
+            << "\"shade_scalar_probe\","
+            << "\"shade_closure_probe\","
+            << "\"shade_bsdf_probe\","
+            << "\"shadow_indirect_guard\"],\n";
+    outFile << "    \"wavefront_platform_limited_stages\": ";
+    outFile << (wavefrontExecution && !guardedShadeIndirect ? "[\"shade\"]" : "[]");
+    outFile << ",\n";
+    outFile << "    \"wavefront_stage_dispatch_modes\": {"
+            << "\"intersect\":\"" << JsonEscape(output.performance.wavefrontIntersectDispatchMode)
+            << "\",\"shade\":\"" << JsonEscape(output.performance.wavefrontShadeDispatchMode)
+            << "\",\"shadow\":\"" << JsonEscape(output.performance.wavefrontShadowDispatchMode)
+            << "\"},\n";
+    outFile << "    \"wavefront_stage_fallback_reasons\": {"
+            << "\"intersect\":\"none\","
+            << "\"shade\":\""
+            << (guardedShadeIndirect
+                    ? "explicit_diagnostic_guard_requested_not_production_closure"
+                    : "exact_shade_active_count_indirect_reproduces_code_8_default_exact_direct_grid_platform_limited")
+            << "\",\"shadow\":\""
+            << (guardedShadowIndirect
+                    ? "explicit_guarded_indexed_shadow_dispatch_requested_not_default_promoted"
+                    : "sparse_shadow_storage_requires_indexed_sidecar_until_promotion_matrix_passes")
+            << "\"},\n";
+    outFile << "    \"wavefront_m1_shade_indirect_guard_available\": true,\n";
+    outFile << "    \"wavefront_m1_shade_indirect_guard_default_enabled\": false,\n";
+    outFile << "    \"wavefront_m1_shadow_indirect_guard_available\": true,\n";
+    outFile << "    \"wavefront_m1_shadow_indirect_promoted\": false,\n";
     outFile << "    \"wavefront_intersect_dispatch_mode\": \""
             << JsonEscape(output.performance.wavefrontIntersectDispatchMode) << "\",\n";
     outFile << "    \"wavefront_shade_dispatch_mode\": \""
@@ -5247,6 +6872,17 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << (output.performance.hardwareRaytracingFallbackActive ? "true" : "false") << ",\n";
     outFile << "    \"hardware_raytracing_fallback_reason\": \""
             << JsonEscape(output.performance.hardwareRaytracingFallbackReason) << "\",\n";
+    outFile << "    \"megakernel_integrate_pipeline\": \""
+            << JsonEscape(output.performance.megakernelIntegratePipeline) << "\",\n";
+    outFile << "    \"shader_directory\": \""
+            << JsonEscape(PathTracer::ResolvedShaderDirectory()) << "\",\n";
+    WriteSssWalkJson(outFile, output);
+    outFile << "    \"wavefront_direct_light_fallback\": \""
+            << JsonEscape(output.performance.wavefrontDirectLightFallback) << "\",\n";
+    outFile << "    \"volume_direct_light_fallback\": \""
+            << JsonEscape(VolumeDirectLightFallbackLabel(options, settings)) << "\",\n";
+    outFile << "    \"wavefront_megakernel_fallback\": \""
+            << JsonEscape(output.performance.wavefrontMegakernelFallback) << "\",\n";
     outFile << "    \"device_capabilities\": {"
             << "\"device_name\":\"" << JsonEscape(output.performance.deviceName)
             << "\",\"recommended_max_working_set_bytes\":"
@@ -5273,6 +6909,8 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << (output.performance.pipelineFunctionConstantsUsed ? "true" : "false")
             << ",\"metal_binary_archive_used\":"
             << (output.performance.pipelineMetalBinaryArchiveUsed ? "true" : "false")
+            << ",\"metal_binary_archive_serialized\":"
+            << (output.performance.pipelineMetalBinaryArchiveSerialized ? "true" : "false")
             << ",\"harvested_compilation_ready\":"
             << (output.performance.pipelineHarvestedCompilationReady ? "true" : "false")
             << ",\"shader_source_bytes\":" << output.performance.pipelineShaderSourceBytes
@@ -5287,6 +6925,8 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << JsonEscape(output.performance.pipelineCacheStrategy)
             << "\",\"specialization_strategy\":\""
             << JsonEscape(output.performance.pipelineSpecializationStrategy)
+            << "\",\"binary_archive_path\":\""
+            << JsonEscape(output.performance.pipelineBinaryArchivePath)
             << "\",\"records\":[";
     for (size_t i = 0; i < output.performance.pipelineCompileKeys.size(); ++i) {
         if (i > 0) {
@@ -5335,14 +6975,72 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << (output.performance.hardwareRaytracingAvailable ? "true" : "false")
             << ",\"explicit_restir_di_graph_requested\":"
             << (directRestirRequested ? "true" : "false")
+            << ",\"restir_di_path_status\":\""
+            << JsonEscape(output.performance.restirDiPathStatus) << "\""
             << ",\"ml_backend_mode\":\"" << MlBackendModeLabel(settings.mlBackendMode)
             << "\",\"spectral_mode\":\""
             << SpectralRenderingModeLabel(settings.spectralRenderingMode)
             << "\",\"volume_mode\":\"" << VolumeTransportModeLabel(settings.volumeTransportMode)
             << "\"},\n";
+    const auto disabledFeatureBytes = [&](const std::string& token) -> uint64_t {
+        uint64_t bytes = 0u;
+        for (size_t i = 0; i < output.performance.transportMemoryBytes.size(); ++i) {
+            const uint64_t recordBytes = output.performance.transportMemoryBytes[i];
+            if (recordBytes == 0u) {
+                continue;
+            }
+            const std::string name = (i < output.performance.transportMemoryNames.size())
+                ? output.performance.transportMemoryNames[i]
+                : std::string();
+            const std::string featureGate = (i < output.performance.transportMemoryFeatureGates.size())
+                ? output.performance.transportMemoryFeatureGates[i]
+                : std::string();
+            if (name.find(token) != std::string::npos ||
+                featureGate.find(token) != std::string::npos) {
+                bytes += recordBytes;
+            }
+        }
+        return bytes;
+    };
+    const uint64_t disabledPathGuidingBytes =
+        settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Off
+            ? disabledFeatureBytes("PathGuiding")
+            : 0u;
+    const uint64_t disabledRadianceCacheBytes =
+        settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Off
+            ? disabledFeatureBytes("RadianceCache")
+            : 0u;
+    outFile << "    \"disabled_feature_cost\": {"
+            << "\"policy\":\"runtime preheats the shared pipeline set at startup and reports compile records; disabled feature per-frame allocations and dispatches are expected to stay zero or metadata-only\","
+            << "\"restir_di_disabled_dispatches\":"
+            << (!directRestirRequested
+                    ? (output.performance.restirDiInitializeDispatchCount +
+                       output.performance.restirDiInitialCandidateDispatchCount +
+                       output.performance.restirDiTemporalReuseDispatchCount +
+                       output.performance.restirDiSpatialReuseDispatchCount +
+                       output.performance.restirDiVisibilityDispatchCount +
+                       output.performance.restirDiApplyLightingDispatchCount)
+                    : 0u)
+            << ",\"path_guiding_disabled_bytes\":"
+            << disabledPathGuidingBytes
+            << ",\"radiance_cache_disabled_bytes\":"
+            << disabledRadianceCacheBytes
+            << ",\"ml_disabled_pass_count\":"
+            << (settings.mlBackendMode == PathTracer::RenderSettings::MlBackendMode::Off
+                    ? output.performance.mlBackendPassCount
+                    : 0u)
+            << ",\"svgf_disabled_dispatches\":"
+            << (!settings.svgfDenoiseEnabled ? 0u : 0u)
+            << ",\"residual_startup_compile_records\":"
+            << output.performance.pipelineCompileKeys.size()
+            << ",\"residual_startup_compile_policy\":\"visible_pipeline_compile_records_and_binary_archive_cache\""
+            << "},\n";
     outFile << "    \"pass_timing_summary\": {"
             << "\"gpu_bucket_timing_available\":"
             << (output.performance.gpuBucketTimingAvailable ? "true" : "false")
+            << ",\"frame_graph_pass_timing_available\":"
+            << (output.performance.passGraphTimingAvailable ? "true" : "false")
+            << ",\"sample_window\":\"completed_headless_frames\""
             << ",\"intersect_ms\":"
             << output.performance.gpuBucketIntersectSeconds * 1000.0
             << ",\"shade_ms\":"
@@ -5373,6 +7071,37 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << ",\"wavefront_queue_bytes\":"
             << output.performance.wavefrontQueueBytesTotal
             << "},\n";
+    {
+        const uint64_t accelerationBytes =
+            sceneMemory.blasMemoryBytes + sceneMemory.tlasMemoryBytes + sceneMemory.scratchMemoryBytes;
+        const uint64_t attributedBytes =
+            sceneMemory.geometryMemoryBytes +
+            sceneMemory.textureAllocatedMemoryBytes +
+            accelerationBytes +
+            output.performance.transportMemoryBytesTotal +
+            output.performance.wavefrontQueueBytesTotal +
+            output.performance.restirDiResourceBytesTotal;
+        const uint64_t residualBytes =
+            output.performance.currentAllocatedBytes > attributedBytes
+                ? output.performance.currentAllocatedBytes - attributedBytes
+                : 0u;
+        outFile << "    \"subsystem_memory_breakdown\": {"
+                << "\"accounting_source\":\"SceneMemoryReport plus TransportMemoryRegistry runtime records\","
+                << "\"scene_geometry_bytes\":" << sceneMemory.geometryMemoryBytes
+                << ",\"scene_texture_allocated_bytes\":"
+                << sceneMemory.textureAllocatedMemoryBytes
+                << ",\"acceleration_structure_bytes\":" << accelerationBytes
+                << ",\"transport_memory_bytes\":"
+                << output.performance.transportMemoryBytesTotal
+                << ",\"restir_di_graph_bytes\":"
+                << output.performance.restirDiResourceBytesTotal
+                << ",\"wavefront_queue_bytes\":"
+                << output.performance.wavefrontQueueBytesTotal
+                << ",\"unattributed_current_allocated_bytes\":"
+                << residualBytes
+                << ",\"unattributed_policy\":\"reported residual; includes runtime, drawable, compiler, framework, and graph texture allocations not itemized by transport registry\""
+                << "},\n";
+    }
     outFile << "    \"ml_backend_requested\": "
             << (output.performance.mlBackendRequested ? "true" : "false") << ",\n";
     outFile << "    \"ml_backend_active\": "
@@ -5395,6 +7124,14 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"ml_backend_pass_count\": " << output.performance.mlBackendPassCount << ",\n";
     outFile << "    \"acceleration_build_policy\": \""
             << JsonEscape(output.performance.accelerationBuildPolicy) << "\",\n";
+    outFile << "    \"acceleration_build_policy_reason\": \""
+            << JsonEscape(output.performance.accelerationBuildPolicyReason) << "\",\n";
+    outFile << "    \"acceleration_compaction_policy\": \""
+            << JsonEscape(output.performance.accelerationCompactionPolicy) << "\",\n";
+    outFile << "    \"acceleration_blas_compaction_ratio\": "
+            << output.performance.accelerationBlasCompactionRatio << ",\n";
+    outFile << "    \"acceleration_tlas_compaction_ratio\": "
+            << output.performance.accelerationTlasCompactionRatio << ",\n";
     outFile << "    \"acceleration_identity_stable\": "
             << (output.performance.accelerationIdentityStable ? "true" : "false") << ",\n";
     outFile << "    \"acceleration_identity_strategy\": \""
@@ -5405,6 +7142,8 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << (output.performance.accelerationCustomIntersectionFunctionsSupported ? "true" : "false") << ",\n";
     outFile << "    \"acceleration_custom_intersection_functions_enabled\": "
             << (output.performance.accelerationCustomIntersectionFunctionsEnabled ? "true" : "false") << ",\n";
+    outFile << "    \"acceleration_traversal_coverage\": \""
+            << JsonEscape(output.performance.accelerationTraversalCoverage) << "\",\n";
     outFile << "    \"acceleration_primitive_count\": "
             << output.performance.accelerationPrimitiveCount << ",\n";
     outFile << "    \"acceleration_instance_count\": "
@@ -5450,10 +7189,73 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"transport_memory_bytes_shared\": " << output.performance.transportMemoryBytesShared << ",\n";
     outFile << "    \"transport_memory_bytes_staging\": " << output.performance.transportMemoryBytesStaging << ",\n";
     outFile << "    \"transport_memory_record_count\": " << output.performance.transportMemoryRecordCount << ",\n";
+    outFile << "    \"transport_memory_allocator_backed_record_count\": "
+            << output.performance.transportMemoryAllocatorBackedRecordCount << ",\n";
+    outFile << "    \"transport_memory_frame_graph_backed_record_count\": "
+            << output.performance.transportMemoryFrameGraphBackedRecordCount << ",\n";
+    outFile << "    \"transport_memory_ownership_gap_record_count\": "
+            << output.performance.transportMemoryOwnershipGapRecordCount << ",\n";
     outFile << "    \"transport_memory_invalidated_record_count\": "
             << output.performance.transportMemoryInvalidatedRecordCount << ",\n";
     outFile << "    \"wavefront_queue_compaction_cost_ms\": "
             << output.performance.wavefrontQueueCompactionCostMs << ",\n";
+    outFile << "    \"wavefront_stage_gpu_time_ms\": {"
+            << "\"intersect\":" << output.performance.gpuBucketIntersectSeconds * 1000.0
+            << ",\"shade\":" << output.performance.gpuBucketShadeSeconds * 1000.0
+            << ",\"shadow\":" << output.performance.gpuBucketShadowQueueSeconds * 1000.0
+            << "},\n";
+    outFile << "    \"wavefront_stage_active_work_count\": {"
+            << "\"intersect\":" << output.performance.wavefrontIntersectProcessedCount
+            << ",\"shade\":" << output.performance.wavefrontShadeProcessedCount
+            << ",\"shadow\":" << output.performance.wavefrontShadowProcessedCount
+            << "},\n";
+    outFile << "    \"wavefront_stage_dispatched_thread_count\": {"
+            << "\"intersect\":" << output.performance.wavefrontIntersectProcessedCount
+            << ",\"shade\":" << shadeDispatchedThreadCount
+            << ",\"shadow\":" << shadowDispatchedThreadCount
+            << "},\n";
+    outFile << "    \"wavefront_stage_inactive_lane_estimate\": {"
+            << "\"intersect\":0"
+            << ",\"shade\":" << shadeInactiveLaneEstimate
+            << ",\"shadow\":" << shadowInactiveLaneEstimate
+            << "},\n";
+    {
+        const char* wavefrontQueueLabels[] = {
+            "primary", "diffuse", "glossy", "specular",
+            "transmission", "shadow", "material_eval", "reservoir_update",
+            "medium", "cache_query", "cache_training", "guiding_training",
+        };
+        outFile << "    \"wavefront_queue_storage_policy\": {";
+        for (uint32_t i = 0u; i < HeadlessRenderOutput::kWavefrontQueueMetricCount; ++i) {
+            if (i > 0u) {
+                outFile << ",";
+            }
+            const char* queueStoragePolicy =
+                output.performance.wavefrontQueueCapacities[i] == 0u
+                    ? "metadata_only"
+                    : (i == 5u ? "physical_sparse" : "physical_compact");
+            outFile << "\"" << wavefrontQueueLabels[i] << "\":\"" << queueStoragePolicy << "\"";
+        }
+        outFile << "},\n";
+        outFile << "    \"wavefront_queue_dispatch_policy\": {";
+        for (uint32_t i = 0u; i < HeadlessRenderOutput::kWavefrontQueueMetricCount; ++i) {
+            if (i > 0u) {
+                outFile << ",";
+            }
+            const char* queueDispatchPolicy = "metadata_only_or_future_stage";
+            if (i == 0u) {
+                queueDispatchPolicy = "primary_generation_direct_grid_then_active_count_intersect";
+            } else if (i >= 1u && i <= 4u) {
+                queueDispatchPolicy = "active_count_indirect_intersect_queue";
+            } else if (i == 5u) {
+                queueDispatchPolicy = guardedShadowIndirect
+                    ? "sparse_storage_indexed_active_count_indirect_guarded"
+                    : "direct_grid_sparse_storage_platform_limited";
+            }
+            outFile << "\"" << wavefrontQueueLabels[i] << "\":\"" << queueDispatchPolicy << "\"";
+        }
+        outFile << "},\n";
+    }
     outFile << "    \"wavefront_queue_metrics\": [";
     const char* wavefrontQueueLabels[] = {
         "primary", "diffuse", "glossy", "specular",
@@ -5548,6 +7350,12 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
         const bool temporaryShared = (i < output.performance.transportMemoryTemporaryShared.size())
             ? (output.performance.transportMemoryTemporaryShared[i] != 0u)
             : false;
+        const bool frameGraphOwned = (i < output.performance.transportMemoryFrameGraphOwned.size())
+            ? (output.performance.transportMemoryFrameGraphOwned[i] != 0u)
+            : false;
+        const bool allocatorOwned = (i < output.performance.transportMemoryAllocatorOwned.size())
+            ? (output.performance.transportMemoryAllocatorOwned[i] != 0u)
+            : false;
         outFile << "{\"name\":\"" << JsonEscape(output.performance.transportMemoryNames[i])
                 << "\",\"kind\":\"" << JsonEscape(kind)
                 << "\",\"owner\":\"" << JsonEscape(owner)
@@ -5561,6 +7369,8 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                 << "\",\"migration_risk\":\"" << JsonEscape(migrationRisk)
                 << "\",\"hot_path\":" << (hotPath ? "true" : "false")
                 << ",\"temporary_shared\":" << (temporaryShared ? "true" : "false")
+                << ",\"frame_graph_owned\":" << (frameGraphOwned ? "true" : "false")
+                << ",\"allocator_owned\":" << (allocatorOwned ? "true" : "false")
                 << ",\"bytes\":" << bytes
                 << ",\"width\":" << width
                 << ",\"height\":" << height
@@ -5611,6 +7421,22 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"history_reset_reason\": \""
             << JsonEscape(output.performance.historyResetReason) << "\",\n";
     outFile << "    \"pass_count\": " << output.performance.passGraphNames.size() << ",\n";
+    outFile << "    \"timing_available\": "
+            << (output.performance.passGraphTimingAvailable ? "true" : "false") << ",\n";
+    outFile << "    \"timing_sample_window\": \"completed_headless_frames\",\n";
+    outFile << "    \"timings\": [";
+    for (size_t i = 0; i < output.performance.passGraphTimingNames.size(); ++i) {
+        if (i > 0) {
+            outFile << ", ";
+        }
+        const double passMs =
+            i < output.performance.passGraphTimingMs.size()
+                ? output.performance.passGraphTimingMs[i]
+                : 0.0;
+        outFile << "{\"pass\":\"" << JsonEscape(output.performance.passGraphTimingNames[i])
+                << "\",\"gpu_ms\":" << passMs << "}";
+    }
+    outFile << "],\n";
     outFile << "    \"passes\": [";
     for (size_t i = 0; i < output.performance.passGraphNames.size(); ++i) {
         if (i > 0) {
@@ -5688,6 +7514,10 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             (i < output.performance.passGraphResourceDebugReadbackPolicies.size())
                 ? output.performance.passGraphResourceDebugReadbackPolicies[i]
                 : std::string();
+        const std::string clearLoadPolicy =
+            (i < output.performance.passGraphResourceClearLoadPolicies.size())
+                ? output.performance.passGraphResourceClearLoadPolicies[i]
+                : std::string();
         const std::string migrationRisk =
             (i < output.performance.passGraphResourceMigrationRisks.size())
                 ? output.performance.passGraphResourceMigrationRisks[i]
@@ -5723,6 +7553,7 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                 << "\",\"target_owner\":\"" << JsonEscape(targetOwner)
                 << "\",\"feature_gate\":\"" << JsonEscape(featureGate)
                 << "\",\"debug_readback_policy\":\"" << JsonEscape(debugReadbackPolicy)
+                << "\",\"clear_load_policy\":\"" << JsonEscape(clearLoadPolicy)
                 << "\",\"migration_risk\":\"" << JsonEscape(migrationRisk)
                 << "\",\"hot_path\":" << (hotPath ? "true" : "false")
                 << ",\"temporary_shared\":" << (temporaryShared ? "true" : "false")
@@ -5839,6 +7670,36 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
         output.performance.restirDiSpatialReuseDispatchCount +
         output.performance.restirDiVisibilityDispatchCount +
         output.performance.restirDiApplyLightingDispatchCount;
+    const bool integratedExplicitRestirDi =
+        output.performance.restirDiPathStatus == "explicit_megakernel_integrated" ||
+        output.performance.restirDiPathStatus == "explicit_wavefront";
+    const uint64_t explicitRestirDiActivity =
+        explicitRestirDiDispatches +
+        (integratedExplicitRestirDi ? 1u : 0u);
+    const std::string restirDiSelectedPath = !directRestirRequested
+        ? std::string("disabled")
+        : (integratedExplicitRestirDi
+               ? std::string("explicit_integrated")
+               : (!output.performance.restirDiPathStatus.empty()
+               ? output.performance.restirDiPathStatus
+               : (explicitRestirDiDispatches > 0u ? std::string("explicit_d_graph")
+                                                  : std::string("fused_reference_path"))));
+    // Homogeneous volumes run ReSTIR DI as baseline_emissive on Metal (RestirDiDemotedByVolume); the path status is
+    // then volume_baseline_emissive.
+    const bool volumeRestirDiDisabled = metalVolumeHomogeneous && PathTracer::RestirDiDemotedByVolume(settings);
+    const std::string restirDiReason = !directRestirRequested
+        ? std::string("direct light mode does not request ReSTIR DI")
+        : volumeRestirDiDisabled
+        ? std::string("ReSTIR DI does not run with homogeneous volume transport (its reservoirs carry no medium "
+                      "state); baseline_emissive renders instead")
+        : (integratedExplicitRestirDi
+               ? std::string("explicit integrated direct-light stage selected")
+               : (explicitRestirDiDispatches > 0u
+                      ? std::string("explicit D graph dispatched")
+                      : (output.performance.restirDiPathStatus == "fused_megakernel_wavefront_fallback"
+                             ? std::string("the wavefront fell back to the megakernel, which has no wavefront "
+                                           "explicit stage; the megakernel's fused direct light selected")
+                             : std::string("explicit D graph did not dispatch; fused/reference path selected"))));
     writeFallbackReport("traversal",
                         "configured_intersection_provider",
                         output.performance.hardwareRaytracingActive
@@ -5858,49 +7719,131 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                             output.performance.hardwareRaytracingFallbackActive);
     writeFallbackReport("restir_di",
                         DirectLightModeLabel(settings.directLightMode),
-                        !directRestirRequested
-                            ? "disabled"
-                            : (explicitRestirDiDispatches > 0u ? "explicit_d_graph"
-                                                                : "fused_reference_path"),
-                        !directRestirRequested
-                            ? "direct light mode does not request ReSTIR DI"
-                            : (explicitRestirDiDispatches > 0u
-                                   ? "explicit D graph dispatched"
-                                   : "explicit D graph did not dispatch; fused/reference path selected"),
-                        explicitRestirDiDispatches,
+                        restirDiSelectedPath.c_str(),
+                        restirDiReason.c_str(),
+                        explicitRestirDiActivity,
                         "direct_lighting",
-                        directRestirRequested && explicitRestirDiDispatches == 0u);
+                        directRestirRequested && explicitRestirDiActivity == 0u);
     writeFallbackReport("path_guiding",
                         PathGuidingModeLabel(settings.pathGuidingMode),
-                        settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype
-                            ? "prototype_guiding_provider"
+                        metalVolumeHomogeneous &&
+                                settings.pathGuidingMode ==
+                                    PathTracer::RenderSettings::PathGuidingMode::Prototype
+                            ? "disabled_by_volume_fallback"
+                            : settings.pathGuidingMode ==
+                                      PathTracer::RenderSettings::PathGuidingMode::Prototype
+                            ? "production_guiding_provider"
                             : "disabled",
-                        output.pbrMetrics.pathGuidingFallbackCount > 0u
+                        metalVolumeHomogeneous &&
+                                settings.pathGuidingMode ==
+                                    PathTracer::RenderSettings::PathGuidingMode::Prototype
+                            ? "path-guiding provider is surface-domain only; medium segments use phase-function sampling"
+                            : output.pbrMetrics.pathGuidingFallbackCount > 0u
                             ? "guiding provider rejected or lacked confidence for some samples"
                             : "no path guiding sample fallback recorded",
-                        output.pbrMetrics.pathGuidingFallbackCount,
+                        metalVolumeHomogeneous &&
+                                settings.pathGuidingMode ==
+                                    PathTracer::RenderSettings::PathGuidingMode::Prototype
+                            ? 1u
+                            : output.pbrMetrics.pathGuidingFallbackCount,
                         "path_guiding",
-                        output.pbrMetrics.pathGuidingFallbackCount > 0u);
+                        output.pbrMetrics.pathGuidingFallbackCount > 0u ||
+                            (metalVolumeHomogeneous &&
+                             settings.pathGuidingMode ==
+                                 PathTracer::RenderSettings::PathGuidingMode::Prototype));
     writeFallbackReport("radiance_cache",
                         RadianceCacheModeLabel(settings.radianceCacheMode),
-                        settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Prototype
-                            ? "prototype_radiance_provider"
+                        radianceCacheRefusal ? "refused"
+                        : volumeRadianceCacheDisabled
+                            ? "disabled_by_volume_fallback"
+                            : settings.radianceCacheMode ==
+                                      PathTracer::RenderSettings::RadianceCacheMode::Prototype
+                            ? "production_world_grid_radiance_provider"
                             : "disabled",
-                        output.pbrMetrics.radianceCacheFallbackCount > 0u
+                        radianceCacheRefusal ? PathTracer::RadianceCacheRefusalMessage(radianceCacheRefusal)
+                        : volumeRadianceCacheDisabled
+                            ? "radiance-cache query records do not include medium-state keys; volume paths fall back to path tracing"
+                            : output.pbrMetrics.radianceCacheFallbackCount > 0u
                             ? "radiance provider miss or low confidence fell back to path continuation"
                             : "no radiance cache fallback recorded",
-                        output.pbrMetrics.radianceCacheFallbackCount,
+                        (radianceCacheRefusal || volumeRadianceCacheDisabled)
+                            ? 1u
+                            : output.pbrMetrics.radianceCacheFallbackCount,
                         "radiance_cache",
-                        output.pbrMetrics.radianceCacheFallbackCount > 0u);
+                        output.pbrMetrics.radianceCacheFallbackCount > 0u || radianceCacheRefusal != nullptr ||
+                            volumeRadianceCacheDisabled);
+    writeFallbackReport("volume_restir_di_interaction",
+                        DirectLightModeLabel(settings.directLightMode),
+                        volumeRestirDiDisabled ? "volume_baseline_emissive" : "unchanged",
+                        volumeRestirDiDisabled
+                            ? "ReSTIR DI does not run with homogeneous volume transport (its reservoirs carry no medium state); baseline_emissive renders instead"
+                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
+                            : "no volume/ReSTIR DI fallback required",
+                        volumeRestirDiDisabled ? 1u : 0u,
+                        "volume_transport",
+                        volumeRestirDiDisabled);
+    const bool volumeRestirGiPtDisabled =
+        metalVolumeHomogeneous &&
+        (settings.restirGiMode != PathTracer::RenderSettings::RestirGiMode::Off ||
+         settings.restirPtMode != PathTracer::RenderSettings::RestirPtMode::Off);
+    writeFallbackReport("volume_restir_gi_pt_interaction",
+                        RestirGiModeLabel(settings.restirGiMode),
+                        volumeRestirGiPtDisabled ? "path_continuation" : "unchanged",
+                        volumeRestirGiPtDisabled
+                            ? "ReSTIR GI/PT reservoirs do not include medium-state keys; volume paths fall back to path continuation"
+                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
+                            : "no volume/ReSTIR GI/PT fallback required",
+                        volumeRestirGiPtDisabled ? 1u : 0u,
+                        "volume_transport",
+                        volumeRestirGiPtDisabled);
+    const bool volumeGuidingDisabled =
+        metalVolumeHomogeneous &&
+        settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype;
+    writeFallbackReport("volume_path_guiding_interaction",
+                        PathGuidingModeLabel(settings.pathGuidingMode),
+                        volumeGuidingDisabled ? "phase_sampling" : "unchanged",
+                        volumeGuidingDisabled
+                            ? "path-guiding provider is surface-domain only; medium segments use phase-function sampling"
+                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
+                            : "no volume/path-guiding fallback required",
+                        volumeGuidingDisabled ? 1u : 0u,
+                        "volume_transport",
+                        volumeGuidingDisabled);
+    writeFallbackReport("volume_radiance_cache_interaction",
+                        RadianceCacheModeLabel(settings.radianceCacheMode),
+                        volumeRadianceCacheDisabled ? "path_tracing" : "unchanged",
+                        volumeRadianceCacheDisabled
+                            ? "radiance-cache query records do not include medium-state keys; volume paths fall back to path tracing"
+                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
+                            : "no volume/radiance-cache fallback required",
+                        volumeRadianceCacheDisabled ? 1u : 0u,
+                        "volume_transport",
+                        volumeRadianceCacheDisabled);
+    const bool restirPtEnhancedRequested = RestirPtEnhancedActive(settings.restirPtMode);
+    writeFallbackReport("restir_pt_enhanced_paper_features",
+                        RestirPtModeLabel(settings.restirPtMode),
+                        !restirPtEnhancedRequested ? "disabled"
+                            : options.backend == HeadlessBackend::Embree ? "ordinary_cpu_capture_reuse"
+                            : metalVolumeHomogeneous ? "disabled_by_volume_fallback" : "fused_directional_reuse_heuristics",
+                        restirPtEnhancedRequested
+                            ? "configuration fallback: paired_spatial_reuse, footprint_reconnection, duplication_decorrelation/cCap, unified_di_gi, vector_shading_weights, dual_motion_vectors, replay_compaction unsupported; count is configuration-only, not a renderer counter"
+                            : "ReSTIR PT Enhanced not requested",
+                        restirPtEnhancedRequested ? 1u : 0u,
+                        "restir_pt_enhanced",
+                        restirPtEnhancedRequested);
     writeFallbackReport("ml_backend",
                         MlBackendModeLabel(settings.mlBackendMode),
                         output.performance.mlBackendActive
                             ? output.performance.mlBackendProvider.c_str()
                             : "disabled",
-                        output.performance.mlBackendFallbackReason.empty()
-                            ? "ml backend disabled"
-                            : output.performance.mlBackendFallbackReason.c_str(),
-                        output.performance.mlBackendPassCount,
+                        output.performance.mlBackendActive
+                            ? "custom Metal ML backend active"
+                            : (output.performance.mlBackendFallbackReason.empty()
+                                   ? "ml backend disabled"
+                                   : output.performance.mlBackendFallbackReason.c_str()),
+                        output.performance.mlBackendActive
+                            ? output.performance.mlBackendPassCount
+                            : (settings.mlBackendMode != PathTracer::RenderSettings::MlBackendMode::Off ? 1u : 0u),
                         "reconstruction",
                         settings.mlBackendMode != PathTracer::RenderSettings::MlBackendMode::Off &&
                             !output.performance.mlBackendNativeAccelerationAvailable);
@@ -5919,6 +7862,17 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                         wavefrontOverflowCount,
                         "wavefront",
                         wavefrontOverflowCount > 0u);
+    const bool wavefrontMegakernelFallback = output.performance.wavefrontMegakernelFallback != "none";
+    writeFallbackReport("wavefront_executor",
+                        settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront
+                            ? "wavefront"
+                            : "megakernel",
+                        wavefrontMegakernelFallback ? "megakernel_fallback" : "configured_executor",
+                        wavefrontMegakernelFallback ? output.performance.wavefrontMegakernelFallback.c_str()
+                                                    : "no fallback to the megakernel recorded",
+                        wavefrontMegakernelFallback ? 1u : 0u,
+                        "wavefront",
+                        wavefrontMegakernelFallback);
     outFile << "],\n";
     outFile << "  \"renderer\": {\n";
     outFile << "    \"available\": " << (output.pbrMetrics.available ? "true" : "false") << ",\n";
@@ -5956,6 +7910,12 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << output.pbrMetrics.mneeRectAddedCount << ",\n";
     outFile << "    \"mnee_contribution_count\": "
             << output.pbrMetrics.mneeContributionCount << ",\n";
+    outFile << "    \"restir_di_regir_candidate_count\": "
+            << output.pbrMetrics.restirDiRegirCandidateCount << ",\n";
+    outFile << "    \"restir_di_regir_accepted_count\": "
+            << output.pbrMetrics.restirDiRegirAcceptedCount << ",\n";
+    outFile << "    \"restir_di_regir_fallback_count\": "
+            << output.pbrMetrics.restirDiRegirFallbackCount << ",\n";
     outFile << "    \"restir_gi_candidate_count\": "
             << output.pbrMetrics.restirGiCandidateCount << ",\n";
     outFile << "    \"restir_gi_reservoir_update_count\": "
@@ -5992,6 +7952,52 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << output.pbrMetrics.restirPtReuseRejectedInvalidCount << ",\n";
     outFile << "    \"restir_pt_reuse_fallback_count\": "
             << output.pbrMetrics.restirPtReuseFallbackCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_candidate_count\": "
+            << output.pbrMetrics.restirPtEnhancedCandidateCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_initial_selected_count\": "
+            << output.pbrMetrics.restirPtEnhancedInitialSelectedCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_temporal_accepted_count\": "
+            << output.pbrMetrics.restirPtEnhancedTemporalAcceptedCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_temporal_rejected_count\": "
+            << output.pbrMetrics.restirPtEnhancedTemporalRejectedCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_spatial_accepted_count\": "
+            << output.pbrMetrics.restirPtEnhancedSpatialAcceptedCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_spatial_rejected_count\": "
+            << output.pbrMetrics.restirPtEnhancedSpatialRejectedCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_invalid_shift\": {\n";
+    outFile << "      \"geometry\": " << output.pbrMetrics.restirPtEnhancedInvalidShiftGeometryCount << ",\n";
+    outFile << "      \"material\": " << output.pbrMetrics.restirPtEnhancedInvalidShiftMaterialCount << ",\n";
+    outFile << "      \"pdf\": " << output.pbrMetrics.restirPtEnhancedInvalidShiftPdfCount << ",\n";
+    outFile << "      \"visibility\": " << output.pbrMetrics.restirPtEnhancedInvalidShiftVisibilityCount << ",\n";
+    outFile << "      \"invertibility\": " << output.pbrMetrics.restirPtEnhancedInvalidShiftInvertibilityCount << ",\n";
+    outFile << "      \"unsupported\": " << output.pbrMetrics.restirPtEnhancedInvalidShiftUnsupportedCount << "\n";
+    outFile << "    },\n";
+    outFile << "    \"restir_pt_enhanced_duplicate_score_sum\": "
+            << output.pbrMetrics.restirPtEnhancedDuplicateScoreSum << ",\n";
+    outFile << "    \"restir_pt_enhanced_biased_cCap_application_count\": "
+            << output.pbrMetrics.restirPtEnhancedBiasedCCapApplicationCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_vector_weight_use_count\": "
+            << output.pbrMetrics.restirPtEnhancedVectorWeightUseCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_replay_compaction_input_count\": "
+            << output.pbrMetrics.restirPtEnhancedReplayCompactionInputCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_replay_compaction_output_count\": "
+            << output.pbrMetrics.restirPtEnhancedReplayCompactionOutputCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_fallback_count\": "
+            << output.pbrMetrics.restirPtEnhancedFallbackCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_canonical_sample_count\": "
+            << output.pbrMetrics.restirPtEnhancedCanonicalSampleCount << ",\n";
+    outFile << "    \"restir_pt_enhanced_path_length_histogram\": [";
+    for (uint32_t i = 0u; i < HeadlessRenderOutput::PbrMetrics::kRestirPtEnhancedHistogramBins; ++i) {
+        if (i > 0u) outFile << ", ";
+        outFile << output.pbrMetrics.restirPtEnhancedPathLengthHistogram[i];
+    }
+    outFile << "],\n";
+    outFile << "    \"restir_pt_enhanced_reconnection_depth_histogram\": [";
+    for (uint32_t i = 0u; i < HeadlessRenderOutput::PbrMetrics::kRestirPtEnhancedHistogramBins; ++i) {
+        if (i > 0u) outFile << ", ";
+        outFile << output.pbrMetrics.restirPtEnhancedReconnectionDepthHistogram[i];
+    }
+    outFile << "],\n";
     outFile << "    \"radiance_cache_query_count\": "
             << output.pbrMetrics.radianceCacheQueryCount << ",\n";
     outFile << "    \"radiance_cache_hit_count\": "
@@ -6004,6 +8010,9 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << output.pbrMetrics.radianceCacheFallbackCount << ",\n";
     outFile << "    \"radiance_cache_invalid_count\": "
             << output.pbrMetrics.radianceCacheInvalidCount << ",\n";
+    outFile << "    \"radiance_cache_stats\": ";
+    WriteRadianceCacheStatsJson(outFile, output.pbrMetrics);
+    outFile << ",\n";
     outFile << "    \"caustic_eye_vertex_count\": "
             << output.pbrMetrics.causticEyeVertexCount << ",\n";
     outFile << "    \"caustic_light_vertex_count\": "
@@ -6034,6 +8043,10 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
             << output.pbrMetrics.spectralDispersionEventCount << ",\n";
     outFile << "    \"spectral_fallback_count\": "
             << output.pbrMetrics.spectralFallbackCount << ",\n";
+    outFile << "    \"spectral_collapse_count\": "
+            << output.pbrMetrics.spectralCollapseCount << ",\n";
+    outFile << "    \"spectral_wavelength_channel_sample_count\": "
+            << output.pbrMetrics.spectralWavelengthChannelSampleCount << ",\n";
     outFile << "    \"max_throughput_by_bounce\": [";
     for (size_t i = 0; i < output.pbrMetrics.maxThroughputByBounce.size(); ++i) {
         if (i > 0) {
@@ -6049,7 +8062,12 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
         error = "Failed while writing metrics JSON: " + jsonPath.string();
         return false;
     }
-    return true;
+    outFile.close();
+    if (!outFile) {
+        error = "Failed while closing metrics temp file: " + tmpPath.string();
+        return false;
+    }
+    return PublishTempFileAtomic(tmpPath, jsonPath, error);
 }
 
 bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
@@ -6059,18 +8077,20 @@ bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
                                  const HeadlessRenderOutput& output,
                                  const ImagePbrMetrics& imageMetrics,
                                  std::string& error) {
-    std::ofstream outFile(jsonPath);
-    if (!outFile.is_open()) {
-        error = "Failed to open ReSTIR debug metrics file for writing: " + jsonPath.string();
+    fs::path tmpPath;
+    std::ofstream outFile;
+    if (!OpenAtomicSidecarStream(jsonPath, tmpPath, outFile, error, "ReSTIR debug metrics JSON")) {
         return false;
     }
 
+    // The mode the backend ran: homogeneous volumes demote ReSTIR DI to baseline_emissive on Metal.
+    const PathTracer::RenderSettings::DirectLightMode ranDirectLightMode = RunDirectLightMode(options, settings);
     const bool directActive =
-        settings.directLightMode != PathTracer::RenderSettings::DirectLightMode::LegacyRect &&
-        settings.directLightMode != PathTracer::RenderSettings::DirectLightMode::BaselineEmissive;
-    const bool worldActive = RestirWorldModeActive(settings.directLightMode);
+        ranDirectLightMode != PathTracer::RenderSettings::DirectLightMode::LegacyRect &&
+        ranDirectLightMode != PathTracer::RenderSettings::DirectLightMode::BaselineEmissive;
+    const bool worldActive = RestirWorldModeActive(ranDirectLightMode);
     const bool giActive =
-        settings.restirGiMode == PathTracer::RenderSettings::RestirGiMode::DiffusePrototype;
+        settings.restirGiMode == PathTracer::RenderSettings::RestirGiMode::ProductionDiffuse;
     const bool pathGuidingActive =
         settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype;
     const bool restirPtActive =
@@ -6105,6 +8125,9 @@ bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
     outFile << "    \"debugPixel\": {\"enabled\": false, \"x\": 0, \"y\": 0},\n";
 #endif
     outFile << "    \"modes\": {\n";
+    outFile << "      \"renderMode\": \"" << RenderModeLabel(options.renderMode) << "\",\n";
+    outFile << "      \"renderProfile\": \"" << RenderProfileLabel(options.renderProfile) << "\",\n";
+    outFile << "      \"backend\": \"" << (options.backend == HeadlessBackend::Embree ? "embree" : "metal") << "\",\n";
     outFile << "      \"executionMode\": \""
             << (settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront
                     ? "wavefront"
@@ -6113,10 +8136,14 @@ bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
     outFile << "      \"wavefrontSchedulingPolicy\": \""
             << WavefrontSchedulingPolicyLabel(settings.wavefrontSchedulingPolicy) << "\",\n";
     outFile << "      \"directLightMode\": \"" << DirectLightModeLabel(settings.directLightMode) << "\",\n";
+    outFile << "      \"volumeDirectLightFallback\": \""
+            << JsonEscape(VolumeDirectLightFallbackLabel(options, settings)) << "\",\n";
     outFile << "      \"restirGiMode\": \"" << RestirGiModeLabel(settings.restirGiMode) << "\",\n";
     outFile << "      \"pathGuidingMode\": \"" << PathGuidingModeLabel(settings.pathGuidingMode) << "\",\n";
     outFile << "      \"restirPtMode\": \"" << RestirPtModeLabel(settings.restirPtMode) << "\",\n";
-    outFile << "      \"svgfDenoise\": " << (settings.svgfDenoiseEnabled ? "true" : "false") << "\n";
+    outFile << "      \"svgfDenoise\": " << (settings.svgfDenoiseEnabled ? "true" : "false") << ",\n";
+    outFile << "      \"svgfDenoiseDirect\": " << (settings.svgfDenoiseDirect ? "true" : "false") << ",\n";
+    outFile << "      \"svgfDenoiseIndirect\": " << (settings.svgfDenoiseIndirect ? "true" : "false") << "\n";
     outFile << "    },\n";
     outFile << "    \"counters\": {\n";
     outFile << "      \"directLightCandidateCount\": " << directLightCandidateCount << ",\n";
@@ -6141,12 +8168,25 @@ bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
     outFile << "      \"restirPtRejectedInvalidCount\": " << output.pbrMetrics.restirPtRejectedInvalidCount << ",\n";
     outFile << "      \"restirPtReuseRejectedInvalidCount\": " << output.pbrMetrics.restirPtReuseRejectedInvalidCount << ",\n";
     outFile << "      \"restirPtDebugRecordCount\": " << output.pbrMetrics.restirPtDebugRecordCount << ",\n";
+    outFile << "      \"restirPtEnhancedCandidateCount\": " << output.pbrMetrics.restirPtEnhancedCandidateCount << ",\n";
+    outFile << "      \"restirPtEnhancedInitialSelectedCount\": " << output.pbrMetrics.restirPtEnhancedInitialSelectedCount << ",\n";
+    outFile << "      \"restirPtEnhancedTemporalAcceptedCount\": " << output.pbrMetrics.restirPtEnhancedTemporalAcceptedCount << ",\n";
+    outFile << "      \"restirPtEnhancedTemporalRejectedCount\": " << output.pbrMetrics.restirPtEnhancedTemporalRejectedCount << ",\n";
+    outFile << "      \"restirPtEnhancedSpatialAcceptedCount\": " << output.pbrMetrics.restirPtEnhancedSpatialAcceptedCount << ",\n";
+    outFile << "      \"restirPtEnhancedSpatialRejectedCount\": " << output.pbrMetrics.restirPtEnhancedSpatialRejectedCount << ",\n";
+    outFile << "      \"restirPtEnhancedFallbackCount\": " << output.pbrMetrics.restirPtEnhancedFallbackCount << ",\n";
+    outFile << "      \"restirPtEnhancedCanonicalSampleCount\": " << output.pbrMetrics.restirPtEnhancedCanonicalSampleCount << ",\n";
+    outFile << "      \"restirPtEnhancedBiasedCCapApplicationCount\": " << output.pbrMetrics.restirPtEnhancedBiasedCCapApplicationCount << ",\n";
+    outFile << "      \"restirPtEnhancedVectorWeightUseCount\": " << output.pbrMetrics.restirPtEnhancedVectorWeightUseCount << ",\n";
     outFile << "      \"radianceCacheQueryCount\": " << output.pbrMetrics.radianceCacheQueryCount << ",\n";
     outFile << "      \"radianceCacheHitCount\": " << output.pbrMetrics.radianceCacheHitCount << ",\n";
     outFile << "      \"radianceCacheMissCount\": " << output.pbrMetrics.radianceCacheMissCount << ",\n";
     outFile << "      \"radianceCacheTrainCount\": " << output.pbrMetrics.radianceCacheTrainCount << ",\n";
     outFile << "      \"radianceCacheFallbackCount\": " << output.pbrMetrics.radianceCacheFallbackCount << ",\n";
     outFile << "      \"radianceCacheInvalidCount\": " << output.pbrMetrics.radianceCacheInvalidCount << ",\n";
+    outFile << "      \"radianceCacheStats\": ";
+    WriteRadianceCacheStatsJson(outFile, output.pbrMetrics);
+    outFile << ",\n";
     outFile << "      \"svgfActivePixelCount\": "
             << (settings.svgfDenoiseEnabled
                     ? static_cast<uint64_t>(output.width) * static_cast<uint64_t>(output.height)
@@ -6158,9 +8198,17 @@ bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
     outFile << "    \"sanity\": {\n";
     outFile << "      \"nanInf\": \"" << (nanInfCount == 0u ? "green" : "red") << "\",\n";
     outFile << "      \"defaultExperimentalGates\": \""
-            << ((!giActive && !pathGuidingActive && !restirPtActive && !radianceCacheActive && !settings.svgfDenoiseEnabled)
+            << ((!pathGuidingActive && !radianceCacheActive && !settings.svgfDenoiseEnabled)
                     ? "green"
                     : "yellow")
+            << "\",\n";
+    outFile << "      \"restirProductionModes\": \""
+            << ((giActive ||
+                 restirPtActive ||
+                 ranDirectLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDi ||
+                 ranDirectLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid)
+                    ? "active"
+                    : "inactive")
             << "\",\n";
     outFile << "      \"radianceCacheActivity\": \""
             << ((!radianceCacheActive || output.pbrMetrics.radianceCacheTrainCount > 0u) ? "green" : "yellow")
@@ -6180,27 +8228,73 @@ bool WriteRestirDebugMetricsJson(const fs::path& jsonPath,
                               : output.performance.historyResetReason)
             << "\"\n";
     outFile << "    },\n";
-    outFile << "    \"availableAOVs\": [\"beauty\", \"candidate_source_id\", \"reservoir_confidence\", \"regir_cell_id\", \"path_guiding_used_mask\", \"restir_pt_reuse_mask\", \"svgf_variance\", \"nan_inf_mask\"],\n";
+    outFile << "    \"availableAOVs\": [\"beauty\", \"albedo\", \"normal\", \"position_depth\", \"material_features\", \"motion_disocclusion\", \"candidate_source_id\", \"reservoir_confidence\", \"regir_cell_id\", \"path_guiding_used_mask\", \"restir_pt_reuse_mask\", \"svgf_variance\", \"nan_inf_mask\"],\n";
     outFile << "    \"unavailable\": [\"selected_light_id per-pixel image\", \"temporal rejection image\", \"spatial reuse-count image\", \"live ReGIR hit/miss hardware counters\"]\n";
     outFile << "  }\n";
     outFile << "}\n";
 
-    if (!outFile.good()) {
-        error = "Failed while writing ReSTIR debug metrics JSON: " + jsonPath.string();
-        return false;
-    }
-    return true;
+    return PublishAtomicSidecarStream(outFile, tmpPath, jsonPath, error, "ReSTIR debug metrics JSON");
 }
+// JSON has no NaN or infinity, and a stream writes them as "nan" and "inf", which no JSON parser accepts. Imbued on a
+// debug sidecar's stream, this facet writes a non-finite float or double as null and counts it. Finite values keep the
+// stream's own formatting. ImbueJsonNonFiniteAsNull returns the facet, which lives as long as the stream's locale, so
+// the writer can record the count in the sidecar and log it (ReportJsonNonFinite): never a silent substitute.
+class JsonNonFiniteAsNull : public std::num_put<char> {
+public:
+    mutable size_t nanCount = 0u;
+    mutable size_t infCount = 0u;
+
+protected:
+    iter_type do_put(iter_type out, std::ios_base& str, char_type fill, double value) const override {
+        if (std::isfinite(value)) {
+            return std::num_put<char>::do_put(out, str, fill, value);
+        }
+        return writeNull(out, std::isnan(value));
+    }
+    iter_type do_put(iter_type out, std::ios_base& str, char_type fill, long double value) const override {
+        if (std::isfinite(value)) {
+            return std::num_put<char>::do_put(out, str, fill, value);
+        }
+        return writeNull(out, std::isnan(value));
+    }
+
+private:
+    iter_type writeNull(iter_type out, bool isNan) const {
+        ++(isNan ? nanCount : infCount);
+        for (const char* c = "null"; *c != '\0'; ++c) {
+            *out++ = *c;
+        }
+        return out;
+    }
+};
+
+const JsonNonFiniteAsNull& ImbueJsonNonFiniteAsNull(std::ostream& stream) {
+    auto* facet = new JsonNonFiniteAsNull();  // owned by the locale
+    stream.imbue(std::locale(stream.getloc(), facet));
+    return *facet;
+}
+
+// Logs the non-finite values a sidecar wrote as null; writes nothing when there were none.
+void ReportJsonNonFinite(const JsonNonFiniteAsNull& facet, const char* label, const fs::path& jsonPath) {
+    if (facet.nanCount + facet.infCount == 0u) {
+        return;
+    }
+    std::cerr << "[" << label << "] warning: " << (facet.nanCount + facet.infCount)
+              << " non-finite values (" << facet.nanCount << " NaN, " << facet.infCount
+              << " infinite) written as null to " << jsonPath.string() << std::endl;
+}
+
 bool WriteMaterialMrDebugJson(const fs::path& jsonPath,
                               const CliOptions& options,
                               const fs::path& outputPath,
                               const HeadlessRenderOutput::MaterialMrDebugDump& debugDump,
                               std::string& error) {
-    std::ofstream outFile(jsonPath);
-    if (!outFile.is_open()) {
-        error = "Failed to open Material_MR debug file for writing: " + jsonPath.string();
+    fs::path tmpPath;
+    std::ofstream outFile;
+    if (!OpenAtomicSidecarStream(jsonPath, tmpPath, outFile, error, "Material_MR debug JSON")) {
         return false;
     }
+    const JsonNonFiniteAsNull& nonFinite = ImbueJsonNonFiniteAsNull(outFile);
     outFile << std::fixed << std::setprecision(9);
     outFile << "{\n";
     outFile << "  \"scene\": \"" << JsonEscape(options.scene) << "\",\n";
@@ -6222,9 +8316,6 @@ bool WriteMaterialMrDebugJson(const fs::path& jsonPath,
     auto writeFloat3 = [&](const char* name, simd::float3 v, bool trailing) {
         outFile << "  \"" << name << "\": [" << v.x << ", " << v.y << ", " << v.z << "]";
         outFile << (trailing ? ",\n" : "\n");
-    };
-    auto jsonFloat = [&](float value) {
-        return std::isfinite(value) ? value : 0.0f;
     };
     writeFloat2("uv0", debugDump.uv0, true);
     writeFloat2("uv1", debugDump.uv1, true);
@@ -6261,13 +8352,10 @@ bool WriteMaterialMrDebugJson(const fs::path& jsonPath,
     writeFloat3("final_specular_contribution", debugDump.finalSpecularContribution, true);
     writeFloat3("direct_contribution", debugDump.directContribution, true);
     outFile << "  \"direct_contribution_kind\": " << debugDump.directContributionKind << ",\n";
-    outFile << "  \"env_lod\": " << debugDump.envLod << "\n";
+    outFile << "  \"non_finite_values\": " << (nonFinite.nanCount + nonFinite.infCount) << "\n";
     outFile << "}\n";
-    if (!outFile.good()) {
-        error = "Failed while writing Material_MR debug JSON: " + jsonPath.string();
-        return false;
-    }
-    return true;
+    ReportJsonNonFinite(nonFinite, "Material_MR debug", jsonPath);
+    return PublishAtomicSidecarStream(outFile, tmpPath, jsonPath, error, "Material_MR debug JSON");
 }
 
 bool WriteDirectLightAuditJson(const fs::path& jsonPath,
@@ -6275,18 +8363,16 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
                                const fs::path& outputPath,
                                const HeadlessRenderOutput::DirectLightAuditDump& auditDump,
                                std::string& error) {
-    std::ofstream outFile(jsonPath);
-    if (!outFile.is_open()) {
-        error = "Failed to open direct-light audit file for writing: " + jsonPath.string();
+    fs::path tmpPath;
+    std::ofstream outFile;
+    if (!OpenAtomicSidecarStream(jsonPath, tmpPath, outFile, error, "direct-light audit JSON")) {
         return false;
     }
+    const JsonNonFiniteAsNull& nonFinite = ImbueJsonNonFiniteAsNull(outFile);
     outFile << std::fixed << std::setprecision(9);
     auto writeFloat3 = [&](const char* name, simd::float3 v, bool trailing) {
         outFile << "  \"" << name << "\": [" << v.x << ", " << v.y << ", " << v.z << "]";
         outFile << (trailing ? ",\n" : "\n");
-    };
-    auto jsonFloat = [&](float value) {
-        return std::isfinite(value) ? value : 0.0f;
     };
     outFile << "{\n";
     outFile << "  \"scene\": \"" << JsonEscape(options.scene) << "\",\n";
@@ -6300,6 +8386,7 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
     outFile << "    \"depth\": " << auditDump.depth << ",\n";
     outFile << "    \"material_index\": " << auditDump.materialIndex << ",\n";
     outFile << "    \"material_type\": " << auditDump.materialType << ",\n";
+    outFile << "    \"raw_material_type\": " << auditDump.rawMaterialType << ",\n";
     outFile << "    \"primitive_index\": " << auditDump.primitiveIndex << "\n";
     outFile << "  },\n";
     writeFloat3("hit_position", auditDump.hitPosition, true);
@@ -6310,6 +8397,19 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
     outFile << "  \"roughness\": " << auditDump.roughness << ",\n";
     outFile << "  \"base_color_lod\": " << auditDump.baseColorLod << ",\n";
     outFile << "  \"base_color_texture_index\": " << auditDump.baseColorTextureIndex << ",\n";
+    outFile << "  \"diffuse_occlusion\": " << auditDump.diffuseOcclusion << ",\n";
+    outFile << "  \"pbr_params\": [" << auditDump.pbrParams.x << ", "
+            << auditDump.pbrParams.y << ", "
+            << auditDump.pbrParams.z << ", "
+            << auditDump.pbrParams.w << "],\n";
+    outFile << "  \"pbr_extras\": [" << auditDump.pbrExtras.x << ", "
+            << auditDump.pbrExtras.y << ", "
+            << auditDump.pbrExtras.z << ", "
+            << auditDump.pbrExtras.w << "],\n";
+    outFile << "  \"type_eta\": [" << auditDump.typeEta.x << ", "
+            << auditDump.typeEta.y << ", "
+            << auditDump.typeEta.z << ", "
+            << auditDump.typeEta.w << "],\n";
     outFile << "  \"ris\": {\n";
     outFile << "    \"available\": " << (auditDump.ris.available ? "true" : "false") << ",\n";
     outFile << "    \"valid\": " << (auditDump.ris.valid ? "true" : "false") << ",\n";
@@ -6328,6 +8428,10 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
     outFile << "    \"w_sum\": " << auditDump.ris.wSum << ",\n";
     outFile << "    \"M\": " << auditDump.ris.M << ",\n";
     outFile << "    \"W\": " << auditDump.ris.W << ",\n";
+    outFile << "    \"rng_before\": " << auditDump.ris.rngBefore << ",\n";
+    outFile << "    \"rng_after\": " << auditDump.ris.rngAfter << ",\n";
+    outFile << "    \"rng_temporal_before\": " << auditDump.ris.rngTemporalBefore << ",\n";
+    outFile << "    \"rng_temporal_after\": " << auditDump.ris.rngTemporalAfter << ",\n";
     outFile << "    \"spatial_reuse_attempted\": "
             << (auditDump.ris.spatialReuseAttempted ? "true" : "false") << ",\n";
     outFile << "    \"spatial_neighbor_target\": " << auditDump.ris.spatialNeighborTarget << ",\n";
@@ -6399,6 +8503,57 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
     outFile << "    \"cache_last_mis_weight\": " << auditDump.ris.cacheLastMisWeight << ",\n";
     outFile << "    \"cache_last_merge_weight\": " << auditDump.ris.cacheLastMergeWeight << "\n";
     outFile << "  },\n";
+    outFile << "  \"ris_candidates\": [\n";
+    for (size_t i = 0; i < auditDump.risCandidates.size(); ++i) {
+        const auto& candidate = auditDump.risCandidates[i];
+        outFile << "    {\n";
+        outFile << "      \"candidate_index\": " << candidate.candidateIndex << ",\n";
+        outFile << "      \"primitive_index\": " << candidate.primitiveIndex << ",\n";
+        outFile << "      \"valid\": " << (candidate.valid ? "true" : "false") << ",\n";
+        outFile << "      \"rng_before\": " << candidate.rngBefore << ",\n";
+        outFile << "      \"rng_after\": " << candidate.rngAfter << ",\n";
+        outFile << "      \"pdf\": " << candidate.pdf << ",\n";
+        outFile << "      \"phat\": " << candidate.phat << ",\n";
+        outFile << "      \"weight\": " << candidate.weight << ",\n";
+        outFile << "      \"reservoir_M\": " << candidate.reservoirM << ",\n";
+        outFile << "      \"reservoir_w_sum\": " << candidate.reservoirWSum << "\n";
+        outFile << "    }" << (i + 1u < auditDump.risCandidates.size() ? "," : "") << "\n";
+    }
+    outFile << "  ],\n";
+    outFile << "  \"bsdf_path\": [\n";
+    for (size_t i = 0; i < auditDump.bsdfPath.size(); ++i) {
+        const auto& bsdf = auditDump.bsdfPath[i];
+        outFile << "    {\n";
+        outFile << "      \"depth\": " << bsdf.depth << ",\n";
+        outFile << "      \"material_index\": " << bsdf.materialIndex << ",\n";
+        outFile << "      \"front_face\": " << (bsdf.frontFace ? "true" : "false") << ",\n";
+        outFile << "      \"is_delta\": " << (bsdf.isDelta ? "true" : "false") << ",\n";
+        outFile << "      \"closure_type\": " << bsdf.closureType << ",\n";
+        outFile << "      \"used_random_walk\": " << (bsdf.usedRandomWalk ? "true" : "false") << ",\n";
+        outFile << "      \"rng_before\": " << bsdf.rngBefore << ",\n";
+        outFile << "      \"rng_after\": " << bsdf.rngAfter << ",\n";
+        outFile << "      \"shading_normal\": ["
+                << bsdf.shadingNormal.x << ", "
+                << bsdf.shadingNormal.y << ", "
+                << bsdf.shadingNormal.z << "],\n";
+        outFile << "      \"incident_direction\": ["
+                << bsdf.incidentDirection.x << ", "
+                << bsdf.incidentDirection.y << ", "
+                << bsdf.incidentDirection.z << "],\n";
+        outFile << "      \"wo\": ["
+                << bsdf.wo.x << ", "
+                << bsdf.wo.y << ", "
+                << bsdf.wo.z << "],\n";
+        outFile << "      \"sampled_direction\": ["
+                << bsdf.sampledDirection.x << ", "
+                << bsdf.sampledDirection.y << ", "
+                << bsdf.sampledDirection.z << "],\n";
+        outFile << "      \"pdf\": " << bsdf.pdf << ",\n";
+        outFile << "      \"directional_pdf\": " << bsdf.directionalPdf << ",\n";
+        outFile << "      \"lobe_type\": " << bsdf.lobeType << "\n";
+        outFile << "    }" << (i + 1u < auditDump.bsdfPath.size() ? "," : "") << "\n";
+    }
+    outFile << "  ],\n";
     outFile << "  \"entries\": [\n";
     for (size_t i = 0; i < auditDump.entries.size(); ++i) {
         const auto& entry = auditDump.entries[i];
@@ -6423,9 +8578,9 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
         outFile << "      \"sampled_primitive_index\": "
                 << (isEmissivePrimitive ? entry.lightIndex : 0xFFFFFFFFu) << ",\n";
         outFile << "      \"sampled_point\": ["
-                << jsonFloat(sampledPoint.x) << ", "
-                << jsonFloat(sampledPoint.y) << ", "
-                << jsonFloat(sampledPoint.z) << "],\n";
+                << sampledPoint.x << ", "
+                << sampledPoint.y << ", "
+                << sampledPoint.z << "],\n";
         outFile << "      \"sample_rejected\": " << (sampleRejected ? "true" : "false") << ",\n";
         outFile << "      \"light_direction\": [" << entry.lightDirection.x << ", " << entry.lightDirection.y << ", " << entry.lightDirection.z << "],\n";
         outFile << "      \"distance\": " << entry.distance << ",\n";
@@ -6449,7 +8604,7 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
         outFile << "        \"hw_raw_result_type\": " << entry.shadowPath.hwRawResultType << ",\n";
         outFile << "        \"hw_raw_instance_index\": " << entry.shadowPath.hwRawInstanceIndex << ",\n";
         outFile << "        \"hw_raw_primitive_index\": " << entry.shadowPath.hwRawPrimitiveIndex << ",\n";
-        outFile << "        \"hw_raw_distance\": " << jsonFloat(entry.shadowPath.hwRawDistance) << ",\n";
+        outFile << "        \"hw_raw_distance\": " << entry.shadowPath.hwRawDistance << ",\n";
         outFile << "        \"hw_resolved_hit\": "
                 << (entry.shadowPath.hwResolvedHit ? "true" : "false") << ",\n";
         outFile << "        \"hw_resolved_mesh_index\": " << entry.shadowPath.hwResolvedMeshIndex << ",\n";
@@ -6458,7 +8613,7 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
         outFile << "        \"hw_resolved_primitive_type\": " << entry.shadowPath.hwResolvedPrimitiveType << ",\n";
         outFile << "        \"hw_resolved_front_face\": "
                 << (entry.shadowPath.hwResolvedFrontFace ? "true" : "false") << ",\n";
-        outFile << "        \"hw_resolved_distance\": " << jsonFloat(entry.shadowPath.hwResolvedDistance) << ",\n";
+        outFile << "        \"hw_resolved_distance\": " << entry.shadowPath.hwResolvedDistance << ",\n";
         outFile << "        \"embedded_sw_consulted\": "
                 << (entry.shadowPath.embeddedSwConsulted ? "true" : "false") << ",\n";
         outFile << "        \"embedded_sw_hit\": "
@@ -6470,11 +8625,11 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
         outFile << "        \"embedded_sw_primitive_type\": " << entry.shadowPath.embeddedSwPrimitiveType << ",\n";
         outFile << "        \"embedded_sw_front_face\": "
                 << (entry.shadowPath.embeddedSwFrontFace ? "true" : "false") << ",\n";
-        outFile << "        \"embedded_sw_distance\": " << jsonFloat(entry.shadowPath.embeddedSwDistance) << ",\n";
+        outFile << "        \"embedded_sw_distance\": " << entry.shadowPath.embeddedSwDistance << ",\n";
         outFile << "        \"embedded_sw_hit_position\": ["
-                << jsonFloat(entry.shadowPath.embeddedSwHitPosition.x) << ", "
-                << jsonFloat(entry.shadowPath.embeddedSwHitPosition.y) << ", "
-                << jsonFloat(entry.shadowPath.embeddedSwHitPosition.z) << "],\n";
+                << entry.shadowPath.embeddedSwHitPosition.x << ", "
+                << entry.shadowPath.embeddedSwHitPosition.y << ", "
+                << entry.shadowPath.embeddedSwHitPosition.z << "],\n";
         outFile << "        \"software_bvh_type\": " << entry.shadowPath.softwareBvhType << ",\n";
         outFile << "        \"software_tlas_available\": "
                 << (entry.shadowPath.softwareTlasAvailable ? "true" : "false") << ",\n";
@@ -6485,10 +8640,10 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
         outFile << "        \"sw_blas_root_node_offset\": " << entry.shadowPath.swBlasRootNodeOffset << ",\n";
         outFile << "        \"sw_blas_prim_index_offset\": " << entry.shadowPath.swBlasPrimIndexOffset << ",\n";
         outFile << "        \"sw_triangle_base_offset\": " << entry.shadowPath.swTriangleBaseOffset << ",\n";
-        outFile << "        \"shadow_t_min\": " << jsonFloat(entry.shadowPath.shadowTMin) << ",\n";
-        outFile << "        \"shadow_t_max\": " << jsonFloat(entry.shadowPath.shadowTMax) << ",\n";
-        outFile << "        \"ray_origin_epsilon\": " << jsonFloat(entry.shadowPath.rayOriginEpsilon) << ",\n";
-        outFile << "        \"hardware_occlusion_epsilon\": " << jsonFloat(entry.shadowPath.hardwareOcclusionEpsilon) << ",\n";
+        outFile << "        \"shadow_t_min\": " << entry.shadowPath.shadowTMin << ",\n";
+        outFile << "        \"shadow_t_max\": " << entry.shadowPath.shadowTMax << ",\n";
+        outFile << "        \"ray_origin_epsilon\": " << entry.shadowPath.rayOriginEpsilon << ",\n";
+        outFile << "        \"hardware_occlusion_epsilon\": " << entry.shadowPath.hardwareOcclusionEpsilon << ",\n";
         outFile << "        \"rejection_mask\": " << entry.shadowPath.rejectionMask << ",\n";
         outFile << "        \"light_two_sided\": "
                 << (entry.shadowPath.lightTwoSided ? "true" : "false") << ",\n";
@@ -6497,21 +8652,19 @@ bool WriteDirectLightAuditJson(const fs::path& jsonPath,
         outFile << "      }\n";
         outFile << "    }" << (i + 1u < auditDump.entries.size() ? ",\n" : "\n");
     }
-    outFile << "  ]\n";
+    outFile << "  ],\n";
+    outFile << "  \"non_finite_values\": " << (nonFinite.nanCount + nonFinite.infCount) << "\n";
     outFile << "}\n";
-    if (!outFile.good()) {
-        error = "Failed while writing direct-light audit JSON: " + jsonPath.string();
-        return false;
-    }
-    return true;
+    ReportJsonNonFinite(nonFinite, "direct-light audit", jsonPath);
+    return PublishAtomicSidecarStream(outFile, tmpPath, jsonPath, error, "direct-light audit JSON");
 }
 
 bool WriteLuminanceHistogramText(const fs::path& histogramPath,
                                  const ImagePbrMetrics& imageMetrics,
                                  std::string& error) {
-    std::ofstream outFile(histogramPath);
-    if (!outFile.is_open()) {
-        error = "Failed to open histogram file for writing: " + histogramPath.string();
+    fs::path tmpPath;
+    std::ofstream outFile;
+    if (!OpenAtomicSidecarStream(histogramPath, tmpPath, outFile, error, "histogram text")) {
         return false;
     }
 
@@ -6521,7 +8674,7 @@ bool WriteLuminanceHistogramText(const fs::path& histogramPath,
     outFile << "# bin lower upper count\n";
     const size_t bucketCount = imageMetrics.histogramCounts.size();
     if (bucketCount == 0u) {
-        return true;
+        return PublishAtomicSidecarStream(outFile, tmpPath, histogramPath, error, "histogram text");
     }
     if (imageMetrics.histogramEdges.size() < bucketCount + 1u) {
         error = "Histogram edges/count mismatch";
@@ -6534,11 +8687,7 @@ bool WriteLuminanceHistogramText(const fs::path& histogramPath,
                 << imageMetrics.histogramCounts[i] << "\n";
     }
 
-    if (!outFile.good()) {
-        error = "Failed while writing histogram file: " + histogramPath.string();
-        return false;
-    }
-    return true;
+    return PublishAtomicSidecarStream(outFile, tmpPath, histogramPath, error, "histogram text");
 }
 
 void PrintPbrMetricsSummary(const ImagePbrMetrics& imageMetrics,
@@ -6581,6 +8730,10 @@ void PrintPbrMetricsSummary(const ImagePbrMetrics& imageMetrics,
                   << "]"
                   << ",rect=" << output.pbrMetrics.mneeRectAddedCount
                   << ",contrib=" << output.pbrMetrics.mneeContributionCount << ")"
+                  << " restirDiRegir(candidates="
+                  << output.pbrMetrics.restirDiRegirCandidateCount
+                  << ",accepted=" << output.pbrMetrics.restirDiRegirAcceptedCount
+                  << ",fallback=" << output.pbrMetrics.restirDiRegirFallbackCount << ")"
                   << " restirGi(candidates=" << output.pbrMetrics.restirGiCandidateCount
                   << ",updates=" << output.pbrMetrics.restirGiReservoirUpdateCount
                   << ",accept=" << output.pbrMetrics.restirGiAcceptCount
@@ -6619,8 +8772,11 @@ void PrintPbrMetricsSummary(const ImagePbrMetrics& imageMetrics,
                   << " spectral(wavelengths=" << output.pbrMetrics.spectralWavelengthSampleCount
                   << ",materials=" << output.pbrMetrics.spectralMaterialLookupCount
                   << ",dispersion=" << output.pbrMetrics.spectralDispersionEventCount
-                  << ",fallback=" << output.pbrMetrics.spectralFallbackCount << ")"
+                  << ",fallback=" << output.pbrMetrics.spectralFallbackCount
+                  << ",collapses=" << output.pbrMetrics.spectralCollapseCount
+                  << ",channelSamples=" << output.pbrMetrics.spectralWavelengthChannelSampleCount << ")"
                   << std::endl;
+        PrintRadianceCacheStatsLine(output.pbrMetrics);
     } else {
         std::cout << "[PBR] renderer: unavailable for current backend" << std::endl;
     }
@@ -6705,10 +8861,14 @@ bool DumpMaterialTextureDiagnostics(const PathTracer::SceneResources& resources,
     const auto& meshes = resources.meshes();
     const uint32_t textureCount = resources.materialTextureCount();
 
-    std::ofstream json(outDir / "manifest.json");
-    if (!json.is_open()) {
-        error = "Failed to open material texture manifest for writing: " +
-                (outDir / "manifest.json").string();
+    const fs::path manifestPath = outDir / "manifest.json";
+    fs::path manifestTmpPath;
+    std::ofstream json;
+    if (!OpenAtomicSidecarStream(manifestPath,
+                                 manifestTmpPath,
+                                 json,
+                                 error,
+                                 "material texture manifest JSON")) {
         return false;
     }
 
@@ -6871,11 +9031,274 @@ bool DumpMaterialTextureDiagnostics(const PathTracer::SceneResources& resources,
     }
     json << "  ]\n";
     json << "}\n";
+    return PublishAtomicSidecarStream(json,
+                                      manifestTmpPath,
+                                      manifestPath,
+                                      error,
+                                      "material texture manifest JSON");
+}
+
+bool FindRunRenderQueueArgument(int argc, const char** argv, std::string& path, std::string& error) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        std::string value;
+        const auto eqPos = arg.find('=');
+        const bool hasInlineValue = eqPos != std::string::npos;
+        if (hasInlineValue) {
+            value = arg.substr(eqPos + 1);
+            arg = arg.substr(0, eqPos);
+        }
+        if (arg != "--runRenderQueueItemJson" && arg != "--renderQueueItem") {
+            continue;
+        }
+        if (hasInlineValue) {
+            path = value;
+            return true;
+        }
+        if (i + 1 >= argc) {
+            error = "Missing value for " + arg;
+            return false;
+        }
+        path = argv[i + 1];
+        return true;
+    }
+    return false;
+}
+
+bool LoadRenderQueueBatchItems(const fs::path& path,
+                               std::vector<std::string>& itemJsons,
+                               std::string& summaryPath,
+                               bool& isBatch,
+                               std::string& error) {
+    isBatch = false;
+    NSData* data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.string().c_str()]];
+    if (!data) {
+        error = "Failed to read render queue JSON: " + path.string();
+        return false;
+    }
+
+    NSError* nsError = nil;
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&nsError];
+    if (!root) {
+        error = "Failed to parse render queue JSON: " + path.string();
+        if (nsError) {
+            error += " (" + NSStringToStdString([nsError localizedDescription]) + ")";
+        }
+        return false;
+    }
+
+    NSArray* items = nil;
+    if ([root isKindOfClass:[NSArray class]]) {
+        items = (NSArray*)root;
+    } else if ([root isKindOfClass:[NSDictionary class]]) {
+        NSDictionary* dict = (NSDictionary*)root;
+        id queueItems = [dict objectForKey:@"queue_items"];
+        if ([queueItems isKindOfClass:[NSArray class]]) {
+            items = (NSArray*)queueItems;
+        }
+        if (auto explicitSummary = JsonString(dict, @"batch_summary_json")) {
+            summaryPath = *explicitSummary;
+        }
+    }
+
+    if (!items) {
+        return true;
+    }
+    isBatch = true;
+    if ([items count] == 0u) {
+        error = "Render queue batch has no queue_items: " + path.string();
+        return false;
+    }
+    if (summaryPath.empty()) {
+        summaryPath = path.string() + ".summary.json";
+    }
+
+    for (NSUInteger index = 0; index < [items count]; ++index) {
+        id item = [items objectAtIndex:index];
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            error = "Render queue batch item " + std::to_string(static_cast<size_t>(index)) +
+                    " must be a JSON object.";
+            return false;
+        }
+        NSData* itemData = [NSJSONSerialization dataWithJSONObject:item
+                                                           options:NSJSONWritingPrettyPrinted
+                                                             error:&nsError];
+        if (!itemData) {
+            error = "Failed to serialize render queue batch item " +
+                    std::to_string(static_cast<size_t>(index));
+            if (nsError) {
+                error += " (" + NSStringToStdString([nsError localizedDescription]) + ")";
+            }
+            return false;
+        }
+        NSString* itemString = [[NSString alloc] initWithData:itemData encoding:NSUTF8StringEncoding];
+        itemJsons.push_back(NSStringToStdString(itemString));
+    }
     return true;
+}
+
+bool IsRunRenderQueueArgument(const std::string& arg) {
+    const auto eqPos = arg.find('=');
+    const std::string name = eqPos == std::string::npos ? arg : arg.substr(0, eqPos);
+    return name == "--runRenderQueueItemJson" || name == "--renderQueueItem";
+}
+
+std::vector<std::string> BuildBatchChildArguments(int argc,
+                                                  const char** argv,
+                                                  const fs::path& itemPath) {
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        const bool runQueueArg = IsRunRenderQueueArgument(arg);
+        if (runQueueArg) {
+            if (arg.find('=') == std::string::npos && i + 1 < argc) {
+                ++i;
+            }
+            continue;
+        }
+        args.push_back(arg);
+    }
+    args.emplace_back("--runRenderQueueItemJson");
+    args.push_back(itemPath.string());
+    return args;
+}
+
+int RunRenderQueueBatch(int argc,
+                        const char** argv,
+                        const fs::path& batchPath,
+                        const std::vector<std::string>& itemJsons,
+                        const fs::path& summaryPath) {
+    struct BatchItemResult {
+        fs::path itemJsonPath;
+        int exitCode = 1;
+    };
+
+    std::vector<BatchItemResult> results;
+    results.reserve(itemJsons.size());
+
+    fs::path executablePath(argv[0]);
+    if (executablePath.is_relative()) {
+        executablePath = fs::absolute(executablePath);
+    }
+
+    const fs::path batchTempDir =
+        fs::temp_directory_path() /
+        ("pathtracer_render_queue_" + NSStringToStdString([[NSUUID UUID] UUIDString]));
+    std::error_code dirEc;
+    fs::create_directories(batchTempDir, dirEc);
+    if (dirEc) {
+        std::cerr << "Failed to create render queue batch temp directory '"
+                  << batchTempDir << "': " << dirEc.message() << std::endl;
+        return 1;
+    }
+
+    uint32_t failedCount = 0;
+    for (size_t index = 0; index < itemJsons.size(); ++index) {
+        const fs::path itemPath =
+            batchTempDir / ("queue_item_" + std::to_string(index) + ".json");
+        std::string writeError;
+        if (!WriteTextFileAtomic(itemPath, itemJsons[index], writeError)) {
+            std::cerr << writeError << std::endl;
+            ++failedCount;
+            results.push_back(BatchItemResult{itemPath, 1});
+            continue;
+        }
+
+        std::vector<std::string> childArgs = BuildBatchChildArguments(argc, argv, itemPath);
+        NSMutableArray* nsArgs = [NSMutableArray arrayWithCapacity:childArgs.size()];
+        for (const std::string& childArg : childArgs) {
+            [nsArgs addObject:[NSString stringWithUTF8String:childArg.c_str()]];
+        }
+
+        NSTask* task = [[NSTask alloc] init];
+        task.executableURL =
+            [NSURL fileURLWithPath:[NSString stringWithUTF8String:executablePath.string().c_str()]];
+        task.arguments = nsArgs;
+        NSError* launchError = nil;
+        std::cout << "[RenderQueueBatch] item " << index << " start" << std::endl;
+        if (![task launchAndReturnError:&launchError]) {
+            std::cerr << "[RenderQueueBatch] item " << index
+                      << " launch failed: "
+                      << (launchError ? NSStringToStdString([launchError localizedDescription])
+                                      : std::string("unknown error"))
+                      << std::endl;
+            ++failedCount;
+            results.push_back(BatchItemResult{itemPath, 1});
+            continue;
+        }
+        [task waitUntilExit];
+        const int exitCode = [task terminationStatus];
+        if (exitCode != 0) {
+            ++failedCount;
+        }
+        std::cout << "[RenderQueueBatch] item " << index
+                  << " exit_code=" << exitCode << std::endl;
+        results.push_back(BatchItemResult{itemPath, exitCode});
+    }
+
+    std::ostringstream summary;
+    summary << "{\n";
+    summary << "  \"schema_version\": \"pathtracer.render_queue_batch_summary.v1\",\n";
+    summary << "  \"batch_json\": \"" << JsonEscape(batchPath.string()) << "\",\n";
+    summary << "  \"item_count\": " << results.size() << ",\n";
+    summary << "  \"failed_count\": " << failedCount << ",\n";
+    summary << "  \"items\": [\n";
+    for (size_t i = 0; i < results.size(); ++i) {
+        summary << "    {\"index\": " << i
+                << ", \"queue_item_json\": \"" << JsonEscape(results[i].itemJsonPath.string())
+                << "\", \"exit_code\": " << results[i].exitCode
+                << ", \"status\": \"" << (results[i].exitCode == 0 ? "succeeded" : "failed")
+                << "\"}";
+        if (i + 1u < results.size()) {
+            summary << ",";
+        }
+        summary << "\n";
+    }
+    summary << "  ]\n";
+    summary << "}\n";
+
+    std::string summaryError;
+    if (!WriteTextFileAtomic(summaryPath, summary.str(), summaryError)) {
+        std::cerr << summaryError << std::endl;
+        return 1;
+    }
+    std::cout << "[RenderQueueBatch] summary written to: " << summaryPath << std::endl;
+
+    return failedCount == 0u ? 0 : 1;
 }
 
 int main(int argc, const char** argv) {
     @autoreleasepool {
+        std::string batchQueuePath;
+        std::string batchProbeError;
+        const bool hasRunQueueArg =
+            FindRunRenderQueueArgument(argc, argv, batchQueuePath, batchProbeError);
+        if (!batchProbeError.empty()) {
+            std::cerr << "Error: " << batchProbeError << std::endl;
+            return 1;
+        }
+        if (hasRunQueueArg) {
+            std::vector<std::string> batchItems;
+            std::string summaryPathString;
+            bool isBatch = false;
+            std::string batchError;
+            if (!LoadRenderQueueBatchItems(fs::path(batchQueuePath),
+                                           batchItems,
+                                           summaryPathString,
+                                           isBatch,
+                                           batchError)) {
+                std::cerr << "Error: " << batchError << std::endl;
+                return 1;
+            }
+            if (isBatch) {
+                return RunRenderQueueBatch(argc,
+                                           argv,
+                                           fs::path(batchQueuePath),
+                                           batchItems,
+                                           fs::path(summaryPathString));
+            }
+        }
+
         CliOptions options;
         std::string error;
         if (!ParseOptions(argc, argv, options, error)) {
@@ -6945,6 +9368,51 @@ int main(int argc, const char** argv) {
         ApplyRenderProfileDefaults(options, settings);
         ApplyCliOverrides(options, settings);
         ApplyPilotModeOverrides(sceneResources, settings, options.pilotMode);
+        std::cout << "[RenderMode] mode=" << RenderModeLabel(options.renderMode)
+                  << " profile=" << RenderProfileLabel(options.renderProfile)
+                  << " backend=" << (options.backend == HeadlessBackend::Embree ? "embree" : "metal")
+                  << " execution="
+                  << (settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront
+                          ? "wavefront"
+                          : "megakernel")
+                  << std::endl;
+        if (const char* refusal = PathTracer::RadianceCacheRefusalReason(settings)) {
+            std::cerr << "[RadianceCache] refused (" << refusal << "): "
+                      << PathTracer::RadianceCacheRefusalMessage(refusal) << ". The cache is off for this render."
+                      << std::endl;
+        }
+        // restir_di's explicit passes on the megakernel are screen passes that read no material textures, normal
+        // maps or occlusion and give wrong light (0.0625 of the exact value on an analytic case): refused, not run.
+        // The wavefront's explicit stage, the hybrid's on the megakernel and the fused restir_di are exact. The test
+        // mirrors RenderLoop's (PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE keeps the fused path, homogeneous volumes render
+        // baseline_emissive instead of restir_di, --validate-ris and --bias-check render their own modes) and runs
+        // before the acceleration structures build.
+        if (options.backend == HeadlessBackend::Metal && !options.validateRis && !options.biasCheck &&
+            settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Megakernel &&
+            settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDi &&
+            settings.volumeTransportMode != PathTracer::RenderSettings::VolumeTransportMode::Homogeneous &&
+            settings.restirDebugEnabled && !EnvFlagEnabled("PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE")) {
+            std::cerr << "[ReSTIR DI] the explicit passes are not supported on the megakernel: its screen passes "
+                         "ignore material textures, normal maps and occlusion. They are on through --restirDebug=1, "
+                         "a --restirDebugView other than beauty, --restirDebugMetricsJson or --profile=debug. Use "
+                         "--executionMode=wavefront for the explicit passes, or restir_di without them; refusing to "
+                         "render." << std::endl;
+            if (options.outputMetadata &&
+                (options.outputMetadataJsonProvided || !options.outputPath.empty())) {
+                const fs::path refusalPath = options.outputMetadataJsonProvided
+                    ? fs::path(options.outputMetadataJsonPath)
+                    : fs::path(options.outputPath + ".metadata.json");
+                std::string refusalError;
+                if (!WriteTextFileAtomic(refusalPath,
+                                         "{\n  \"status\": \"refused\",\n"
+                                         "  \"restir_di_refused_combination\": "
+                                         "\"explicit passes on the megakernel\"\n}\n",
+                                         refusalError)) {
+                    std::cerr << refusalError << std::endl;
+                }
+            }
+            return 2;
+        }
 
         if (options.debugLandmarks || options.cameraSearchReportProvided) {
             std::vector<RuntimeMeshSnapshot> snapshots;
@@ -7191,9 +9659,16 @@ int main(int argc, const char** argv) {
             settings.renderHeight = options.heightSet ? options.height : 720u;
         }
 
-        sceneResources.buildCPUPackedSceneData();
+        if (useMetalSceneContext) {
+            sceneResources.buildCPUPackedSceneData();
+        } else {
+            // Embree builds its scene from meshes() and never reads the packed arrays Metal uploads (on Barcelona
+            // Pavilion, 2.5 GB resident); it needs the triangle count and the emissive inventory.
+            sceneResources.buildCPUSceneCountsAndEmissiveInventory();
+        }
         EnsureSceneDirectiveAssetPipelineReport(options, sceneManager, sceneResources);
         PrintEmissiveInventoryReport(sceneResources);
+        PrintSubsurfaceMaterialReport(sceneResources, settings);
 
         const bool explicitSwrt =
             (options.enableSoftwareRayTracingSet && options.enableSoftwareRayTracing) ||
@@ -7223,7 +9698,9 @@ int main(int argc, const char** argv) {
 
         if (useMetalSceneContext &&
             !settings.environmentMapPath.empty() &&
-            !sceneResources.reloadEnvironmentIfNeeded(settings.environmentMapPath)) {
+            !sceneResources.reloadEnvironmentIfNeeded(settings.environmentMapPath,
+                                                      nullptr,
+                                                      settings.environmentSunClamp)) {
             std::cerr << "Failed to load environment map for scene statistics: "
                       << settings.environmentMapPath << std::endl;
             return 1;
@@ -7263,6 +9740,12 @@ int main(int argc, const char** argv) {
                       << ". Aborting before acceleration-structure build due to --budget-policy=strict."
                       << std::endl;
             return 1;
+        }
+
+        if (useMetalSceneContext) {
+            std::cout << "[MipChain] material textures with footprint-filtered mips (size not a power of two): "
+                      << sceneResources.footprintMipChainCount() << " of " << sceneResources.materialTextureCount()
+                      << std::endl;
         }
 
         if (options.dumpMaterialTexturesDirProvided) {
@@ -7360,6 +9843,42 @@ int main(int argc, const char** argv) {
         HeadlessCamera camera = BuildHeadlessCamera(settings);
 
         std::unique_ptr<IHeadlessRenderer> renderer;
+        std::string sourceCapabilityError;
+        if (headlessScene.resources && !PathTracer::ResolveSourceCapabilities(*headlessScene.resources, settings,
+                options.backend != HeadlessBackend::Metal, true, sourceCapabilityError)) {
+            std::cerr << sourceCapabilityError << std::endl;
+            return 1;
+        }
+        if (headlessScene.resources) {
+            const std::string ignoredDirectional =
+                PathTracer::IgnoredDirectionalLightsDiagnostic(*headlessScene.resources, settings);
+            if (!ignoredDirectional.empty()) std::cerr << "Warning: " << ignoredDirectional << std::endl;
+        }
+        if (options.backend == HeadlessBackend::Metal) {
+            const std::string spectralRefusal = PathTracer::SpectralUnsupportedCombination(settings);
+            if (!spectralRefusal.empty()) {
+                std::cerr << "spectral mode does not support " << spectralRefusal
+                          << "; refusing to render instead of substituting it." << std::endl;
+                if (options.outputMetadata &&
+                    (options.outputMetadataJsonProvided || !options.outputPath.empty())) {
+                    const fs::path refusalPath = options.outputMetadataJsonProvided
+                        ? fs::path(options.outputMetadataJsonPath)
+                        : fs::path(options.outputPath + ".metadata.json");
+                    std::ostringstream refusal;
+                    refusal << "{\n"
+                            << "  \"status\": \"refused\",\n"
+                            << "  \"spectral_rendering_mode\": \""
+                            << SpectralRenderingModeLabel(settings.spectralRenderingMode) << "\",\n"
+                            << "  \"spectral_refused_combination\": \"" << JsonEscape(spectralRefusal) << "\"\n"
+                            << "}\n";
+                    std::string refusalError;
+                    if (!WriteTextFileAtomic(refusalPath, refusal.str(), refusalError)) {
+                        std::cerr << refusalError << std::endl;
+                    }
+                }
+                return 2;
+            }
+        }
         if (options.backend == HeadlessBackend::Metal) {
             renderer = std::make_unique<MetalHeadlessRenderer>();
         } else {
@@ -7375,6 +9894,10 @@ int main(int argc, const char** argv) {
 #endif
         }
 
+        if (settings.bloomEnabled) {
+            std::cout << "[Beauty] Viewport bloom is not applied to saved headless images." << std::endl;
+        }
+
         auto runHeadlessRender = [&](const PathTracer::RenderSettings& renderSettings,
                                      uint32_t sppTotal,
                                      HeadlessRenderOutput& renderOutput,
@@ -7385,8 +9908,9 @@ int main(int argc, const char** argv) {
                                     sppTotal,
                                     options.verbose,
                                     options.stats,
-                                    (renderSettings.denoiseEnabled || renderSettings.svgfDenoiseEnabled) &&
-                                        (renderSettings.denoiseUseAlbedo || renderSettings.denoiseUseNormal),
+                                    options.writeDenoiseGuides ||
+                                        ((renderSettings.denoiseEnabled || renderSettings.svgfDenoiseEnabled) &&
+                                         (renderSettings.denoiseUseAlbedo || renderSettings.denoiseUseNormal)),
                                     renderOutput,
                                     renderError);
         };
@@ -7705,7 +10229,7 @@ int main(int argc, const char** argv) {
             std::cerr << denoiseError << std::endl;
             return 1;
         }
-        ApplyRestirDebugView(settings, output);
+        ApplyRestirDebugView(settings, RunDirectLightMode(options, settings), output);
 
         std::string outputPath = options.outputPath;
         PathTracer::ImageFileFormat outputFormat = options.format;
@@ -7747,6 +10271,8 @@ int main(int argc, const char** argv) {
         tonemapSettings.acesVariant = settings.acesVariant;
         tonemapSettings.exposure = settings.exposure;
         tonemapSettings.reinhardWhitePoint = settings.reinhardWhitePoint;
+        tonemapSettings.srgbEncode = settings.srgbOutputEncoding;
+        tonemapSettings.referenceBloomIntensity = settings.referenceBloomIntensity;
 
         auto writeImageBuffer = [&](const fs::path& targetPath,
                                     PathTracer::ImageFileFormat format,
@@ -7761,15 +10287,19 @@ int main(int argc, const char** argv) {
         };
 
         if (options.verbose || settings.denoiseEnabled || settings.svgfDenoiseEnabled ||
-            options.fireflyClampMode != CliOptions::FireflyClampMode::Off) {
+            settings.fireflyClampEnabled) {
             std::cout << "[Beauty] denoise=" << (settings.denoiseEnabled ? "on" : "off")
                       << " svgf=" << (settings.svgfDenoiseEnabled ? "on" : "off")
-                      << " hdr=" << (options.denoiseHdr ? "1" : "0")
-                      << " useAlbedo=" << (options.denoiseUseAlbedo ? "1" : "0")
-                      << " useNormal=" << (options.denoiseUseNormal ? "1" : "0")
+                      << " hdr=" << (settings.denoiseHdr ? "1" : "0")
+                      << " useAlbedo=" << (settings.denoiseUseAlbedo ? "1" : "0")
+                      << " useNormal=" << (settings.denoiseUseNormal ? "1" : "0")
                       << " fireflyClampStage=per_sample_contribution"
-                      << " fireflyClampMode=" << FireflyClampModeLabel(options.fireflyClampMode)
-                      << " fireflyClampValue=" << options.fireflyClampValue
+                      << " fireflyClampMode=" << (!settings.fireflyClampEnabled ? "off" :
+                          settings.fireflyClampMode == PathTracer::RenderSettings::FireflyClampMode::MaxComponent
+                              ? "maxcomponent" : "luminance")
+                      << " fireflyClampFactor=" << settings.fireflyClampFactor
+                      << " fireflyClampFloor=" << settings.fireflyClampFloor
+                      << " fireflyClampMaxContribution=" << settings.fireflyClampMaxContribution
                       << std::endl;
         }
 
@@ -7792,6 +10322,24 @@ int main(int argc, const char** argv) {
         } else if (!writeImageBuffer(outputFsPath, outputFormat, beautyLinearRGB)) {
             std::cerr << "Failed to write output image: " << writeError << std::endl;
             return 1;
+        }
+
+        if (options.writeDenoiseGuides) {
+            const size_t guideValues = static_cast<size_t>(output.width) * static_cast<size_t>(output.height) * 3u;
+            const std::pair<const char*, const std::vector<float>*> guides[] = {
+                {"_albedo", &output.albedoLinearRGB}, {"_normal", &output.normalLinearRGB}};
+            for (const auto& [suffix, buffer] : guides) {
+                if (buffer->size() != guideValues) {
+                    std::cerr << "Denoise guide " << suffix << " unavailable for this backend/render" << std::endl;
+                    return 1;
+                }
+                fs::path guidePath = AppendStemSuffix(outputFsPath, suffix);
+                guidePath.replace_extension(".exr");
+                if (!writeImageBuffer(guidePath, PathTracer::ImageFileFormat::EXR, *buffer)) {
+                    std::cerr << "Failed to write denoise guide: " << writeError << std::endl;
+                    return 1;
+                }
+            }
         }
 
         std::optional<fs::path> writtenMetadataPath;
@@ -8039,6 +10587,7 @@ int main(int argc, const char** argv) {
         std::cout << "Rendered " << output.samples << " spp at " << output.width << "x" << output.height
                   << " in " << std::fixed << std::setprecision(2) << output.totalSeconds << " s"
                   << " (~" << std::setprecision(3) << output.avgMsPerSample << " ms/sample)." << std::endl;
+        PrintSssWalkLine(output);
         if (output.performance.available) {
             std::cout << "[Perf] gpu=" << std::fixed << std::setprecision(2)
                       << output.performance.totalGpuSeconds << " s"

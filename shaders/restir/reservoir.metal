@@ -102,6 +102,41 @@ inline bool merge_reservoir_winner(thread Reservoir& r,
     return false;
 }
 
+// Pairwise MIS for a canonical reservoir merged with k neighbour reservoirs that all hold the same candidate count M.
+// The arguments a_c and a_n are the two pixels' targets per unit light area, p_hat * cos(theta_light) / d^2
+// (ris_payload_solid_angle_per_area): RIS candidate pdfs are solid-angle densities at the point that built the
+// reservoir, so a sample moves between pixels through the light point, with Jacobian a ratio of those terms.
+// Neighbour n is paired with 1/k of the canonical domain. For a light sample x, neighbour n's MIS weight is
+// a_n(x) / (k a_n(x) + a_c(x)) and the canonical's share of that pair is a_c(x) / (k a_n(x) + a_c(x)) / k. They sum to
+// 1/k per pair and so to one over the k pairs, which keeps the merge unbiased for any k. Weights are expressed on the
+// canonical 1/M scale, so the merged reservoir keeps M and W = wSum / M / p_c(y) still holds.
+
+// Resampling weight of neighbour n's winner y_n: m_n(y_n) p_c(y_n) W_n J times M, with W_n = wSum_n / (M p_n(y_n)) and
+// J the solid-angle Jacobian from the neighbour to the canonical; that reduces to a_c wSum_n / (a_c + k a_n).
+inline float pairwise_mis_neighbor_weight(float areaTargetCanonical,
+                                          float areaTargetNeighbor,
+                                          float neighborWSum,
+                                          float k) {
+    float denom = areaTargetCanonical + k * areaTargetNeighbor;
+    if (!(areaTargetCanonical > 0.0f) || !(denom > 0.0f) || !isfinite(denom)) {
+        return 0.0f;
+    }
+    float weight = areaTargetCanonical * neighborWSum / denom;
+    return isfinite(weight) ? weight : 0.0f;
+}
+
+// The canonical winner y_c's share of pair n. A pair whose neighbour was rejected, or where neither target is
+// positive, belongs to the canonical entirely (1/k).
+inline float pairwise_mis_canonical_share(float areaTargetCanonical,
+                                          float areaTargetNeighbor,
+                                          float k) {
+    float denom = areaTargetCanonical + k * areaTargetNeighbor;
+    if (!(denom > 0.0f) || !isfinite(denom)) {
+        return 1.0f / k;
+    }
+    return areaTargetCanonical / denom / k;
+}
+
 inline float p_hat(float3 Le,
                    float3 bsdf,
                    float cosThetaSurface,

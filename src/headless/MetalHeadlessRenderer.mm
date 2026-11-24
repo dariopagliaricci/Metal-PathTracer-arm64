@@ -9,6 +9,8 @@
 
 #include "headless/MetalHeadlessRenderer.h"
 #include "MetalRenderer.h"
+#include "renderer/SceneResources.h"
+#include "renderer/SettingsUtils.h"
 
 namespace {
 
@@ -49,6 +51,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
                                    std::string& error) {
     PathTracer::RenderSettings rendererSettings = settings;
     rendererSettings.denoiseEnabled = false;
+
+    if (scene.resources && !PathTracer::ResolveSourceCapabilities(*scene.resources, rendererSettings, false, true, error)) return false;
 
     MetalRendererOptions rendererOptions;
     rendererOptions.headless = true;
@@ -158,11 +162,15 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     uint64_t restirDiReservoirBytesEach = 0;
     uint64_t restirDiVisibilityBytes = 0;
     uint64_t restirDiDebugBytes = 0;
+    std::string restirDiPathStatus;
     uint64_t transportMemoryBytesTotal = 0;
     uint64_t transportMemoryBytesPrivate = 0;
     uint64_t transportMemoryBytesShared = 0;
     uint64_t transportMemoryBytesStaging = 0;
     uint32_t transportMemoryRecordCount = 0;
+    uint32_t transportMemoryAllocatorBackedRecordCount = 0;
+    uint32_t transportMemoryFrameGraphBackedRecordCount = 0;
+    uint32_t transportMemoryOwnershipGapRecordCount = 0;
     uint32_t transportMemoryInvalidatedRecordCount = 0;
     uint32_t renderExecutionMode = 0;
     uint32_t wavefrontSchedulingPolicy = 0;
@@ -171,6 +179,12 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     bool hardwareRaytracingActive = false;
     bool hardwareRaytracingFallbackActive = false;
     std::string hardwareRaytracingFallbackReason;
+    std::string megakernelIntegratePipeline;
+    uint64_t sssWalkStats[5] = {};
+    std::vector<HeadlessRenderOutput::PerformanceSummary::SssWalkMaterialStats> sssWalkMaterials;
+    uint32_t sssMaxSteps = 0;
+    std::string wavefrontDirectLightFallback = "none";
+    std::string wavefrontMegakernelFallback = "none";
     std::string deviceName;
     uint64_t deviceRecommendedMaxWorkingSetBytes = 0;
     bool deviceSupportsRaytracing = false;
@@ -180,11 +194,16 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     bool deviceSupportsMetalFX = false;
     bool deviceSupportsMLBackend = false;
     std::string accelerationBuildPolicy;
+    std::string accelerationBuildPolicyReason;
+    std::string accelerationCompactionPolicy;
     std::string accelerationIdentityStrategy;
     std::string accelerationIntersectionFunctionStrategy;
     bool accelerationIdentityStable = false;
     bool accelerationCustomIntersectionFunctionsSupported = false;
     bool accelerationCustomIntersectionFunctionsEnabled = false;
+    double accelerationBlasCompactionRatio = 0.0;
+    double accelerationTlasCompactionRatio = 0.0;
+    std::string accelerationTraversalCoverage;
     uint32_t intersectionMode = 0;
     uint32_t accelerationPrimitiveCount = 0;
     uint32_t accelerationInstanceCount = 0;
@@ -205,6 +224,9 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     std::vector<std::string> passGraphExecutedPasses;
     std::vector<std::string> passGraphSkippedPasses;
     std::vector<std::string> passGraphFailedPasses;
+    bool passGraphTimingAvailable = false;
+    std::vector<std::string> passGraphTimingNames;
+    std::vector<double> passGraphTimingMs;
     std::vector<std::string> passGraphNames;
     std::vector<std::string> passGraphTypes;
     std::vector<std::string> passGraphExecutions;
@@ -224,6 +246,7 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     std::vector<std::string> passGraphResourceTargetOwners;
     std::vector<std::string> passGraphResourceFeatureGates;
     std::vector<std::string> passGraphResourceDebugReadbackPolicies;
+    std::vector<std::string> passGraphResourceClearLoadPolicies;
     std::vector<std::string> passGraphResourceMigrationRisks;
     std::vector<int32_t> passGraphResourceFirstPasses;
     std::vector<int32_t> passGraphResourceLastPasses;
@@ -259,6 +282,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     std::vector<uint32_t> transportMemoryInvalidationCounts;
     std::vector<uint32_t> transportMemoryHotPath;
     std::vector<uint32_t> transportMemoryTemporaryShared;
+    std::vector<uint32_t> transportMemoryFrameGraphOwned;
+    std::vector<uint32_t> transportMemoryAllocatorOwned;
     uint32_t mlBackendMode = 0;
     bool mlBackendRequested = false;
     bool mlBackendActive = false;
@@ -275,6 +300,7 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     bool pipelineRuntimeSourceCompilation = true;
     bool pipelineFunctionConstantsUsed = false;
     bool pipelineMetalBinaryArchiveUsed = false;
+    bool pipelineMetalBinaryArchiveSerialized = false;
     bool pipelineHarvestedCompilationReady = false;
     uint64_t pipelineShaderSourceBytes = 0;
     double pipelineLibraryCompileMs = 0.0;
@@ -283,6 +309,7 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     uint32_t pipelineFailedPipelineCount = 0;
     std::string pipelineCacheStrategy;
     std::string pipelineSpecializationStrategy;
+    std::string pipelineBinaryArchivePath;
     std::vector<std::string> pipelineCompileKeys;
     std::vector<std::string> pipelineCompileFunctions;
     std::vector<std::string> pipelineCompileStages;
@@ -303,11 +330,18 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         CFAbsoluteTime frameStart = CFAbsoluteTimeGetCurrent();
         renderer.drawFrame();
         CFAbsoluteTime frameEnd = CFAbsoluteTimeGetCurrent();
+        MetalRenderer::RuntimeStatsSnapshot postFrameStats{};
+        if (renderer.captureRuntimeStats(postFrameStats) &&
+            !postFrameStats.lastCommandBufferCompleted) {
+            error = "Metal command buffer failed; see command-buffer diagnostics in stderr";
+            return false;
+        }
 
         uint32_t after = renderer.sampleCount();
         uint32_t produced = (after > before) ? (after - before) : std::min(request, remaining);
         if (produced == 0) {
-            produced = 1;
+            error = "Metal renderer did not advance sample count; command buffer likely failed";
+            return false;
         }
         MetalRenderer::RuntimeStatsSnapshot statsSnapshot{};
         if (renderer.captureRuntimeStats(statsSnapshot) && statsSnapshot.available) {
@@ -392,6 +426,12 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             transportMemoryBytesShared = statsSnapshot.transportMemoryBytesShared;
             transportMemoryBytesStaging = statsSnapshot.transportMemoryBytesStaging;
             transportMemoryRecordCount = statsSnapshot.transportMemoryRecordCount;
+            transportMemoryAllocatorBackedRecordCount =
+                statsSnapshot.transportMemoryAllocatorBackedRecordCount;
+            transportMemoryFrameGraphBackedRecordCount =
+                statsSnapshot.transportMemoryFrameGraphBackedRecordCount;
+            transportMemoryOwnershipGapRecordCount =
+                statsSnapshot.transportMemoryOwnershipGapRecordCount;
             transportMemoryInvalidatedRecordCount =
                 statsSnapshot.transportMemoryInvalidatedRecordCount;
             renderExecutionMode = statsSnapshot.renderExecutionMode;
@@ -403,6 +443,26 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
                 statsSnapshot.hardwareRaytracingFallbackActive;
             hardwareRaytracingFallbackReason =
                 statsSnapshot.hardwareRaytracingFallbackReason;
+            megakernelIntegratePipeline = statsSnapshot.megakernelIntegratePipeline;
+            std::copy(std::begin(statsSnapshot.sssWalkStats), std::end(statsSnapshot.sssWalkStats), sssWalkStats);
+            sssWalkMaterials.clear();
+            for (const auto& entry : statsSnapshot.sssWalkMaterials) {
+                HeadlessRenderOutput::PerformanceSummary::SssWalkMaterialStats copy;
+                copy.material = entry.material;
+                std::copy(std::begin(entry.stats), std::end(entry.stats), copy.stats);
+                sssWalkMaterials.push_back(std::move(copy));
+            }
+            sssMaxSteps = statsSnapshot.sssMaxSteps;
+            // A fallback on any frame stays in the metadata, not only one on the last frame.
+            if (wavefrontDirectLightFallback == "none") {
+                wavefrontDirectLightFallback = statsSnapshot.wavefrontDirectLightFallback;
+            }
+            if (wavefrontMegakernelFallback == "none") {
+                wavefrontMegakernelFallback = statsSnapshot.wavefrontMegakernelFallback;
+            }
+            if (restirDiPathStatus != "fused_megakernel_wavefront_fallback") {
+                restirDiPathStatus = statsSnapshot.restirDiPathStatus;
+            }
             deviceName = statsSnapshot.deviceName;
             deviceRecommendedMaxWorkingSetBytes =
                 statsSnapshot.deviceRecommendedMaxWorkingSetBytes;
@@ -413,6 +473,10 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             deviceSupportsMetalFX = statsSnapshot.deviceSupportsMetalFX;
             deviceSupportsMLBackend = statsSnapshot.deviceSupportsMLBackend;
             accelerationBuildPolicy = statsSnapshot.accelerationBuildPolicy;
+            accelerationBuildPolicyReason =
+                statsSnapshot.accelerationBuildPolicyReason;
+            accelerationCompactionPolicy =
+                statsSnapshot.accelerationCompactionPolicy;
             accelerationIdentityStrategy = statsSnapshot.accelerationIdentityStrategy;
             accelerationIntersectionFunctionStrategy =
                 statsSnapshot.accelerationIntersectionFunctionStrategy;
@@ -421,6 +485,12 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
                 statsSnapshot.accelerationCustomIntersectionFunctionsSupported;
             accelerationCustomIntersectionFunctionsEnabled =
                 statsSnapshot.accelerationCustomIntersectionFunctionsEnabled;
+            accelerationBlasCompactionRatio =
+                statsSnapshot.accelerationBlasCompactionRatio;
+            accelerationTlasCompactionRatio =
+                statsSnapshot.accelerationTlasCompactionRatio;
+            accelerationTraversalCoverage =
+                statsSnapshot.accelerationTraversalCoverage;
             intersectionMode = statsSnapshot.intersectionMode;
             accelerationPrimitiveCount = statsSnapshot.accelerationPrimitiveCount;
             accelerationInstanceCount = statsSnapshot.accelerationInstanceCount;
@@ -449,6 +519,30 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             passGraphExecutedPasses = statsSnapshot.passGraphExecutedPasses;
             passGraphSkippedPasses = statsSnapshot.passGraphSkippedPasses;
             passGraphFailedPasses = statsSnapshot.passGraphFailedPasses;
+            passGraphTimingAvailable =
+                passGraphTimingAvailable || statsSnapshot.passGraphTimingAvailable;
+            for (size_t timingIndex = 0; timingIndex < statsSnapshot.passGraphTimingNames.size();
+                 ++timingIndex) {
+                const std::string& passName = statsSnapshot.passGraphTimingNames[timingIndex];
+                const double passMs =
+                    timingIndex < statsSnapshot.passGraphTimingMs.size()
+                        ? statsSnapshot.passGraphTimingMs[timingIndex]
+                        : 0.0;
+                auto existing = std::find(
+                    passGraphTimingNames.begin(),
+                    passGraphTimingNames.end(),
+                    passName);
+                if (existing == passGraphTimingNames.end()) {
+                    passGraphTimingNames.push_back(passName);
+                    passGraphTimingMs.push_back(passMs);
+                } else {
+                    const size_t existingIndex =
+                        static_cast<size_t>(std::distance(passGraphTimingNames.begin(), existing));
+                    if (existingIndex < passGraphTimingMs.size()) {
+                        passGraphTimingMs[existingIndex] += passMs;
+                    }
+                }
+            }
             passGraphNames = statsSnapshot.passGraphNames;
             passGraphTypes = statsSnapshot.passGraphTypes;
             passGraphExecutions = statsSnapshot.passGraphExecutions;
@@ -469,6 +563,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             passGraphResourceFeatureGates = statsSnapshot.passGraphResourceFeatureGates;
             passGraphResourceDebugReadbackPolicies =
                 statsSnapshot.passGraphResourceDebugReadbackPolicies;
+            passGraphResourceClearLoadPolicies =
+                statsSnapshot.passGraphResourceClearLoadPolicies;
             passGraphResourceMigrationRisks = statsSnapshot.passGraphResourceMigrationRisks;
             passGraphResourceFirstPasses = statsSnapshot.passGraphResourceFirstPasses;
             passGraphResourceLastPasses = statsSnapshot.passGraphResourceLastPasses;
@@ -506,6 +602,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             transportMemoryInvalidationCounts = statsSnapshot.transportMemoryInvalidationCounts;
             transportMemoryHotPath = statsSnapshot.transportMemoryHotPath;
             transportMemoryTemporaryShared = statsSnapshot.transportMemoryTemporaryShared;
+            transportMemoryFrameGraphOwned = statsSnapshot.transportMemoryFrameGraphOwned;
+            transportMemoryAllocatorOwned = statsSnapshot.transportMemoryAllocatorOwned;
             mlBackendMode = statsSnapshot.mlBackendMode;
             mlBackendRequested = statsSnapshot.mlBackendRequested;
             mlBackendActive = statsSnapshot.mlBackendActive;
@@ -523,6 +621,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             pipelineRuntimeSourceCompilation = statsSnapshot.pipelineRuntimeSourceCompilation;
             pipelineFunctionConstantsUsed = statsSnapshot.pipelineFunctionConstantsUsed;
             pipelineMetalBinaryArchiveUsed = statsSnapshot.pipelineMetalBinaryArchiveUsed;
+            pipelineMetalBinaryArchiveSerialized =
+                statsSnapshot.pipelineMetalBinaryArchiveSerialized;
             pipelineHarvestedCompilationReady = statsSnapshot.pipelineHarvestedCompilationReady;
             pipelineShaderSourceBytes = statsSnapshot.pipelineShaderSourceBytes;
             pipelineLibraryCompileMs = statsSnapshot.pipelineLibraryCompileMs;
@@ -531,6 +631,7 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             pipelineFailedPipelineCount = statsSnapshot.pipelineFailedPipelineCount;
             pipelineCacheStrategy = statsSnapshot.pipelineCacheStrategy;
             pipelineSpecializationStrategy = statsSnapshot.pipelineSpecializationStrategy;
+            pipelineBinaryArchivePath = statsSnapshot.pipelineBinaryArchivePath;
             pipelineCompileKeys = statsSnapshot.pipelineCompileKeys;
             pipelineCompileFunctions = statsSnapshot.pipelineCompileFunctions;
             pipelineCompileStages = statsSnapshot.pipelineCompileStages;
@@ -668,6 +769,12 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.hardwareRaytracingActive = hardwareRaytracingActive;
     out.performance.hardwareRaytracingFallbackActive = hardwareRaytracingFallbackActive;
     out.performance.hardwareRaytracingFallbackReason = hardwareRaytracingFallbackReason;
+    out.performance.megakernelIntegratePipeline = megakernelIntegratePipeline;
+    std::copy(std::begin(sssWalkStats), std::end(sssWalkStats), out.performance.sssWalkStats);
+    out.performance.sssWalkMaterials = sssWalkMaterials;
+    out.performance.sssMaxSteps = sssMaxSteps;
+    out.performance.wavefrontDirectLightFallback = wavefrontDirectLightFallback;
+    out.performance.wavefrontMegakernelFallback = wavefrontMegakernelFallback;
     out.performance.deviceName = std::move(deviceName);
     out.performance.deviceRecommendedMaxWorkingSetBytes = deviceRecommendedMaxWorkingSetBytes;
     out.performance.deviceSupportsRaytracing = deviceSupportsRaytracing;
@@ -677,6 +784,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.deviceSupportsMetalFX = deviceSupportsMetalFX;
     out.performance.deviceSupportsMLBackend = deviceSupportsMLBackend;
     out.performance.accelerationBuildPolicy = accelerationBuildPolicy;
+    out.performance.accelerationBuildPolicyReason = accelerationBuildPolicyReason;
+    out.performance.accelerationCompactionPolicy = accelerationCompactionPolicy;
     out.performance.accelerationIdentityStrategy = accelerationIdentityStrategy;
     out.performance.accelerationIntersectionFunctionStrategy =
         accelerationIntersectionFunctionStrategy;
@@ -685,6 +794,9 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         accelerationCustomIntersectionFunctionsSupported;
     out.performance.accelerationCustomIntersectionFunctionsEnabled =
         accelerationCustomIntersectionFunctionsEnabled;
+    out.performance.accelerationBlasCompactionRatio = accelerationBlasCompactionRatio;
+    out.performance.accelerationTlasCompactionRatio = accelerationTlasCompactionRatio;
+    out.performance.accelerationTraversalCoverage = accelerationTraversalCoverage;
     out.performance.intersectionMode = intersectionMode;
     out.performance.accelerationPrimitiveCount = accelerationPrimitiveCount;
     out.performance.accelerationInstanceCount = accelerationInstanceCount;
@@ -735,11 +847,18 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.restirDiReservoirBytesEach = restirDiReservoirBytesEach;
     out.performance.restirDiVisibilityBytes = restirDiVisibilityBytes;
     out.performance.restirDiDebugBytes = restirDiDebugBytes;
+    out.performance.restirDiPathStatus = restirDiPathStatus;
     out.performance.transportMemoryBytesTotal = transportMemoryBytesTotal;
     out.performance.transportMemoryBytesPrivate = transportMemoryBytesPrivate;
     out.performance.transportMemoryBytesShared = transportMemoryBytesShared;
     out.performance.transportMemoryBytesStaging = transportMemoryBytesStaging;
     out.performance.transportMemoryRecordCount = transportMemoryRecordCount;
+    out.performance.transportMemoryAllocatorBackedRecordCount =
+        transportMemoryAllocatorBackedRecordCount;
+    out.performance.transportMemoryFrameGraphBackedRecordCount =
+        transportMemoryFrameGraphBackedRecordCount;
+    out.performance.transportMemoryOwnershipGapRecordCount =
+        transportMemoryOwnershipGapRecordCount;
     out.performance.transportMemoryInvalidatedRecordCount =
         transportMemoryInvalidatedRecordCount;
     out.performance.wavefrontPrimaryGeneratedCount = totalWavefrontPrimaryGeneratedCount;
@@ -788,6 +907,9 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.passGraphExecutedPasses = std::move(passGraphExecutedPasses);
     out.performance.passGraphSkippedPasses = std::move(passGraphSkippedPasses);
     out.performance.passGraphFailedPasses = std::move(passGraphFailedPasses);
+    out.performance.passGraphTimingAvailable = passGraphTimingAvailable;
+    out.performance.passGraphTimingNames = std::move(passGraphTimingNames);
+    out.performance.passGraphTimingMs = std::move(passGraphTimingMs);
     out.performance.passGraphNames = std::move(passGraphNames);
     out.performance.passGraphTypes = std::move(passGraphTypes);
     out.performance.passGraphExecutions = std::move(passGraphExecutions);
@@ -808,6 +930,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.passGraphResourceFeatureGates = std::move(passGraphResourceFeatureGates);
     out.performance.passGraphResourceDebugReadbackPolicies =
         std::move(passGraphResourceDebugReadbackPolicies);
+    out.performance.passGraphResourceClearLoadPolicies =
+        std::move(passGraphResourceClearLoadPolicies);
     out.performance.passGraphResourceMigrationRisks = std::move(passGraphResourceMigrationRisks);
     out.performance.passGraphResourceFirstPasses = std::move(passGraphResourceFirstPasses);
     out.performance.passGraphResourceLastPasses = std::move(passGraphResourceLastPasses);
@@ -848,6 +972,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         std::move(transportMemoryInvalidationCounts);
     out.performance.transportMemoryHotPath = std::move(transportMemoryHotPath);
     out.performance.transportMemoryTemporaryShared = std::move(transportMemoryTemporaryShared);
+    out.performance.transportMemoryFrameGraphOwned = std::move(transportMemoryFrameGraphOwned);
+    out.performance.transportMemoryAllocatorOwned = std::move(transportMemoryAllocatorOwned);
     out.performance.mlBackendMode = mlBackendMode;
     out.performance.mlBackendRequested = mlBackendRequested;
     out.performance.mlBackendActive = mlBackendActive;
@@ -864,6 +990,7 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.pipelineRuntimeSourceCompilation = pipelineRuntimeSourceCompilation;
     out.performance.pipelineFunctionConstantsUsed = pipelineFunctionConstantsUsed;
     out.performance.pipelineMetalBinaryArchiveUsed = pipelineMetalBinaryArchiveUsed;
+    out.performance.pipelineMetalBinaryArchiveSerialized = pipelineMetalBinaryArchiveSerialized;
     out.performance.pipelineHarvestedCompilationReady = pipelineHarvestedCompilationReady;
     out.performance.pipelineShaderSourceBytes = pipelineShaderSourceBytes;
     out.performance.pipelineLibraryCompileMs = pipelineLibraryCompileMs;
@@ -872,6 +999,7 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     out.performance.pipelineFailedPipelineCount = pipelineFailedPipelineCount;
     out.performance.pipelineCacheStrategy = std::move(pipelineCacheStrategy);
     out.performance.pipelineSpecializationStrategy = std::move(pipelineSpecializationStrategy);
+    out.performance.pipelineBinaryArchivePath = std::move(pipelineBinaryArchivePath);
     out.performance.pipelineCompileKeys = std::move(pipelineCompileKeys);
     out.performance.pipelineCompileFunctions = std::move(pipelineCompileFunctions);
     out.performance.pipelineCompileStages = std::move(pipelineCompileStages);
@@ -897,6 +1025,9 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         out.pbrMetrics.mneeEnvChainMaxBounceCount = pbrSnapshot.mneeEnvChainMaxBounceCount;
         out.pbrMetrics.mneeRectAddedCount = pbrSnapshot.mneeRectAddedCount;
         out.pbrMetrics.mneeContributionCount = pbrSnapshot.mneeContributionCount;
+        out.pbrMetrics.restirDiRegirCandidateCount = pbrSnapshot.restirDiRegirCandidateCount;
+        out.pbrMetrics.restirDiRegirAcceptedCount = pbrSnapshot.restirDiRegirAcceptedCount;
+        out.pbrMetrics.restirDiRegirFallbackCount = pbrSnapshot.restirDiRegirFallbackCount;
         out.pbrMetrics.restirGiCandidateCount = pbrSnapshot.restirGiCandidateCount;
         out.pbrMetrics.restirGiReservoirUpdateCount = pbrSnapshot.restirGiReservoirUpdateCount;
         out.pbrMetrics.restirGiAcceptCount = pbrSnapshot.restirGiAcceptCount;
@@ -915,12 +1046,57 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         out.pbrMetrics.restirPtReuseAppliedCount = pbrSnapshot.restirPtReuseAppliedCount;
         out.pbrMetrics.restirPtReuseRejectedInvalidCount = pbrSnapshot.restirPtReuseRejectedInvalidCount;
         out.pbrMetrics.restirPtReuseFallbackCount = pbrSnapshot.restirPtReuseFallbackCount;
+        out.pbrMetrics.restirPtEnhancedCandidateCount = pbrSnapshot.restirPtEnhancedCandidateCount;
+        out.pbrMetrics.restirPtEnhancedInitialSelectedCount =
+            pbrSnapshot.restirPtEnhancedInitialSelectedCount;
+        out.pbrMetrics.restirPtEnhancedTemporalAcceptedCount =
+            pbrSnapshot.restirPtEnhancedTemporalAcceptedCount;
+        out.pbrMetrics.restirPtEnhancedTemporalRejectedCount =
+            pbrSnapshot.restirPtEnhancedTemporalRejectedCount;
+        out.pbrMetrics.restirPtEnhancedSpatialAcceptedCount =
+            pbrSnapshot.restirPtEnhancedSpatialAcceptedCount;
+        out.pbrMetrics.restirPtEnhancedSpatialRejectedCount =
+            pbrSnapshot.restirPtEnhancedSpatialRejectedCount;
+        out.pbrMetrics.restirPtEnhancedInvalidShiftGeometryCount =
+            pbrSnapshot.restirPtEnhancedInvalidShiftGeometryCount;
+        out.pbrMetrics.restirPtEnhancedInvalidShiftMaterialCount =
+            pbrSnapshot.restirPtEnhancedInvalidShiftMaterialCount;
+        out.pbrMetrics.restirPtEnhancedInvalidShiftPdfCount =
+            pbrSnapshot.restirPtEnhancedInvalidShiftPdfCount;
+        out.pbrMetrics.restirPtEnhancedInvalidShiftVisibilityCount =
+            pbrSnapshot.restirPtEnhancedInvalidShiftVisibilityCount;
+        out.pbrMetrics.restirPtEnhancedInvalidShiftInvertibilityCount =
+            pbrSnapshot.restirPtEnhancedInvalidShiftInvertibilityCount;
+        out.pbrMetrics.restirPtEnhancedInvalidShiftUnsupportedCount =
+            pbrSnapshot.restirPtEnhancedInvalidShiftUnsupportedCount;
+        out.pbrMetrics.restirPtEnhancedDuplicateScoreSum =
+            pbrSnapshot.restirPtEnhancedDuplicateScoreSum;
+        out.pbrMetrics.restirPtEnhancedBiasedCCapApplicationCount =
+            pbrSnapshot.restirPtEnhancedBiasedCCapApplicationCount;
+        out.pbrMetrics.restirPtEnhancedVectorWeightUseCount =
+            pbrSnapshot.restirPtEnhancedVectorWeightUseCount;
+        out.pbrMetrics.restirPtEnhancedReplayCompactionInputCount =
+            pbrSnapshot.restirPtEnhancedReplayCompactionInputCount;
+        out.pbrMetrics.restirPtEnhancedReplayCompactionOutputCount =
+            pbrSnapshot.restirPtEnhancedReplayCompactionOutputCount;
+        out.pbrMetrics.restirPtEnhancedFallbackCount = pbrSnapshot.restirPtEnhancedFallbackCount;
+        out.pbrMetrics.restirPtEnhancedCanonicalSampleCount =
+            pbrSnapshot.restirPtEnhancedCanonicalSampleCount;
+        for (uint32_t i = 0u; i < HeadlessRenderOutput::PbrMetrics::kRestirPtEnhancedHistogramBins; ++i) {
+            out.pbrMetrics.restirPtEnhancedPathLengthHistogram[i] =
+                pbrSnapshot.restirPtEnhancedPathLengthHistogram[i];
+            out.pbrMetrics.restirPtEnhancedReconnectionDepthHistogram[i] =
+                pbrSnapshot.restirPtEnhancedReconnectionDepthHistogram[i];
+        }
         out.pbrMetrics.radianceCacheQueryCount = pbrSnapshot.radianceCacheQueryCount;
         out.pbrMetrics.radianceCacheHitCount = pbrSnapshot.radianceCacheHitCount;
         out.pbrMetrics.radianceCacheMissCount = pbrSnapshot.radianceCacheMissCount;
         out.pbrMetrics.radianceCacheTrainCount = pbrSnapshot.radianceCacheTrainCount;
         out.pbrMetrics.radianceCacheFallbackCount = pbrSnapshot.radianceCacheFallbackCount;
         out.pbrMetrics.radianceCacheInvalidCount = pbrSnapshot.radianceCacheInvalidCount;
+        for (uint32_t i = 0u; i < PathTracer::RadianceCacheTraining::kStatCount; ++i) {
+            out.pbrMetrics.radianceCacheStats[i] = pbrSnapshot.radianceCacheStats[i];
+        }
         out.pbrMetrics.causticEyeVertexCount = pbrSnapshot.causticEyeVertexCount;
         out.pbrMetrics.causticLightVertexCount = pbrSnapshot.causticLightVertexCount;
         out.pbrMetrics.causticConnectionCandidateCount = pbrSnapshot.causticConnectionCandidateCount;
@@ -936,6 +1112,8 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         out.pbrMetrics.spectralMaterialLookupCount = pbrSnapshot.spectralMaterialLookupCount;
         out.pbrMetrics.spectralDispersionEventCount = pbrSnapshot.spectralDispersionEventCount;
         out.pbrMetrics.spectralFallbackCount = pbrSnapshot.spectralFallbackCount;
+        out.pbrMetrics.spectralCollapseCount = pbrSnapshot.spectralCollapseCount;
+        out.pbrMetrics.spectralWavelengthChannelSampleCount = pbrSnapshot.spectralWavelengthChannelSampleCount;
         out.pbrMetrics.maxThroughputByBounce = std::move(pbrSnapshot.maxThroughputByBounce);
     }
     renderer.captureMaterialMrDebugDump(out.materialMrDebug);
