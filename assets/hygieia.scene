@@ -4,8 +4,8 @@ camera target=0.00,1.60,0.00 distance=9.50 yaw=1.5 pitch=0.0 vfov=25.50 defocusA
 background env=venice_sunrise_4k.hdr
 renderer maxDepth=16 samplesPerFrame=1 tonemap=2 exposure=0.5 reinhardWhite=1.50 \
         fireflyClampEnabled=1 fireflyClampFactor=6.0 fireflyClampFloor=0.6 \
-        throughputClamp=10.0 specularTailClampBase=3.0 \
-        specularTailClampRoughnessScale=8.0 minSpecularPdf=0.0005
+        throughputClamp=10.0 \
+        minSpecularPdf=0.0005
 
 # Materials (0=steel, 1=black metal, 2=red metal)
 material type=metal albedo=0.90,0.90,0.90 roughness=0.30 eta=1.657,0.880,0.521 k=9.223,6.270,5.303

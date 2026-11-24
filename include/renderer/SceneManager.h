@@ -35,6 +35,7 @@ public:
         std::vector<std::pair<size_t, std::string>> directives;
         size_t nextDirective = 0;
         bool sawExplicitCameraDirective = false;
+        bool deprecationNoted = false;  // a deprecated renderer key was reported for this load
         std::unordered_map<std::string, uint32_t> materialIndicesByName;
         RenderSettings parsedSettings{};
         std::string scenePath;
@@ -90,9 +91,11 @@ private:
     static bool parseCamera(const std::unordered_map<std::string, std::string>& tokens,
                             RenderSettings& inOutSettings,
                             std::string& errorMessage);
+    // deprecationNoted (optional, per scene load): limits deprecated-key notes to one per load.
     static bool parseRenderer(const std::unordered_map<std::string, std::string>& tokens,
                               RenderSettings& inOutSettings,
-                              std::string& errorMessage);
+                              std::string& errorMessage,
+                              bool* deprecationNoted = nullptr);
     static bool parseMaterial(const std::unordered_map<std::string, std::string>& tokens,
                               SceneResources& resources,
                               std::string& errorMessage,
@@ -110,6 +113,9 @@ private:
     static bool parseDisk(const std::unordered_map<std::string, std::string>& tokens,
                           SceneResources& resources,
                           std::string& errorMessage);
+    static bool parseReferencePoint(const std::unordered_map<std::string, std::string>& tokens,
+                                    SceneResources& resources,
+                                    std::string& errorMessage);
     static bool parseDirectionalLight(const std::unordered_map<std::string, std::string>& tokens,
                                       SceneResources& resources,
                                       std::string& errorMessage);

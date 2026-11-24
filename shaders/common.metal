@@ -18,13 +18,53 @@ constant uint kMaxMaterialSamplers = 14;
 constant uint kMaterialResourcePathGuidingStateIndex = kMaxMaterialTextures + kMaxMaterialSamplers;
 constant uint kMaterialResourceRestirPtStateIndex = kMaterialResourcePathGuidingStateIndex + 1u;
 constant uint kMaterialResourceRadianceCacheStateIndex = kMaterialResourceRestirPtStateIndex + 1u;
+constant uint kMaterialResourceRadianceCacheQueryItemIndex =
+    kMaterialResourceRadianceCacheStateIndex + 1u;
+constant uint kMaterialResourceRadianceCacheTrainRecordIndex =
+    kMaterialResourceRadianceCacheQueryItemIndex + 1u;
+constant uint kMaterialResourceCausticEyeVertexIndex =
+    kMaterialResourceRadianceCacheTrainRecordIndex + 1u;
+constant uint kMaterialResourceCausticLightVertexIndex =
+    kMaterialResourceCausticEyeVertexIndex + 1u;
+constant uint kMaterialResourceCausticConnectionIndex =
+    kMaterialResourceCausticLightVertexIndex + 1u;
+constant uint kMaterialResourceCausticConnectionResultIndex =
+    kMaterialResourceCausticConnectionIndex + 1u;
 constant uint kWavefrontShadowCapacityMultiplier = 4u;
 constant uint kRestirPathReservoirDepthCount = 8u;
 constant uint kMaterialFlagDisableOrm = 1u << 0;
 constant uint kMaterialFlagForceBaseColorMip0 = 1u << 1;
 constant uint kMaterialFlagBlackKeyAlphaFromRgb = 1u << 2;
 constant uint kMaterialFlagCameraVisibleEmissionTint = 1u << 3;
+constant uint kMaterialFlagThinFoliageShadow = 1u << 4;
+constant uint kMaterialFlagFoliageBeautyLift = 1u << 5;
+constant uint kMaterialFlagAlphaCutoutContinuation = 1u << 6;  // Mask holes preserve path depth; never clear later blockers.
+constant uint kMaterialFlagDielectricTransmissionTint = 1u << 8;
+constant uint kMaterialFlagSingleScatterSpecular = 1u << 10;
+constant uint kMaterialFlagRegularizedDielectric = 1u << 11;
+constant uint kMaterialFlagReferenceDielectricContinuation = 1u << 12;
+constant uint kMaterialFlagTexturedEmissionNee = 1u << 13;
+constant uint kMaterialFlagBlackBackFace = 1u << 14;  // Single-sided: back-face hits absorb the path.
+// Bit 15 is reserved.
+constant uint kMaterialFlagFalcorStandardBsdf = 1u << 16;  // PBR as Falcor: Frostbite diffuse, single-scatter GGX.
+constant uint kMaterialFlagSourceNormalGreen = 1u << 17;  // Restore source G for an imported tangent frame.
+constant uint kMaterialFlagThinWalledTransmission = 1u << 18;  // glTF transmission without volume: no refraction.
+// Source-interface transport is opt-in; keep these high bits separate from closure flags.
+constant uint kMaterialFlagSourceFeatures = 1u << 19;
+// Set only on an integrator's local plastic copy: the exit point of a coated subsurface walk (base term only).
+constant uint kMaterialFlagSubsurfaceExit = 1u << 20;
+// Set only on an integrator's local copy: an authored source dielectric seen from the side its raw normal points away
+// from (source_mark_closure_side). The direct-light cosine then uses the side the closure shades.
+constant uint kMaterialFlagSourceClosureBackSide = 1u << 21;
+constant uint kMaterialFlagInterfacePrecision = 1u << 28;
+constant uint kMaterialFlagExplicitInterior = 1u << 29;
+constant uint kMaterialFlagMediumInherit = 1u << 30;
+constant uint kMaterialFlagAuthoredDielectricNormal = 1u << 31;
+
 constant uint kLightPrimitiveFlagDirectional = 1u << 0;
+constant uint kLightPrimitiveFlagRectangle = 1u << 1;
+constant uint kLightPrimitiveFlagTwoSided = 1u << 2;
+constant uint kLightPrimitiveFlagTexturedEmission = 1u << 3;
 constant uint kMaterialClosureTypeDiffuse = 0u;
 constant uint kMaterialClosureTypeConductor = 1u;
 constant uint kMaterialClosureTypeDielectric = 2u;
@@ -47,6 +87,13 @@ constant uint kMaterialClosureFlagVolumetric = 1u << 6;
 constant uint kMaterialClosureFlagGlossy = 1u << 7;
 constant uint kMaterialClosureFlagDiffuse = 1u << 8;
 constant uint kMaterialClosureFlagSpecular = 1u << 9;
+constant uint kRestirPtEnhancedFeaturePairedSpatialReuse = 1u << 0;
+constant uint kRestirPtEnhancedFeatureFootprintReconnection = 1u << 1;
+constant uint kRestirPtEnhancedFeatureDuplicationDecorrelation = 1u << 2;
+constant uint kRestirPtEnhancedFeatureUnifiedDiGi = 1u << 3;
+constant uint kRestirPtEnhancedFeatureVectorShadingWeights = 1u << 4;
+constant uint kRestirPtEnhancedFeatureDualMotionVectors = 1u << 5;
+constant uint kRestirPtEnhancedFeatureReplayCompaction = 1u << 6;
 
 struct PathGuidingReservoirState {
     float4 directionConfidence;
@@ -62,10 +109,21 @@ struct RestirPtReservoirState {
     float4 normalDepth;
     float4 directionWeight;
     float4 throughputLuma;
+    float4 reconnectionVertexSourcePdf;
+    float4 targetJacobianMis;
+    float4 vectorContributionScalar;
     uint materialType;
     uint lobeType;
     uint frameTag;
     uint flags;
+    uint replaySeed;
+    uint pathLength;
+    uint techniqueIndex;
+    uint validityFlags;
+    uint materialLobeMetadata;
+    uint duplicateScoreQ;
+    uint cCapQ;
+    uint enhancedModeFlags;
 };
 
 struct RadianceQuery {
@@ -98,11 +156,32 @@ struct RadianceCacheState {
     uint invalidationState;
 };
 
+// Deferred radiance cache training (mirror of RadianceCacheTraining.h and MetalShaderTypes.h): one record per
+// cacheable vertex of a training path, slot = depth - radianceCacheMinDepth. 48 bytes.
+constant uint kRadianceCacheTrainRecordCount = 6u;
+constant uint kRadianceCacheTrainingPathStride = 8u;
+struct RadianceCacheTrainRecord {
+    float4 positionKey;       // xyz query position, w = as_type<float>(domain key)
+    float4 throughputNormal;  // xyz throughput at the query, w = as_type<float>(octahedral normal, 2 x unorm16)
+    float4 baselineMeta;      // xyz radiance accumulated at the query (x's emission and NEE included),
+                              // w = as_type<float>(material type:12 | lobe:4 | roughness unorm8:8 | valid:1 at bit 31)
+};
+
+struct RadianceCacheWorkItem {
+    RadianceQuery query;
+    float4 radianceConfidence;
+    float4 varianceBiasRisk;
+    uint4 pathPixelDepthFlags;
+};
+
 struct PathVertex {
     float4 positionPdfFwd;
     float4 normalPdfRev;
     float4 throughputEta;
+    float4 directionDepth;
+    float4 geometricNormalMedium;
     uint4 metadata;
+    uint4 transport;
 };
 
 struct EyeSubpathVertex {
@@ -129,6 +208,7 @@ struct RestirDIReservoirState {
     float4 normalTargetPdf;
     float4 emissionWeight;
     uint4 sampleMeta;
+    uint4 surfaceMeta;
     uint candidateCount;
     uint temporalAccepted;
     uint spatialAccepted;
@@ -153,6 +233,12 @@ struct MaterialTextureArgumentBuffer {
     device PathGuidingReservoirState* pathGuidingStates [[id(kMaterialResourcePathGuidingStateIndex)]];
     device RestirPtReservoirState* restirPtReservoirs [[id(kMaterialResourceRestirPtStateIndex)]];
     device RadianceCacheState* radianceCacheStates [[id(kMaterialResourceRadianceCacheStateIndex)]];
+    device RadianceCacheWorkItem* radianceCacheQueryItems [[id(kMaterialResourceRadianceCacheQueryItemIndex)]];
+    device RadianceCacheTrainRecord* radianceCacheTrainRecords [[id(kMaterialResourceRadianceCacheTrainRecordIndex)]];
+    device EyeSubpathVertex* causticEyeVertices [[id(kMaterialResourceCausticEyeVertexIndex)]];
+    device LightSubpathVertex* causticLightVertices [[id(kMaterialResourceCausticLightVertexIndex)]];
+    device PathConnection* causticConnections [[id(kMaterialResourceCausticConnectionIndex)]];
+    device ConnectionResult* causticConnectionResults [[id(kMaterialResourceCausticConnectionResultIndex)]];
 };
 
 struct SphereData {
@@ -161,7 +247,7 @@ struct SphereData {
 };
 
 struct RectData {
-    float4 corner;          // rectangle: xyz corner; disk: xyz center
+    float4 corner;          // rectangle: corner; disk: center; reference point: xyz position, w radius
     float4 edgeU;           // rectangle: edge vector; disk: scaled tangent/radius axis
     float4 edgeV;           // rectangle: edge vector; disk: scaled bitangent/radius axis
     float4 normalAndPlane;  // xyz normal, w plane constant
@@ -182,7 +268,7 @@ struct MaterialData {
     float4 sssSigmaS;           // xyz sigma_s, w anisotropy g
     float4 sssParams;           // x mean free path, y method, z coat enabled flag, w unused
     float4 carpaintBaseParams;  // x base metallic, y base roughness, z flake scale, w flake reflectance scale
-    float4 carpaintFlakeParams; // x flake sample weight, y flake roughness, z flake anisotropy, w flake normal strength
+    float4 carpaintFlakeParams; // x flake coverage (CarPaint under-layer), y flake roughness, z flake anisotropy, w flake normal strength
     float4 carpaintBaseEta;     // xyz carpaint base eta, w flag (>0 when valid)
     float4 carpaintBaseK;       // xyz carpaint base k, w flag (>0 when valid)
     float4 carpaintBaseTint;    // xyz conductor tint multiplier, w unused
@@ -192,7 +278,7 @@ struct MaterialData {
     uint interiorMediumId;      // 0 = vacuum; front-face transmission enters this medium
     uint exteriorMediumId;      // 0 = vacuum; back-face transmission exits to this medium
     uint materialPad2;
-    float4 spectralParams;      // x dispersion scale, y spectral absorption scale, z/w reserved
+    float4 spectralParams;      // x dispersion scale, y absorption scale, z material spectral policy, w texture policy
     float4 pbrParams;           // x = metallic, y = roughness, z = occlusion strength, w = normal scale
     float4 pbrExtras;           // x = alpha factor, y = alpha cutoff, z = transmission factor, w = alpha mode
     uint4 textureUvSet0;        // x = baseColor, y = metallicRoughness, z = normal, w = occlusion
@@ -209,7 +295,40 @@ struct MaterialData {
     float4 textureTransform9;   // emissive: row1
     float4 textureTransform10;  // transmission: row0
     float4 textureTransform11;  // transmission: row1
+    float4 sourceParams;       // model, distribution (1 Beckmann/2 GGX), alpha, nonlinear
+    float4 sourceReflectance;  // RGB multiplier, conductor compensation enabled
+    float4 sourceFresnel;      // diffuse Fresnel, avg transmittance, base-color multiplier, authored IOR
+    float4 textureControl;      // x opacity, y opacity enabled, z Tungsten bump scale, w reserved
 };
+
+inline float4 resolve_alpha_cutout_foliage_base_color_sample(const MaterialData material,
+                                                             const float4 sample) {
+    if ((material.materialFlags & kMaterialFlagThinFoliageShadow) == 0u ||
+        material.pbrExtras.w <= 0.5f) {
+        return sample;
+    }
+
+    if (sample.w >= 0.999f) {
+        return sample;
+    }
+
+    const float alphaCutoff = clamp(material.pbrExtras.y, 0.0f, 1.0f);
+    const float alpha = max(sample.w, max(alphaCutoff, 0.25f));
+    const float edgeWeight = saturate((1.0f - sample.w) / max(1.0f - alphaCutoff, 1.0e-3f));
+    const float3 unassociatedRgb = clamp(sample.xyz / alpha, float3(0.0f), float3(1.0f));
+    const float3 repairedRgb = mix(sample.xyz, max(sample.xyz, unassociatedRgb), edgeWeight);
+    return float4(repairedRgb, sample.w);
+}
+
+inline MaterialData apply_foliage_beauty_lift(MaterialData material) {
+    if ((material.materialFlags & kMaterialFlagFoliageBeautyLift) == 0u) {
+        return material;
+    }
+
+    const float3 foliageColor = clamp(material.baseColorRoughness.xyz, float3(0.0f), float3(1.0f));
+    material.emission.xyz = max(material.emission.xyz, foliageColor * 1.35f);
+    return material;
+}
 
 struct MaterialClosureMetadata {
     uint type;
@@ -258,7 +377,7 @@ struct PathtraceUniforms {
     uint wavefrontDebugStageFailures;
 
     float3 cameraOrigin;
-    float cameraPad0;
+    float textureLodBias;
     float3 lowerLeftCorner;
     float cameraPad1;
     float3 horizontal;
@@ -298,11 +417,9 @@ struct PathtraceUniforms {
     float fireflyClampFactor;
     float fireflyClampFloor;
     float throughputClamp;
-    float specularTailClampBase;
-    float specularTailClampRoughnessScale;
     float minSpecularPdf;
     float fireflyClampMaxContribution;
-    float paddingFirefly;
+    float environmentBackgroundScaleOffset;  // Scale minus one; zero keeps the original background
     uint sssMode;
     uint sssMaxSteps;
     uint directLightMode;
@@ -328,7 +445,7 @@ struct PathtraceUniforms {
     uint radianceCacheTrainingInterval;
     float radianceCacheMaxRadiance;
     uint radianceCacheDebug;
-    uint radianceCachePadding0;
+    uint referencePointExactNee;
     uint causticTransportMode;
     uint causticMaxVertices;
     uint volumeTransportMode;
@@ -340,11 +457,11 @@ struct PathtraceUniforms {
     uint volumeDebug;
     uint spectralRenderingMode;
     uint spectralTexturePolicy;
-    float4 spectralWavelengthRange;
+    float4 spectralWavelengthRange; // x min nm, y max nm, z dispersion strength, w white balance R
     uint spectralDebug;
-    uint spectralPadding0;
-    uint spectralPadding1;
-    uint spectralPadding2;
+    float spectralWhiteBalanceG;
+    float spectralWhiteBalanceB;
+    float sourceRayEpsilon;
     uint restirDebugEnabled;
     uint restirDebugView;
     uint restirDebugCounters;
@@ -359,7 +476,7 @@ struct PathtraceUniforms {
     uint enableHardwareMissFallback;
     uint enableHardwareFirstHitFromSoftware;
     uint enableHardwareForceSoftware;
-    uint paddingHardware1;
+    uint referencePointNeeShadowExtra;
     uint parityAssertEnabled;
     uint parityAssertMode;
     uint parityPixelX;
@@ -367,11 +484,11 @@ struct PathtraceUniforms {
     uint parityOncePerFrame;
     uint parityPadding0;
     uint explicitRestirDiLightingStage;
-    uint parityPadding2;
+    uint sourceOpacityPresent;
     uint forcePureHWRTForGlass;
     uint enableHardwareShadowNearRetryReject;
-    uint parityPadding4;
-    uint parityPadding5;
+    uint sourceTransport;
+    uint oidnDeltaGuidesAllowed; // bit 0: accumulate; bit 1: follow source smooth conductors; bit 2: follow delta source dielectrics
     uint debugViewMode;
     uint debugDisableAO;
     uint debugAoIndirectOnly;
@@ -389,8 +506,44 @@ struct PathtraceUniforms {
     float debugVisorOverrideRoughness;
     float debugVisorOverrideF0;
     uint debugEnvNearest;
-    uint debugPadding0;
+    uint disableNormalVarianceRoughness;
 };
+
+// Mirrors the static_asserts in include/MetalShaderTypes.h.
+static_assert(sizeof(PathtraceUniforms) == 768u, "PathtraceUniforms layout");
+static_assert(__builtin_offsetof(PathtraceUniforms, spectralRenderingMode) == 536u, "spectral uniform layout");
+static_assert(__builtin_offsetof(PathtraceUniforms, spectralWavelengthRange) == 544u, "spectral uniform layout");
+static_assert(__builtin_offsetof(PathtraceUniforms, spectralWhiteBalanceG) == 564u, "spectral uniform layout");
+static_assert(__builtin_offsetof(PathtraceUniforms, spectralWhiteBalanceB) == 568u, "spectral uniform layout");
+static_assert(__builtin_offsetof(PathtraceUniforms, sourceRayEpsilon) == 572u, "spectral uniform layout");
+
+// Default-features specialization of the hardware megakernel.
+// The host builds a second pathtraceIntegrateHardwareKernel pipeline with this constant set to
+// true, and selects it only when every gate below is 0 (UniformBuilder::usesOnlyDefaultFeatures).
+// In that pipeline PT_DEFAULT_OFF folds each gate read to 0, so the compiler drops the research
+// and debug paths. Every other pipeline leaves the constant undefined and reads the uniform.
+// directLightMode stays a runtime value in both pipelines, so scenes that set a direct-light mode
+// also take the default-features pipeline, except ris_spatial and ris_world: their same-frame
+// neighbour and candidate blocks (a primary trace and a reservoir build per neighbour) are gates,
+// folded out here.
+constant bool kMegakernelDefaultFeaturesValue [[function_constant(2)]];
+constant bool kMegakernelDefaultFeatures =
+    is_function_constant_defined(kMegakernelDefaultFeaturesValue) ? kMegakernelDefaultFeaturesValue : false;
+#define PT_DEFAULT_OFF(gate) (kMegakernelDefaultFeatures ? 0u : (gate))
+
+// The gates PT_DEFAULT_OFF wraps. Mirrors UniformBuilder::UsesOnlyDefaultFeatures: a field
+// wrapped in PT_DEFAULT_OFF must be listed in both.
+inline bool default_feature_gates_off(constant PathtraceUniforms& u) {
+    return u.sssMode == 0u && u.enableMnee == 0u &&
+           u.restirGiMode == 0u && u.pathGuidingMode == 0u && u.restirPtMode == 0u &&
+           u.radianceCacheMode == 0u && u.causticTransportMode == 0u &&
+           u.volumeTransportMode == 0u && u.spectralRenderingMode == 0u &&
+           u.restirDebugEnabled == 0u && u.debugPathActive == 0u && u.restirPtDebug == 0u &&
+           u.radianceCacheDebug == 0u && u.volumeDebug == 0u && u.spectralDebug == 0u &&
+           u.parityAssertEnabled == 0u && u.debugViewMode == 0u && u.debugDirectLightAudit == 0u &&
+           u.directLightMode != 3u &&  // kDirectLightModeRisSpatialReuse (core/constants.metal, compiled later)
+           u.directLightMode != 5u;    // kDirectLightModeRisWorldReuse
+}
 
 struct DisplayUniforms {
     uint tonemapMode;
@@ -401,6 +554,7 @@ struct DisplayUniforms {
     float bloomThreshold;
     float bloomIntensity;
     float bloomRadius;
+    uint srgbEncode;
 };
 
 struct SvgfDenoiseUniforms {
@@ -412,6 +566,10 @@ struct SvgfDenoiseUniforms {
     float albedoSigma;
     float luminanceSigma;
     uint historyValid;
+    uint denoiseDirect;
+    uint denoiseIndirect;
+    uint reserved0;
+    uint reserved1;
     float4 currentCameraOrigin;
     float4 previousCameraOrigin;
     float4 previousLowerLeftCorner;
@@ -427,6 +585,7 @@ struct DisplayVertexOut {
 struct Ray {
     float3 origin;
     float3 direction;
+    uint4 mediumState; // medium id, stack depth, volume scatter depth, phase
 };
 
 struct BvhNode {
@@ -450,6 +609,36 @@ constant uint kSoftwareBvhSpheres = 1u;
 constant uint kSoftwareBvhTriangles = 2u;
 constant uint kPathtraceDebugMaxEntries = 512u;
 constant uint kPathtraceParityMaxEntries = 16u;
+
+// Radiance cache diagnostics (mirror of include/renderer/RadianceCacheTraining.h RadianceCacheStat and
+// include/MetalShaderTypes.h): 64-bit counters as (lo, hi) words, accumulated from the last history reset.
+constant uint kRadianceCacheStatCount = 48u;
+// PathtraceStats::sssWalkStats, per material (index material * kSssWalkStatCount + stat): random walks started, then
+// how each ended. Indices 1 to 4 are the walk's own event codes (kSssWalkExit, kSssWalkAbsorbed, kSssWalkOpenMesh,
+// kSssWalkStepLimit in bsdf/closures_eval.metal).
+constant uint kSssWalkStatWalks = 0u;
+constant uint kSssWalkStatCount = 5u;
+constant uint kRadianceCacheStatTrainRecords = 0u;
+constant uint kRadianceCacheStatTrainAccepted = 1u;
+constant uint kRadianceCacheStatTrainClamped = 2u;
+constant uint kRadianceCacheStatTrainRejectedNonFinite = 3u;
+constant uint kRadianceCacheStatTrainRejectedZeroThroughput = 4u;
+constant uint kRadianceCacheStatTrainSaturated = 5u;
+constant uint kRadianceCacheStatCellEvictions = 6u;
+constant uint kRadianceCacheStatTargetLumaFixed = 7u;
+constant uint kRadianceCacheStatClampedLumaFixed = 8u;
+constant uint kRadianceCacheStatFallbackReasonBase = 9u;
+constant uint kRadianceCacheStatDepthQueryBase = 19u;
+constant uint kRadianceCacheStatDepthHitBase = 27u;
+constant uint kRadianceCacheStatDepthHitLumaFixedBase = 35u;
+constant uint kRadianceCacheStatMaxStoredSumBase = 43u;
+constant uint kRadianceCacheStatWrappedSums = 47u;
+constant float kRadianceCacheStatLumaScale = 65536.0f;
+constant float kRadianceCacheStatLumaAddMax = 1.0e9f;
+struct RadianceCacheStatCounter {
+    atomic_uint lo;
+    atomic_uint hi;
+};
 
 struct PathtraceStats {
     atomic_uint primaryRayCount;
@@ -512,6 +701,9 @@ struct PathtraceStats {
     atomic_uint throughputNanInfCount;
     atomic_uint radianceNanInfCount;
     atomic_uint clampEventCount;
+    atomic_uint restirDiRegirCandidateCount;
+    atomic_uint restirDiRegirAcceptedCount;
+    atomic_uint restirDiRegirFallbackCount;
     atomic_uint restirGiCandidateCount;
     atomic_uint restirGiReservoirUpdateCount;
     atomic_uint restirGiAcceptCount;
@@ -530,6 +722,27 @@ struct PathtraceStats {
     atomic_uint restirPtReuseAppliedCount;
     atomic_uint restirPtReuseRejectedInvalidCount;
     atomic_uint restirPtReuseFallbackCount;
+    atomic_uint restirPtEnhancedCandidateCount;
+    atomic_uint restirPtEnhancedInitialSelectedCount;
+    atomic_uint restirPtEnhancedTemporalAcceptedCount;
+    atomic_uint restirPtEnhancedTemporalRejectedCount;
+    atomic_uint restirPtEnhancedSpatialAcceptedCount;
+    atomic_uint restirPtEnhancedSpatialRejectedCount;
+    atomic_uint restirPtEnhancedInvalidShiftGeometryCount;
+    atomic_uint restirPtEnhancedInvalidShiftMaterialCount;
+    atomic_uint restirPtEnhancedInvalidShiftPdfCount;
+    atomic_uint restirPtEnhancedInvalidShiftVisibilityCount;
+    atomic_uint restirPtEnhancedInvalidShiftInvertibilityCount;
+    atomic_uint restirPtEnhancedInvalidShiftUnsupportedCount;
+    atomic_uint restirPtEnhancedDuplicateScoreSum;
+    atomic_uint restirPtEnhancedBiasedCCapApplicationCount;
+    atomic_uint restirPtEnhancedVectorWeightUseCount;
+    atomic_uint restirPtEnhancedReplayCompactionInputCount;
+    atomic_uint restirPtEnhancedReplayCompactionOutputCount;
+    atomic_uint restirPtEnhancedFallbackCount;
+    atomic_uint restirPtEnhancedCanonicalSampleCount;
+    atomic_uint restirPtEnhancedPathLengthHistogram[kRestirPathReservoirDepthCount];
+    atomic_uint restirPtEnhancedReconnectionDepthHistogram[kRestirPathReservoirDepthCount];
     atomic_uint radianceCacheQueryCount;
     atomic_uint radianceCacheHitCount;
     atomic_uint radianceCacheMissCount;
@@ -571,15 +784,40 @@ struct PathtraceStats {
     atomic_uint wavefrontShadowProcessedCount;
     atomic_uint wavefrontNextRayEnqueueCount;
     atomic_uint wavefrontShadowRayEnqueueCount;
+    atomic_uint spectralCollapseCount;
+    atomic_uint spectralWavelengthChannelSampleCount;
+    atomic_uint defaultFeatureGateViolationCount;
+    RadianceCacheStatCounter radianceCacheStats[kRadianceCacheStatCount];
+    // Whole-render like radianceCacheStats: every random walk and its outcome, per material, so a mesh that is not
+    // closed or a step limit that cuts walks short shows in the render log and the metadata with the material's name.
+    RadianceCacheStatCounter sssWalkStats[kMaxMaterials * kSssWalkStatCount];
 };
+
+// Counts one random walk of material `materialIndex` and its outcome (a kSssWalk event code) in the whole-render
+// counters. The thread whose add wraps a low word carries into the high word.
+inline void sss_walk_note_outcome(device PathtraceStats* stats, const uint outcome, const uint materialIndex) {
+    if (!stats) {
+        return;
+    }
+    const uint base = min(materialIndex, kMaxMaterials - 1u) * kSssWalkStatCount;
+    if (atomic_fetch_add_explicit(&stats->sssWalkStats[base + kSssWalkStatWalks].lo, 1u, memory_order_relaxed) ==
+        0xFFFFFFFFu) {
+        atomic_fetch_add_explicit(&stats->sssWalkStats[base + kSssWalkStatWalks].hi, 1u, memory_order_relaxed);
+    }
+    const uint index = base + min(max(outcome, 1u), kSssWalkStatCount - 1u);
+    if (atomic_fetch_add_explicit(&stats->sssWalkStats[index].lo, 1u, memory_order_relaxed) == 0xFFFFFFFFu) {
+        atomic_fetch_add_explicit(&stats->sssWalkStats[index].hi, 1u, memory_order_relaxed);
+    }
+}
 
 struct WavefrontRay {
     float4 originMinT;
     float4 directionMaxT;
-    float4 rayDiffDOdx;
+    float4 rayDiffDOdx; // xyz differential; w optical-origin distance correction (tagged interfaces)
     float4 rayDiffDOdy;
     float4 rayDiffDDdx;
     float4 rayDiffDDdy;
+    uint4 mediumState;
     float2 cone;
     uint excludeMeshIndex;
     uint excludePrimitiveIndex;
@@ -597,11 +835,16 @@ constant uint kWavefrontMediumStackSize = 8u;
 struct PathState {
     float4 throughput;
     float4 radiance;
+    float4 directRadiance;
+    float4 indirectRadiance;
     float4 firstHitAlbedo;
     float4 firstHitNormal;
     float4 firstHitPosition;
     float4 firstHitMaterial;
-    float envLod;
+    float reconstructionConfidence;
+    float reconstructionVariance;
+    float reconstructionBiasRisk;
+    float pathMaxRoughness;
     float lastBsdfPdf;
     uint rngState;
     uint mediumDepth;
@@ -613,10 +856,17 @@ struct PathState {
     uint volumeScatteringDepth;
     float spectralWavelengthNm;
     uint spectralSampleIndex;
-    uint spectralPadding0;
+    uint spectralFlags; // kSpectralFlagCollapsed; former spectralPadding0
     uint spectralPadding1;
     float4 mediumStack[kWavefrontMediumStackSize];
+    float4 sourceNullOrigin; // xyz previous scatter origin, w null chain active
 };
+
+// Mirrors the static_asserts in include/MetalShaderTypes.h.
+static_assert(sizeof(PathState) == 352u, "PathState layout");
+static_assert(__builtin_offsetof(PathState, spectralWavelengthNm) == 180u, "spectral PathState layout");
+static_assert(__builtin_offsetof(PathState, spectralFlags) == 188u, "spectral PathState layout");
+static_assert(__builtin_offsetof(PathState, spectralPadding1) == 192u, "spectral PathState layout");
 
 struct WavefrontHitRecord {
     float4 pointT;
@@ -628,17 +878,34 @@ struct WavefrontHitRecord {
     uint padding;
 };
 
+struct WavefrontResolvedSurface {
+    WavefrontHitRecord hit;
+    float4 materialBaseColorRoughness;
+    float4 materialTypeEta;
+    float4 materialEmission;
+    float4 materialPbrParams;
+    float4 materialPbrExtras;
+    float4 firstHitNormalDiffuse;
+    uint4 meta;
+    uint4 recExtra;
+    float4 sourceForwardWeight;
+};
+
 struct ShadowRay {
     float4 originTMax;
     float4 direction;
     float4 contribution;
     float4 throughput;
+    float4 environmentRadiance;
+    uint4 mediumState;
+    float4 sourceSigma;
+    float4 sourceOrigin;
     uint pathIndex;
     uint lightId;
     uint flags;
     uint excludeMeshIndex;
     uint excludePrimitiveIndex;
-    uint padding;
+    uint depth;
 };
 
 constant uint kWavefrontQueuePrimaryRay = 1u;
@@ -678,7 +945,7 @@ struct QueueCounters {
     atomic_uint terminatedCount;
     atomic_uint overflowFlag;
     atomic_uint iterationIndex;
-    uint reserved0;
+    atomic_uint reserved0;
     uint reserved1;
     WavefrontQueueHeader primaryRayQueue;
     WavefrontQueueHeader diffuseRayQueue;
@@ -820,7 +1087,7 @@ struct LightPrimitive {
     float cumulativePower;
     uint reserved1;
     float3 edge1;
-    float reserved2;
+    float directionalCosDelta; // 1 - cos(angular radius), in the existing padding word.
     float3 edge2;
     float reserved3;
 };

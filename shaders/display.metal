@@ -53,6 +53,16 @@ inline float3 tonemapHable(float3 color) {
     return clamp(mapped / white, float3(0.0f), float3(1.0f));
 }
 
+inline float3 tonemapExponential(float3 color) {
+    return 1.0f - exp(-max(color, float3(0.0f)));
+}
+
+// Tungsten's Tonemap::Filmic. The curve has its gamma built in, so no encode follows it.
+inline float3 tonemapTungstenFilmic(float3 color) {
+    float3 x = max(float3(0.0f), color - 0.004f);
+    return clamp((x * (6.2f * x + 0.5f)) / (x * (6.2f * x + 1.7f) + 0.06f), float3(0.0f), float3(1.0f));
+}
+
 inline float3 extractBloom(float3 hdrColor, float threshold) {
     float luma = luminance(hdrColor);
     if (luma <= threshold) {
@@ -61,6 +71,8 @@ inline float3 extractBloom(float3 hdrColor, float threshold) {
     float soft = luma - threshold;
     return hdrColor * (soft / max(luma, 1.0e-4f));
 }
+
+constant bool kDisplayBloomSpecializedEnabled [[function_constant(0)]];
 
 fragment float4 displayFragment(DisplayVertexOut in [[stage_in]],
                                texture2d<float> accumulationTexture [[texture(0)]],
@@ -79,7 +91,9 @@ fragment float4 displayFragment(DisplayVertexOut in [[stage_in]],
     float exposureScale = pow(2.0f, displayUniforms.exposure);
     float3 color = max(accum.rgb, float3(0.0f)) * exposureScale;
 
-    if (displayUniforms.bloomEnabled != 0u && displayUniforms.bloomIntensity > 0.0f) {
+    if (kDisplayBloomSpecializedEnabled &&
+        displayUniforms.bloomEnabled != 0u &&
+        displayUniforms.bloomIntensity > 0.0f) {
         float radius = max(displayUniforms.bloomRadius, 0.0f);
         if (radius > 0.0f) {
             float2 texel = float2(1.0f / max(float(accumulationTexture.get_width()), 1.0f),
@@ -106,7 +120,9 @@ fragment float4 displayFragment(DisplayVertexOut in [[stage_in]],
 
     switch (displayUniforms.tonemapMode) {
         case 2:
-            color = (displayUniforms.acesVariant == 0) ? ACESFitted(color) : ACESSimple(color);
+            // Variant 2 matches Falcor's ToneMapper: ACES with its 0.6 pre-exposure, sRGB encoded.
+            color = (displayUniforms.acesVariant == 0) ? ACESFitted(color)
+                  : ACESSimple(displayUniforms.acesVariant == 2u ? color * 0.6f : color);
             break;
         case 3:
             color = tonemapReinhard(color, displayUniforms.reinhardWhite);
@@ -114,10 +130,23 @@ fragment float4 displayFragment(DisplayVertexOut in [[stage_in]],
         case 4:
             color = tonemapHable(color);
             break;
+        case 5:
+            color = tonemapExponential(color);
+            break;
+        case 6:
+            // Tungsten filmic is already display-referred: skip the sRGB / gamma encode below.
+            return float4(tonemapTungstenFilmic(color), 1.0);
         default:
             color = clamp(color, float3(0.0f), float3(1.0f));
             break;
     }
+    // Same encode as ImageWriter's LDR outputs; the Falcor variant is always sRGB.
+    if (displayUniforms.srgbEncode != 0u ||
+        (displayUniforms.tonemapMode == 2u && displayUniforms.acesVariant == 2u)) {
+        color = select(1.055f * pow(color, float3(1.0f / 2.4f)) - 0.055f, color * 12.92f, color <= 0.0031308f);
+        return float4(color, 1.0);
+    }
+    // Legacy pure gamma 2.2 (renderer token srgbOutput=0).
     const float gamma = 1.0f / 2.2f;
     color = pow(color, float3(gamma));
     return float4(color, 1.0);

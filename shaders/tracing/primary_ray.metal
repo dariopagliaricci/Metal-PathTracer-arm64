@@ -7,6 +7,6 @@ inline Ray make_center_primary_ray_for_pixel(constant PathtraceUniforms& uniform
     float3 pixelPosition =
         uniforms.lowerLeftCorner + u * uniforms.horizontal + v * uniforms.vertical;
     ray.origin = uniforms.cameraOrigin;
-    ray.direction = pixelPosition - ray.origin;
+    ray.direction = normalize_camera_ray_direction(pixelPosition - ray.origin);
     return ray;
 }

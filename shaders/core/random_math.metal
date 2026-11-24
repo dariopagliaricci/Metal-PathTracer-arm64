@@ -9,19 +9,6 @@ inline float rand_uniform(thread uint& state) {
     return float(state) / 4294967296.0f;
 }
 
-inline float3 random_in_unit_sphere(thread uint& state) {
-    while (true) {
-        float3 p = float3(rand_uniform(state), rand_uniform(state), rand_uniform(state)) * 2.0f - 1.0f;
-        if (dot(p, p) < 1.0f) {
-            return p;
-        }
-    }
-}
-
-inline float3 random_unit_vector(thread uint& state) {
-    return normalize(random_in_unit_sphere(state));
-}
-
 inline float2 random_in_unit_disk(thread uint& state) {
     while (true) {
         float2 p = float2(rand_uniform(state), rand_uniform(state)) * 2.0f - 1.0f;
@@ -29,11 +16,6 @@ inline float2 random_in_unit_disk(thread uint& state) {
             return p;
         }
     }
-}
-
-inline bool near_zero(const float3 v) {
-    const float s = 1e-6f;
-    return (fabs(v.x) < s) && (fabs(v.y) < s) && (fabs(v.z) < s);
 }
 
 inline float3 linear_srgb_to_acescg(const float3 color) {
@@ -53,16 +35,12 @@ inline float3 to_working_space(const float3 color,
 
 inline float3 decode_normal_map(float3 sample,
                                 float normalScale,
-                                bool flipGreen,
-                                thread float& outLength) {
+                                bool flipGreen) {
     float3 n = sample * 2.0f - 1.0f;
     if (flipGreen) {
         n.y = -n.y;
     }
     n.xy *= normalScale;
-    outLength = length(n);
-    float xyLen2 = dot(n.xy, n.xy);
-    n.z = sqrt(max(1.0f - xyLen2, 0.0f));
     float len2 = dot(n, n);
     if (len2 > 1.0e-12f) {
         n *= rsqrt(len2);
@@ -83,6 +61,28 @@ struct PrimaryRayDiff {
     float3 dDdx;
     float3 dDdy;
 };
+
+// Camera rays leave their generator with a unit direction, as every other ray
+// does and as Embree's camera rays do, so t is a world distance: the kEpsilon
+// minimum, the cutout continuations, the volume segments and offset_ray_origin
+// all read it that way. pixelPosition - origin is about the focus distance long,
+// so a parametric kEpsilon on it skipped kEpsilon times that length behind a
+// cutout hole: about 2 cm on sponza, where the focus distance is about 21.
+inline float3 normalize_camera_ray_direction(const float3 direction) {
+    return direction * rsqrt(dot(direction, direction));
+}
+
+// The same, with the pixel differential of the normalized direction:
+// d(D/|D|) = (dD - d * dot(d, dD)) / |D|. The Igehy transfers project out the
+// part along the ray, so the hit footprint is the one the raw direction gave.
+inline float3 normalize_camera_ray_direction(const float3 direction,
+                                             thread PrimaryRayDiff& rayDiff) {
+    const float invLength = rsqrt(dot(direction, direction));
+    const float3 d = direction * invLength;
+    rayDiff.dDdx = (rayDiff.dDdx - d * dot(d, rayDiff.dDdx)) * invLength;
+    rayDiff.dDdy = (rayDiff.dDdy - d * dot(d, rayDiff.dDdy)) * invLength;
+    return d;
+}
 
 inline RayCone make_primary_ray_cone(constant PathtraceUniforms& uniforms) {
     float pixelWorldX = length(uniforms.horizontal) / max(float(uniforms.width), 1.0f);

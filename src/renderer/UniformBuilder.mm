@@ -1,6 +1,7 @@
 #import "renderer/UniformBuilder.h"
 #import "renderer/Accumulation.h"
 #import "renderer/SceneResources.h"
+#include "renderer/SpectralSensor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,7 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
     CGSize renderSize) {
     
     PathTracerShaderTypes::PathtraceUniforms uniforms{};
+    uniforms.textureLodBias = settings.textureLodBias;
     
     // Render resolution
     uniforms.width = static_cast<uint32_t>(std::max(1.0, renderSize.width));
@@ -177,6 +179,9 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
     uniforms.workingColorSpace = static_cast<uint32_t>(settings.workingColorSpace);
     uniforms.environmentRotation = settings.environmentRotation;
     uniforms.environmentIntensity = std::max(settings.environmentIntensity, 0.0f);
+    const float backgroundScale = std::isfinite(settings.environmentBackgroundScale)
+        ? std::max(settings.environmentBackgroundScale, 0.0f) : 1.0f;
+    uniforms.environmentBackgroundScaleOffset = backgroundScale - 1.0f;
     uniforms.emissiveTotalPower = std::max(scene.totalEmittedPower(), 0.0f);
     uniforms.backgroundColor = settings.backgroundColor;
     uniforms.environmentAliasCount = scene.environmentAliasCount();
@@ -190,15 +195,14 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
     uniforms.fireflyClampFactor = std::max(settings.fireflyClampFactor, 0.0f);
     uniforms.fireflyClampFloor = std::max(settings.fireflyClampFloor, 0.0f);
     uniforms.throughputClamp = std::max(settings.throughputClamp, 0.0f);
-    uniforms.specularTailClampBase = std::max(settings.specularTailClampBase, 0.0f);
-    uniforms.specularTailClampRoughnessScale = std::max(settings.specularTailClampRoughnessScale, 0.0f);
     uniforms.minSpecularPdf = std::max(settings.minSpecularPdf, 0.0f);
     uniforms.fireflyClampMaxContribution = std::max(settings.fireflyClampMaxContribution, 0.0f);
 
     // Subsurface scattering configuration
     uniforms.sssMode = static_cast<uint32_t>(settings.sssMode);
     uniforms.sssMaxSteps = settings.sssMaxSteps;
-    uniforms.directLightMode = static_cast<uint32_t>(settings.directLightMode);
+    // Homogeneous volumes run restir_di and the hybrid as baseline_emissive (RestirDiDemotedByVolume).
+    uniforms.directLightMode = static_cast<uint32_t>(MetalDirectLightMode(settings));
     uniforms.enableSpecularNee = settings.enableSpecularNee ? 1u : 0u;
     uniforms.enableMnee = settings.enableMnee ? 1u : 0u;
     uniforms.enableMneeSecondary = settings.enableMneeSecondary ? 1u : 0u;
@@ -214,7 +218,10 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
     uniforms.restirPtMaxReservoirs = std::max(settings.restirPtMaxReservoirs, 1u);
     uniforms.restirPtDebug = settings.restirPtDebug ? 1u : 0u;
     uniforms.restirPtReuseStrength = std::clamp(settings.restirPtReuseStrength, 0.0f, 1.0f);
-    uniforms.radianceCacheMode = static_cast<uint32_t>(settings.radianceCacheMode);
+    // A refused combination (RadianceCacheRefusalReason) runs with the cache off.
+    uniforms.radianceCacheMode = static_cast<uint32_t>(RadianceCacheActive(settings)
+                                                           ? settings.radianceCacheMode
+                                                           : RenderSettings::RadianceCacheMode::Off);
     uniforms.radianceCacheCellSize = std::max(settings.radianceCacheCellSize, 1.0e-4f);
     uniforms.radianceCacheMinDepth = std::max<uint32_t>(settings.radianceCacheMinDepth, 1u);
     uniforms.radianceCacheMinConfidence =
@@ -223,7 +230,7 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
         std::max<uint32_t>(settings.radianceCacheTrainingInterval, 1u);
     uniforms.radianceCacheMaxRadiance = std::max(settings.radianceCacheMaxRadiance, 1.0e-4f);
     uniforms.radianceCacheDebug = settings.radianceCacheDebug ? 1u : 0u;
-    uniforms.radianceCachePadding0 = 0u;
+    uniforms.referencePointExactNee = settings.referencePointExactNee ? 1u : 0u;
     uniforms.causticTransportMode = static_cast<uint32_t>(settings.causticTransportMode);
     uniforms.causticMaxVertices = std::max<uint32_t>(settings.causticMaxVertices, 1u);
     uniforms.volumeTransportMode = static_cast<uint32_t>(settings.volumeTransportMode);
@@ -251,25 +258,33 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
                          static_cast<float>(std::max<uint32_t>(settings.volumeMaxScatteringEvents, 1u)));
     uniforms.volumeNeeEnabled = settings.volumeNeeEnabled ? 1u : 0u;
     uniforms.volumeDebug = settings.volumeDebug ? 1u : 0u;
-    uniforms.spectralRenderingMode = static_cast<uint32_t>(settings.spectralRenderingMode);
+    if (settings.volumeTransportMode == RenderSettings::VolumeTransportMode::Homogeneous) {
+        uniforms.restirGiMode = static_cast<uint32_t>(RenderSettings::RestirGiMode::Off);
+        uniforms.restirPtMode = static_cast<uint32_t>(RenderSettings::RestirPtMode::Off);
+        uniforms.pathGuidingMode = static_cast<uint32_t>(RenderSettings::PathGuidingMode::Off);
+        uniforms.radianceCacheMode = static_cast<uint32_t>(RenderSettings::RadianceCacheMode::Off);
+    }
+    // 1 = hero wavelength with three wavelengths per path, 2 = one wavelength per path (spectral_transport.metal).
+    uniforms.spectralRenderingMode =
+        settings.spectralRenderingMode == RenderSettings::SpectralRenderingMode::Off
+            ? 0u
+            : (settings.spectralWavelengthsPerPath == 1u ? 2u : 1u);
     uniforms.spectralTexturePolicy = static_cast<uint32_t>(settings.spectralTexturePolicy);
-    const float spectralMin =
-        std::clamp(std::min(settings.spectralMinWavelengthNm, settings.spectralMaxWavelengthNm - 1.0f),
-                   300.0f,
-                   829.0f);
-    const float spectralMax =
-        std::clamp(std::max(settings.spectralMaxWavelengthNm, spectralMin + 1.0f),
-                   spectralMin + 1.0f,
-                   830.0f);
+    const SpectralSensor::WavelengthRange spectralRange =
+        SpectralSensor::ClampRange(settings.spectralMinWavelengthNm, settings.spectralMaxWavelengthNm);
+    // The white balance is written only in spectral mode, so spectral-off uniforms stay byte-identical.
+    const simd::float3 spectralWhiteBalance =
+        settings.spectralRenderingMode != RenderSettings::SpectralRenderingMode::Off
+            ? SpectralSensor::WhiteBalanceCached(spectralRange)
+            : simd_make_float3(0.0f, 0.0f, 0.0f);
     uniforms.spectralWavelengthRange =
-        simd_make_float4(spectralMin,
-                         spectralMax,
+        simd_make_float4(spectralRange.minNm,
+                         spectralRange.maxNm,
                          std::max(settings.spectralDispersionStrength, 0.0f),
-                         0.0f);
+                         spectralWhiteBalance.x);
     uniforms.spectralDebug = settings.spectralDebug ? 1u : 0u;
-    uniforms.spectralPadding0 = 0u;
-    uniforms.spectralPadding1 = 0u;
-    uniforms.spectralPadding2 = 0u;
+    uniforms.spectralWhiteBalanceG = spectralWhiteBalance.y;
+    uniforms.spectralWhiteBalanceB = spectralWhiteBalance.z;
     uniforms.restirDebugEnabled = settings.restirDebugEnabled ? 1u : 0u;
     uniforms.restirDebugView = static_cast<uint32_t>(settings.restirDebugView);
     uniforms.restirDebugCounters = settings.restirDebugCounters ? 1u : 0u;
@@ -292,16 +307,18 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
         settings.enableHardwareFirstHitFromSoftware ? 1u : 0u;
     uniforms.enableHardwareForceSoftware = settings.enableHardwareForceSoftware ? 1u : 0u;
 #endif
-    uniforms.paddingHardware1 = 0u;
+    uniforms.referencePointNeeShadowExtra = settings.referencePointExactNee
+        ? scene.zeroRadiusReferencePointLightCount() : 0u;
 
     uniforms.debugPathActive = 0u;
     uniforms.debugPixelX = 0u;
     uniforms.debugPixelY = 0u;
     uniforms.debugMaxEntries = 0u;
 #if PT_DEBUG_TOOLS
-    if (settings.enablePathDebug && settings.debugMaxEntries > 0 &&
+    if ((settings.enablePathDebug || settings.debugDirectLightAudit) &&
+        settings.debugMaxEntries > 0 &&
         uniforms.width > 0u && uniforms.height > 0u) {
-        uniforms.debugPathActive = 1u;
+        uniforms.debugPathActive = settings.enablePathDebug ? 1u : 0u;
         uint32_t clampedX = settings.debugPixelX;
         uint32_t clampedY = settings.debugPixelY;
         if (clampedX >= uniforms.width) {
@@ -325,12 +342,26 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
     uniforms.parityOncePerFrame = 0u;
     uniforms.parityPadding0 = 0u;
     uniforms.explicitRestirDiLightingStage = 0u;
-    uniforms.parityPadding2 = 0u;
+    uniforms.sourceOpacityPresent = 0u;
+    if (const auto* materials = scene.materialsData()) {
+        for (uint32_t i = 0; i < scene.materialCount(); ++i) {
+            if (materials[i].textureControl.y != 0.0f) {
+                uniforms.sourceOpacityPresent = 1u;
+                break;
+            }
+        }
+    }
     uniforms.forcePureHWRTForGlass = 0u;
     uniforms.enableHardwareShadowNearRetryReject =
         settings.enableHardwareShadowNearRetryReject ? 1u : 0u;
-    uniforms.parityPadding4 = 0u;
-    uniforms.parityPadding5 = 0u;
+    uniforms.sourceTransport = settings.sourceTransport ? 1u : 0u;
+    uniforms.sourceRayEpsilon = (settings.sourceTransport && std::isfinite(settings.sourceRayEpsilon) && settings.sourceRayEpsilon > 0.0f)
+        ? settings.sourceRayEpsilon : 0.0f;
+    uniforms.oidnDeltaGuidesAllowed =
+        !settings.svgfDenoiseEnabled &&
+        settings.mlBackendMode == RenderSettings::MlBackendMode::Off
+            ? (1u | (settings.denoiseMirrorGuides ? 2u : 0u) |
+               (settings.denoiseTransmissionGuides ? 4u : 0u)) : 0u;
     uniforms.debugViewMode = 0u;
     uniforms.debugDisableAO = settings.debugDisableAO ? 1u : 0u;
     uniforms.debugAoIndirectOnly = settings.debugAoIndirectOnly ? 1u : 0u;
@@ -349,7 +380,7 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
         std::clamp(settings.debugVisorOverrideRoughness, 0.0f, 1.0f);
     uniforms.debugVisorOverrideF0 = std::clamp(settings.debugVisorOverrideF0, 0.0f, 0.12f);
     uniforms.debugEnvNearest = settings.debugEnvNearest ? 1u : 0u;
-    uniforms.debugPadding0 = 0u;
+    uniforms.disableNormalVarianceRoughness = settings.normalVarianceRoughness ? 0u : 1u;
 #if PT_DEBUG_TOOLS
     uniforms.parityOncePerFrame = settings.parityAssertOncePerFrame ? 1u : 0u;
     uniforms.forcePureHWRTForGlass = settings.forcePureHWRTForGlass ? 1u : 0u;
@@ -414,12 +445,31 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
             case RenderSettings::RestirDebugView::RadianceCache:
                 uniforms.debugViewMode = 18u;
                 break;
+            case RenderSettings::RestirDebugView::CausticTransport:
+                uniforms.debugViewMode = 19u;
+                break;
             case RenderSettings::RestirDebugView::Beauty:
                 break;
         }
     }
 
     return uniforms;
+}
+
+bool UniformBuilder::usesOnlyDefaultFeatures(const PathTracerShaderTypes::PathtraceUniforms& u) {
+    // Mirrors default_feature_gates_off() in shaders/common.metal: the gates the
+    // default-features hardware megakernel folds to 0 with PT_DEFAULT_OFF. directLightMode stays
+    // a runtime value in both pipelines, except ris_spatial and ris_world, whose neighbour and candidate
+    // blocks are gates.
+    return u.sssMode == 0u && u.enableMnee == 0u &&
+           u.restirGiMode == 0u && u.pathGuidingMode == 0u && u.restirPtMode == 0u &&
+           u.radianceCacheMode == 0u && u.causticTransportMode == 0u &&
+           u.volumeTransportMode == 0u && u.spectralRenderingMode == 0u &&
+           u.restirDebugEnabled == 0u && u.debugPathActive == 0u && u.restirPtDebug == 0u &&
+           u.radianceCacheDebug == 0u && u.volumeDebug == 0u && u.spectralDebug == 0u &&
+           u.parityAssertEnabled == 0u && u.debugViewMode == 0u && u.debugDirectLightAudit == 0u &&
+           u.directLightMode != static_cast<uint32_t>(RenderSettings::DirectLightMode::RisSpatialReuse) &&
+           u.directLightMode != static_cast<uint32_t>(RenderSettings::DirectLightMode::RisWorldReuse);
 }
 
 PathTracerShaderTypes::DisplayUniforms UniformBuilder::buildDisplayUniforms(
@@ -434,7 +484,8 @@ PathTracerShaderTypes::DisplayUniforms UniformBuilder::buildDisplayUniforms(
     uniforms.bloomThreshold = std::max(settings.bloomThreshold, 0.0f);
     uniforms.bloomIntensity = std::max(settings.bloomIntensity, 0.0f);
     uniforms.bloomRadius = std::max(settings.bloomRadius, 0.0f);
-    
+    uniforms.srgbEncode = settings.srgbOutputEncoding ? 1u : 0u;
+
     return uniforms;
 }
 

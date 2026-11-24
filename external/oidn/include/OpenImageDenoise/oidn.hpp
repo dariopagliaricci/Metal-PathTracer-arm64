@@ -31,12 +31,10 @@ OIDN_NAMESPACE_BEGIN
   public:
     static_assert(IsFlag<FlagT>::value, "not a flag type");
 
-    using MaskType = typename std::underlying_type<FlagT>::type;
-
     constexpr Flags() noexcept : mask(0) {}
-    constexpr Flags(FlagT flag) noexcept : mask(static_cast<MaskType>(flag)) {}
+    constexpr Flags(FlagT flag) noexcept : mask(static_cast<OIDNFlags>(flag)) {}
     constexpr Flags(const Flags& b) noexcept = default;
-    constexpr explicit Flags(MaskType mask) noexcept : mask(mask) {}
+    constexpr explicit Flags(OIDNFlags mask) noexcept : mask(mask) {}
 
     constexpr bool operator !() const noexcept { return !mask; }
 
@@ -68,10 +66,10 @@ OIDN_NAMESPACE_BEGIN
     constexpr bool operator !=(const Flags& b) const noexcept { return mask != b.mask; }
 
     constexpr explicit operator bool() const noexcept { return mask; }
-    constexpr explicit operator MaskType() const noexcept { return mask; }
+    constexpr explicit operator OIDNFlags() const noexcept { return mask; }
 
   private:
-    MaskType mask;
+    OIDNFlags mask;
   };
 
   template<typename FlagT>
@@ -159,10 +157,10 @@ OIDN_NAMESPACE_BEGIN
     // file descriptor handle for a Linux dma_buf
     DMABuf = OIDN_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF,
 
-    // NT handle
+    // opaque NT handle
     OpaqueWin32 = OIDN_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32,
 
-    // global share (KMT) handle
+    // opaque global share (KMT) handle
     OpaqueWin32KMT = OIDN_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32_KMT,
 
     // NT handle returned by IDXGIResource1::CreateSharedHandle referring to a Direct3D 11
@@ -188,6 +186,10 @@ OIDN_NAMESPACE_BEGIN
     // NT handle returned by ID3D12Device::CreateSharedHandle referring to a Direct3D 12
     // committed resource
     D3D12Resource = OIDN_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE,
+
+    // modifier flag indicating that the external memory has dedicated allocation
+    // used only in combination with one of the handle type flags above
+    Dedicated = OIDN_EXTERNAL_MEMORY_TYPE_FLAG_DEDICATED,
   };
 
   template<> struct IsFlag<ExternalMemoryTypeFlag> { static constexpr bool value = true; };
@@ -246,7 +248,7 @@ OIDN_NAMESPACE_BEGIN
         oidnReleaseBuffer(handle);
     }
 
-    OIDNBuffer getHandle() const
+    const OIDNBuffer& getHandle() const
     {
       return handle;
     }
@@ -312,6 +314,123 @@ OIDN_NAMESPACE_BEGIN
 
   private:
     OIDNBuffer handle;
+  };
+
+  // -----------------------------------------------------------------------------------------------
+  // Semaphore
+  // -----------------------------------------------------------------------------------------------
+
+  // External semaphore type flags
+  enum class ExternalSemaphoreTypeFlag
+  {
+    None = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_NONE,
+
+    // opaque POSIX file descriptor handle
+    OpaqueFD = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_OPAQUE_FD,
+
+    // opaque NT handle
+    OpaqueWin32 = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_OPAQUE_WIN32,
+
+    // opaque global share (KMT) handle
+    OpaqueWin32KMT = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_OPAQUE_WIN32_KMT,
+
+    // NT handle referencing a Direct3D 11 fence object
+    D3D11Fence = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_D3D11_FENCE,
+
+    // NT handle referencing a Direct3D 12 fence object
+    D3D12Fence = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_D3D12_FENCE,
+
+    // NT handle referencing a Direct3D 11 keyed mutex object
+    KeyedMutex = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_KEYED_MUTEX,
+
+    // global share (KMT) handle referencing a Direct3D 11 keyed mutex object
+    KeyedMutexKMT = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_KEYED_MUTEX_KMT,
+
+    // POSIX file descriptor referencing a timeline semaphore
+    TimelineSemaphoreFD = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_TIMELINE_SEMAPHORE_FD,
+
+    // NT handle referencing a timeline semaphore
+    TimelineSemaphoreWin32 = OIDN_EXTERNAL_SEMAPHORE_TYPE_FLAG_TIMELINE_SEMAPHORE_WIN32,
+  };
+
+  template<> struct IsFlag<ExternalSemaphoreTypeFlag> { static constexpr bool value = true; };
+  using ExternalSemaphoreTypeFlags = Flags<ExternalSemaphoreTypeFlag>;
+
+  // Semaphore object with automatic reference counting
+  class SemaphoreRef
+  {
+  public:
+    SemaphoreRef() : handle(nullptr) {}
+    SemaphoreRef(OIDNSemaphore handle) : handle(handle) {}
+
+    SemaphoreRef(const SemaphoreRef& other) : handle(other.handle)
+    {
+      if (handle)
+        oidnRetainSemaphore(handle);
+    }
+
+    SemaphoreRef(SemaphoreRef&& other) noexcept : handle(other.handle)
+    {
+      other.handle = nullptr;
+    }
+
+    SemaphoreRef& operator =(const SemaphoreRef& other)
+    {
+      if (&other != this)
+      {
+        if (other.handle)
+          oidnRetainSemaphore(other.handle);
+        if (handle)
+          oidnReleaseSemaphore(handle);
+        handle = other.handle;
+      }
+      return *this;
+    }
+
+    SemaphoreRef& operator =(SemaphoreRef&& other) noexcept
+    {
+      std::swap(handle, other.handle);
+      return *this;
+    }
+
+    SemaphoreRef& operator =(OIDNSemaphore other)
+    {
+      if (other)
+        oidnRetainSemaphore(other);
+      if (handle)
+        oidnReleaseSemaphore(handle);
+      handle = other;
+      return *this;
+    }
+
+    ~SemaphoreRef()
+    {
+      if (handle)
+        oidnReleaseSemaphore(handle);
+    }
+
+    const OIDNSemaphore& getHandle() const
+    {
+      return handle;
+    }
+
+    operator bool() const
+    {
+      return handle != nullptr;
+    }
+
+    // Releases the semaphore (decrements the reference count).
+    void release()
+    {
+      if (handle)
+      {
+        oidnReleaseSemaphore(handle);
+        handle = nullptr;
+      }
+    }
+
+  private:
+    OIDNSemaphore handle;
   };
 
   // -----------------------------------------------------------------------------------------------
@@ -384,7 +503,7 @@ OIDN_NAMESPACE_BEGIN
         oidnReleaseFilter(handle);
     }
 
-    OIDNFilter getHandle() const
+    const OIDNFilter& getHandle() const
     {
       return handle;
     }
@@ -662,7 +781,7 @@ OIDN_NAMESPACE_BEGIN
         oidnReleaseDevice(handle);
     }
 
-    OIDNDevice getHandle() const
+    const OIDNDevice& getHandle() const
     {
       return handle;
     }
@@ -758,17 +877,17 @@ OIDN_NAMESPACE_BEGIN
     }
 
     // Creates a shared buffer by importing external memory from a POSIX file descriptor.
-    BufferRef newBuffer(ExternalMemoryTypeFlag fdType, int fd, size_t byteSize) const
+    BufferRef newBuffer(ExternalMemoryTypeFlags fdType, int fd, size_t byteSize) const
     {
       return oidnNewSharedBufferFromFD(
-        handle, static_cast<OIDNExternalMemoryTypeFlag>(fdType), fd, byteSize);
+        handle, static_cast<OIDNExternalMemoryTypeFlags>(fdType), fd, byteSize);
     }
 
     // Creates a shared buffer by importing external memory from a Win32 handle.
-    BufferRef newBuffer(ExternalMemoryTypeFlag handleType, void* handle, const void* name, size_t byteSize) const
+    BufferRef newBuffer(ExternalMemoryTypeFlags handleType, void* handle, const void* name, size_t byteSize) const
     {
       return oidnNewSharedBufferFromWin32Handle(
-        this->handle, static_cast<OIDNExternalMemoryTypeFlag>(handleType), handle, name, byteSize);
+        this->handle, static_cast<OIDNExternalMemoryTypeFlags>(handleType), handle, name, byteSize);
     }
 
     // Creates a shared buffer from a Metal buffer.
@@ -779,6 +898,90 @@ OIDN_NAMESPACE_BEGIN
       return oidnNewSharedBufferFromMetal(handle, buffer);
     }
   #endif
+
+    SemaphoreRef newSemaphore(ExternalSemaphoreTypeFlags fdType, int fd) const
+    {
+      return oidnNewSharedSemaphoreFromFD(
+        handle, static_cast<OIDNExternalSemaphoreTypeFlags>(fdType), fd);
+    }
+
+    SemaphoreRef newSemaphore(ExternalSemaphoreTypeFlags handleType, void* handle, const void* name) const
+    {
+      return oidnNewSharedSemaphoreFromWin32Handle(
+        this->handle, static_cast<OIDNExternalSemaphoreTypeFlags>(handleType), handle, name);
+    }
+
+    void signalSemaphoreAsync(const SemaphoreRef& semaphore) const
+    {
+      oidnSignalSemaphoresAsync(handle, &semaphore.getHandle(), nullptr, 1);
+    }
+
+    void signalSemaphoreAsync(const SemaphoreRef& semaphore, uint64_t value) const
+    {
+      oidnSignalSemaphoresAsync(handle, &semaphore.getHandle(), &value, 1);
+    }
+
+    void signalSemaphoresAsync(const std::vector<SemaphoreRef>& semaphores) const
+    {
+      oidnSignalSemaphoresAsync(handle,
+                                reinterpret_cast<const OIDNSemaphore*>(semaphores.data()),
+                                nullptr,
+                                static_cast<int>(semaphores.size()));
+    }
+
+    void signalSemaphoresAsync(const std::vector<SemaphoreRef>& semaphores,
+                               const std::vector<uint64_t>& values) const
+    {
+      oidnSignalSemaphoresAsync(handle,
+                                reinterpret_cast<const OIDNSemaphore*>(semaphores.data()),
+                                values.data(),
+                                static_cast<int>(semaphores.size()));
+    }
+
+    void waitSemaphoreAsync(const SemaphoreRef& semaphore) const
+    {
+      oidnWaitSemaphoresAsync(handle, &semaphore.getHandle(), nullptr, nullptr, 1);
+    }
+
+    void waitSemaphoreAsync(const SemaphoreRef& semaphore, uint64_t value) const
+    {
+      oidnWaitSemaphoresAsync(handle, &semaphore.getHandle(), &value, nullptr, 1);
+    }
+
+    void waitSemaphoreAsync(const SemaphoreRef& semaphore, uint64_t value, uint32_t timeoutMs) const
+    {
+      oidnWaitSemaphoresAsync(handle, &semaphore.getHandle(), &value, &timeoutMs, 1);
+    }
+
+    void waitSemaphoresAsync(const std::vector<SemaphoreRef>& semaphores) const
+    {
+      oidnWaitSemaphoresAsync(handle,
+                              reinterpret_cast<const OIDNSemaphore*>(semaphores.data()),
+                              nullptr,
+                              nullptr,
+                              static_cast<int>(semaphores.size()));
+    }
+
+    void waitSemaphoresAsync(const std::vector<SemaphoreRef>& semaphores,
+                             const std::vector<uint64_t>& values) const
+    {
+      oidnWaitSemaphoresAsync(handle,
+                              reinterpret_cast<const OIDNSemaphore*>(semaphores.data()),
+                              values.data(),
+                              nullptr,
+                              static_cast<int>(semaphores.size()));
+    }
+
+    void waitSemaphoresAsync(const std::vector<SemaphoreRef>& semaphores,
+                             const std::vector<uint64_t>& values,
+                             const std::vector<uint32_t>& timeoutsMs) const
+    {
+      oidnWaitSemaphoresAsync(handle,
+                              reinterpret_cast<const OIDNSemaphore*>(semaphores.data()),
+                              values.data(),
+                              timeoutsMs.data(),
+                              static_cast<int>(semaphores.size()));
+    }
 
     // Creates a filter of the specified type (e.g. "RT").
     FilterRef newFilter(const char* type) const

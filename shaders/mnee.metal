@@ -20,8 +20,7 @@ inline bool mnee_rect_light_hit(constant PathtraceUniforms& uniforms,
     uint matIndex = min(rectangles[lightRec.primitiveIndex].materialTwoSided.x,
                         uniforms.materialCount - 1u);
     MaterialData material = materials[matIndex];
-    if (static_cast<uint>(material.typeEta.x) != 3u ||
-        all(material.emission.xyz == float3(0.0f))) {
+    if (!material_closure_is_emissive(material)) {
         return false;
     }
 
@@ -29,7 +28,7 @@ inline bool mnee_rect_light_hit(constant PathtraceUniforms& uniforms,
         return false;
     }
 
-    float3 emission = material.emission.xyz;
+    float3 emission = material_closure_aov_emission(material);
     if (material.emission.w > 0.0f &&
         environmentTexture.get_width() > 0 &&
         environmentTexture.get_height() > 0 &&

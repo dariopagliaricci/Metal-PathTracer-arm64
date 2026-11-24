@@ -127,7 +127,7 @@ const char* RestirGiModeName(PathTracer::RenderSettings::RestirGiMode mode) {
     switch (mode) {
         case RestirGiMode::Off:
             return "off";
-        case RestirGiMode::DiffusePrototype:
+        case RestirGiMode::ProductionDiffuse:
             return "production_gi_reservoir";
     }
     return "unknown";
@@ -149,10 +149,14 @@ const char* RestirPtModeName(PathTracer::RenderSettings::RestirPtMode mode) {
     switch (mode) {
         case RestirPtMode::Off:
             return "off";
-        case RestirPtMode::Research:
-            return "path_reservoir_capture";
-        case RestirPtMode::ExperimentalPathReuse:
+        case RestirPtMode::ProductionReservoirCapture:
+            return "production_path_reservoir_capture";
+        case RestirPtMode::ProductionPathReuse:
             return "production_path_reuse";
+        case RestirPtMode::EnhancedUnbiased:
+            return "enhanced_unbiased";
+        case RestirPtMode::EnhancedBiased:
+            return "enhanced_biased";
     }
     return "unknown";
 }
@@ -191,64 +195,155 @@ const char* RestirDebugViewName(PathTracer::RenderSettings::RestirDebugView view
             return "Queue stage failure";
         case RestirDebugView::RadianceCache:
             return "Radiance cache";
+        case RestirDebugView::CausticTransport:
+            return "Caustic transport";
     }
     return "unknown";
 }
 
-const char* ProductionProfileName(int profile) {
-    switch (profile) {
-        case 1:
+const char* ViewportQualityPresetDisplayName(PathTracer::RenderSettings::ViewportQualityPreset preset) {
+    using ViewportQualityPreset = PathTracer::RenderSettings::ViewportQualityPreset;
+    switch (preset) {
+        case ViewportQualityPreset::Interactive:
+            return "Interactive";
+        case ViewportQualityPreset::Balanced:
+            return "Balanced";
+        case ViewportQualityPreset::FinalPreview:
+            return "Final Preview";
+        case ViewportQualityPreset::Custom:
+        default:
+            return "Custom";
+    }
+}
+
+const char* ExecutionModeName(PathTracer::RenderSettings::ExecutionMode mode) {
+    using ExecutionMode = PathTracer::RenderSettings::ExecutionMode;
+    switch (mode) {
+        case ExecutionMode::Megakernel:
+            return "megakernel";
+        case ExecutionMode::Wavefront:
+            return "wavefront";
+    }
+    return "unknown";
+}
+
+const char* WavefrontSchedulingPolicyName(PathTracer::RenderSettings::WavefrontSchedulingPolicy policy) {
+    using WavefrontSchedulingPolicy = PathTracer::RenderSettings::WavefrontSchedulingPolicy;
+    switch (policy) {
+        case WavefrontSchedulingPolicy::Preview:
             return "preview";
-        case 2:
-            return "lookdev";
-        case 3:
+        case WavefrontSchedulingPolicy::Final:
             return "final";
-        case 4:
-            return "reference";
-        case 5:
-            return "debug";
-        case 0:
+        case WavefrontSchedulingPolicy::Offline:
+            return "offline";
+        case WavefrontSchedulingPolicy::Research:
+            return "research";
+    }
+    return "unknown";
+}
+
+std::string ViewportBackendSummary(const PathTracer::PerformanceStats& stats) {
+    if (stats.hardwareRaytracingActive) {
+        return "Metal GUI viewport, HWRT active";
+    }
+    if (stats.hardwareRaytracingAvailable) {
+        return "Metal GUI viewport, SWRT active (HWRT available)";
+    }
+    return "Metal GUI viewport, SWRT active";
+}
+
+std::string ViewportExecutionSummary(const PathTracer::RenderSettings& settings) {
+    std::string summary = ExecutionModeName(settings.executionMode);
+    if (settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront) {
+        summary += ", ";
+        summary += WavefrontSchedulingPolicyName(settings.wavefrontSchedulingPolicy);
+        summary += " scheduling, compaction ";
+        summary += settings.wavefrontCompactionEnabled ? "on" : "off";
+    } else {
+        summary += ", ";
+        summary += WavefrontSchedulingPolicyName(settings.wavefrontSchedulingPolicy);
+        summary += " scheduling policy";
+    }
+    return summary;
+}
+
+std::string ViewportDenoiseSummary(const PathTracer::RenderSettings& settings) {
+    std::string summary = "OIDN ";
+    if (settings.denoiseEnabled) {
+        summary += "on";
+        summary += " (every ";
+        summary += std::to_string(std::max(settings.denoiseFrequency, 1u));
+        summary += settings.denoiseFrequency == 1u ? " frame)" : " frames)";
+    } else {
+        summary += "off";
+    }
+
+    summary += ", SVGF ";
+    if (settings.svgfDenoiseEnabled) {
+        summary += "on (";
+        if (settings.svgfDenoiseDirect && settings.svgfDenoiseIndirect) {
+            summary += "direct+indirect";
+        } else if (settings.svgfDenoiseDirect) {
+            summary += "direct only";
+        } else if (settings.svgfDenoiseIndirect) {
+            summary += "indirect only";
+        } else {
+            summary += "no components selected";
+        }
+        summary += ", ";
+        summary += std::to_string(settings.svgfAtrousIterations);
+        summary += settings.svgfAtrousIterations == 1u ? " iteration)" : " iterations)";
+    } else {
+        summary += "off";
+    }
+    return summary;
+}
+
+std::string ViewportHeadlessOverrideFlags(const PathTracer::RenderSettings& settings) {
+    std::string flags = "--executionMode=";
+    flags += ExecutionModeName(settings.executionMode);
+    flags += " --wavefront-policy=";
+    flags += WavefrontSchedulingPolicyName(settings.wavefrontSchedulingPolicy);
+    flags += " --maxDepth=";
+    flags += std::to_string(settings.maxDepth);
+    flags += " --denoise=";
+    flags += settings.denoiseEnabled ? "1" : "0";
+    flags += " --svgfDenoise=";
+    flags += settings.svgfDenoiseEnabled ? "1" : "0";
+    return flags;
+}
+
+const char* ViewportQualityPresetHeadlessProfile(PathTracer::RenderSettings::ViewportQualityPreset preset) {
+    using ViewportQualityPreset = PathTracer::RenderSettings::ViewportQualityPreset;
+    switch (preset) {
+        case ViewportQualityPreset::Interactive:
+            return "preview";
+        case ViewportQualityPreset::Balanced:
+            return "lookdev";
+        case ViewportQualityPreset::FinalPreview:
+            return "final";
+        case ViewportQualityPreset::Custom:
         default:
             return "custom";
     }
 }
 
-void ApplyProductionProfile(int profile, PathTracer::RenderSettings& settings) {
-    using RenderSettings = PathTracer::RenderSettings;
-    switch (profile) {
-        case 1:
-            settings.samplesPerFrame = 1u;
-            settings.executionMode = RenderSettings::ExecutionMode::Wavefront;
-            settings.wavefrontSchedulingPolicy = RenderSettings::WavefrontSchedulingPolicy::Preview;
-            settings.wavefrontCompactionEnabled = true;
-            break;
-        case 2:
-            settings.samplesPerFrame = 1u;
-            settings.executionMode = RenderSettings::ExecutionMode::Wavefront;
-            settings.wavefrontSchedulingPolicy = RenderSettings::WavefrontSchedulingPolicy::Final;
-            settings.wavefrontCompactionEnabled = true;
-            break;
-        case 3:
-            settings.samplesPerFrame = 1u;
-            settings.executionMode = RenderSettings::ExecutionMode::Wavefront;
-            settings.wavefrontSchedulingPolicy = RenderSettings::WavefrontSchedulingPolicy::Offline;
-            settings.wavefrontCompactionEnabled = true;
-            break;
-        case 4:
-            settings.samplesPerFrame = 1u;
-            settings.executionMode = RenderSettings::ExecutionMode::Megakernel;
-            settings.fixedRngSeed = settings.fixedRngSeed == 0u ? 1u : settings.fixedRngSeed;
-            break;
-        case 5:
-            settings.samplesPerFrame = 1u;
-            settings.executionMode = RenderSettings::ExecutionMode::Megakernel;
-            settings.restirDebugEnabled = true;
-            settings.restirDebugCounters = true;
-            break;
-        case 0:
+const char* ViewportQualityPresetFinalBoundary(PathTracer::RenderSettings::ViewportQualityPreset preset) {
+    using ViewportQualityPreset = PathTracer::RenderSettings::ViewportQualityPreset;
+    switch (preset) {
+        case ViewportQualityPreset::FinalPreview:
+            return "viewport preview only; not metal_final_frame";
+        case ViewportQualityPreset::Interactive:
+        case ViewportQualityPreset::Balanced:
+            return "viewport only; not final-frame correctness evidence";
+        case ViewportQualityPreset::Custom:
         default:
-            break;
+            return "manual settings; final-frame defaults unchanged";
     }
+}
+
+void MarkViewportQualityPresetOverride(PathTracer::RenderSettings& settings) {
+    settings.markViewportQualityPresetOverride();
 }
 
 bool IsRisFamilyMode(PathTracer::RenderSettings::DirectLightMode mode) {
@@ -314,10 +409,13 @@ void DrawRestirDebugPanel(PathTracer::RenderSettings& settings,
     const DirectLightMode directMode = settings.directLightMode;
     const bool risActive = IsRisFamilyMode(directMode);
     const bool worldActive = IsWorldReuseMode(directMode);
-    const bool giActive = settings.restirGiMode == RestirGiMode::DiffusePrototype;
+    const bool giActive = settings.restirGiMode == RestirGiMode::ProductionDiffuse;
     const bool pathGuidingActive = settings.pathGuidingMode == PathGuidingMode::Prototype;
     const bool restirPtActive = settings.restirPtMode != RestirPtMode::Off;
-    const bool restirPtReuseActive = settings.restirPtMode == RestirPtMode::ExperimentalPathReuse;
+    const bool restirPtReuseActive =
+        settings.restirPtMode == RestirPtMode::ProductionPathReuse ||
+        settings.restirPtMode == RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == RestirPtMode::EnhancedBiased;
     const bool radianceCacheActive =
         settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Prototype;
     const uint64_t nanInfCount = stats.throughputNanInfCount + stats.radianceNanInfCount;
@@ -415,6 +513,10 @@ void DrawRestirDebugPanel(PathTracer::RenderSettings& settings,
     } else {
         ImGui::Text("Direct-light candidates (estimated): %llu",
                     static_cast<unsigned long long>(directLightCandidateEstimate));
+        ImGui::Text("ReSTIR DI hybrid ReGIR: %llu candidates / %llu accepted / %llu fallback",
+                    static_cast<unsigned long long>(stats.restirDiRegirCandidateCount),
+                    static_cast<unsigned long long>(stats.restirDiRegirAcceptedCount),
+                    static_cast<unsigned long long>(stats.restirDiRegirFallbackCount));
         ImGui::Text("ReSTIR PT reservoir updates: %llu",
                     static_cast<unsigned long long>(stats.restirPtReservoirUpdateCount));
         ImGui::Text("ReGIR cache hits/misses: unavailable");
@@ -564,9 +666,25 @@ void DrawRestirDebugPanel(PathTracer::RenderSettings& settings,
         DrawRestirAlarm("ReSTIR PT activity:", restirPtStatus, restirPtColor);
         DrawRestirAlarm("ReSTIR PT reuse:", restirPtReuseStatus, restirPtReuseColor);
         DrawRestirAlarm("History reset:", "automatic on setting changes", ok);
-        DrawRestirAlarm("World/ReGIR state:",
-                        worldActive ? "active OK; cache counters unavailable" : "inactive OK",
-                        ok);
+        const bool hybridMode = settings.directLightMode == DirectLightMode::RestirDiRegirHybrid;
+        const bool hybridHasEvidence =
+            stats.restirDiRegirCandidateCount > 0u || stats.restirDiRegirAcceptedCount > 0u;
+        const char* worldRegirStatus = "inactive OK";
+        ImVec4 worldRegirColor = ok;
+        if (hybridMode) {
+            if (stats.restirDiRegirAcceptedCount > 0u) {
+                worldRegirStatus = "explicit hybrid active OK";
+            } else if (hybridHasEvidence) {
+                worldRegirStatus = "candidates/no accepted hybrid replay";
+                worldRegirColor = warn;
+            } else {
+                worldRegirStatus = "hybrid selected/no candidates";
+                worldRegirColor = warn;
+            }
+        } else if (worldActive) {
+            worldRegirStatus = "RIS/ReGIR world reuse selected";
+        }
+        DrawRestirAlarm("World/ReGIR state:", worldRegirStatus, worldRegirColor);
     }
 }
 void DrawRestirPanel(PathTracer::RenderSettings& settings,
@@ -725,7 +843,10 @@ void DrawRestirPanel(PathTracer::RenderSettings& settings,
     ImGui::EndDisabled();
     ImGui::Text("Active radiance cache mode: %s",
                 RadianceCacheModeName(settings.radianceCacheMode));
-    if (!radianceCacheActive) {
+    if (const char* refusal = PathTracer::RadianceCacheRefusalReason(settings)) {
+        ImGui::TextWrapped("Radiance cache refused: %s. The cache is off.",
+                           PathTracer::RadianceCacheRefusalMessage(refusal));
+    } else if (!radianceCacheActive) {
         ImGui::TextDisabled("Rough-indirect cache query, training, and termination are disabled.");
     }
 
@@ -735,6 +856,8 @@ void DrawRestirPanel(PathTracer::RenderSettings& settings,
         "Off",
         "Path reservoir capture",
         "Production path reuse",
+        "Enhanced unbiased",
+        "Enhanced biased",
     };
     int restirPtMode = static_cast<int>(settings.restirPtMode);
     if (restirPtMode < 0 || restirPtMode >= IM_ARRAYSIZE(restirPtModeLabels)) {
@@ -748,8 +871,11 @@ void DrawRestirPanel(PathTracer::RenderSettings& settings,
         settings.restirPtMode = static_cast<RestirPtMode>(restirPtMode);
         outNeedsReset = true;
     }
-    DrawRestirHelpMarker("Captures production BSDF-backed path-reservoir metadata and can reuse compatible diffuse/PBR path samples when explicitly selected. The mode label is retained for compatibility.");
-    const bool restirPtReuseActive = settings.restirPtMode == RestirPtMode::ExperimentalPathReuse;
+    DrawRestirHelpMarker("Captures production BSDF-backed path-reservoir metadata and can reuse compatible diffuse/PBR path samples when explicitly selected.");
+    const bool restirPtReuseActive =
+        settings.restirPtMode == RestirPtMode::ProductionPathReuse ||
+        settings.restirPtMode == RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == RestirPtMode::EnhancedBiased;
     const bool restirPtAnyActive = settings.restirPtMode != RestirPtMode::Off;
     ImGui::BeginDisabled(!restirPtAnyActive);
     int restirPtMaxReservoirs = static_cast<int>(std::max(settings.restirPtMaxReservoirs, 1u));
@@ -864,10 +990,14 @@ void DrawRestirPanel(PathTracer::RenderSettings& settings,
     ImGui::Text("Spatial reuse active: %s", spatialActive ? "yes" : "no");
     ImGui::Text("Temporal reuse active: %s", temporalActive ? "yes" : "no");
     ImGui::Text("World reuse active: %s", worldActive ? "yes" : "no");
-    ImGui::Text("Hybrid ReGIR candidate source: %s",
+    ImGui::Text("Hybrid ReGIR selected: %s",
                 mode == DirectLightMode::RestirDiRegirHybrid ? "yes" : "no");
+    ImGui::Text("Hybrid ReGIR activity: %llu candidates / %llu accepted / %llu fallback",
+                static_cast<unsigned long long>(stats.restirDiRegirCandidateCount),
+                static_cast<unsigned long long>(stats.restirDiRegirAcceptedCount),
+                static_cast<unsigned long long>(stats.restirDiRegirFallbackCount));
     ImGui::Text("Production GI active: %s",
-                settings.restirGiMode == RestirGiMode::DiffusePrototype ? "yes" : "no");
+                settings.restirGiMode == RestirGiMode::ProductionDiffuse ? "yes" : "no");
     ImGui::Text("Production path guiding active: %s",
                 settings.pathGuidingMode == PathGuidingMode::Prototype ? "yes" : "no");
     ImGui::Text("Guided samples: %llu used / %llu candidates",
@@ -1059,9 +1189,9 @@ int FindEnvironmentSelection(const std::vector<EnvironmentFileEntry>& files,
         return -1;
     }
     std::string normalized = NormalizePath(currentPath);
-    for (int i = 0; i < static_cast<int>(files.size()); ++i) {
+    for (size_t i = 0; i < files.size(); ++i) {
         if (NormalizePath(files[i].canonicalPath) == normalized) {
-            return i;
+            return static_cast<int>(i);
         }
     }
     return -1;
@@ -1381,11 +1511,17 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 float renderScale = settings.renderScale;
                 if (ImGui::SliderFloat("Render Scale", &renderScale, 0.5f, 2.0f, "%.2fx")) {
                     settings.renderScale = std::clamp(renderScale, 0.5f, 2.0f);
+                    MarkViewportQualityPresetOverride(settings);
                     outNeedsReset = true;
                 }
             }
             ImGui::Text("Internal Resolution: %u x %u", stats.renderWidth, stats.renderHeight);
             ImGui::Text("Effective Scale: %.2fx", stats.renderScale);
+            const auto viewportPreset = settings.viewportQualityPreset;
+            ImGui::Text("Viewport Preset: %s", ViewportQualityPresetDisplayName(viewportPreset));
+            const std::string viewportDenoiseSummary = ViewportDenoiseSummary(settings);
+            ImGui::Text("Viewport Denoise: %s", viewportDenoiseSummary.c_str());
+            ImGui::Text("Viewport Boundary: %s", ViewportQualityPresetFinalBoundary(viewportPreset));
             ImGui::Text("Samples / Frame: %u (active %u)",
                         settings.samplesPerFrame,
                         stats.activeSamplesPerFrame);
@@ -1457,21 +1593,21 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                     ImGui::TreePop();
                 }
                 ImGui::Text("Wavefront Memory: active=%.2f next=%.2f hit=%.2f shadow=%.2f path=%.2f total=%.2f MiB",
-                            static_cast<float>(stats.wavefrontQueueBytesActive / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.wavefrontQueueBytesNext / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.wavefrontQueueBytesHit / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.wavefrontQueueBytesShadow / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.wavefrontQueueBytesPathState / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.wavefrontQueueBytesTotal / (1024.0 * 1024.0)));
+                            static_cast<float>(static_cast<double>(stats.wavefrontQueueBytesActive) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.wavefrontQueueBytesNext) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.wavefrontQueueBytesHit) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.wavefrontQueueBytesShadow) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.wavefrontQueueBytesPathState) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.wavefrontQueueBytesTotal) / (1024.0 * 1024.0)));
                 if (stats.wavefrontBudgetBytes > 0u) {
                     ImGui::Text("Wavefront Budget Usage: %.2f%% of recommendedMaxWorkingSetSize",
                                 static_cast<float>(stats.wavefrontBudgetUsagePercent));
                 }
                 ImGui::Text("Transport Memory: total=%.2f private=%.2f shared=%.2f staging=%.2f MiB",
-                            static_cast<float>(stats.transportMemoryBytesTotal / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.transportMemoryBytesPrivate / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.transportMemoryBytesShared / (1024.0 * 1024.0)),
-                            static_cast<float>(stats.transportMemoryBytesStaging / (1024.0 * 1024.0)));
+                            static_cast<float>(static_cast<double>(stats.transportMemoryBytesTotal) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.transportMemoryBytesPrivate) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.transportMemoryBytesShared) / (1024.0 * 1024.0)),
+                            static_cast<float>(static_cast<double>(stats.transportMemoryBytesStaging) / (1024.0 * 1024.0)));
                 ImGui::Text("Transport Records: %u invalidated=%u last=%s",
                             stats.transportMemoryRecordCount,
                             stats.transportMemoryInvalidatedRecordCount,
@@ -1545,6 +1681,7 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             if (ImGui::Combo("Execution", &executionMode, executionModes, IM_ARRAYSIZE(executionModes))) {
                 executionMode = std::clamp(executionMode, 0, 1);
                 settings.executionMode = static_cast<RenderSettings::ExecutionMode>(executionMode);
+                MarkViewportQualityPresetOverride(settings);
                 outNeedsReset = true;
             }
             if (settings.executionMode == RenderSettings::ExecutionMode::Wavefront) {
@@ -1557,11 +1694,13 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                     wavefrontPolicy = std::clamp(wavefrontPolicy, 0, 3);
                     settings.wavefrontSchedulingPolicy =
                         static_cast<RenderSettings::WavefrontSchedulingPolicy>(wavefrontPolicy);
+                    MarkViewportQualityPresetOverride(settings);
                     outNeedsReset = true;
                 }
                 bool compactionEnabled = settings.wavefrontCompactionEnabled;
                 if (ImGui::Checkbox("Wavefront Compaction", &compactionEnabled)) {
                     settings.wavefrontCompactionEnabled = compactionEnabled;
+                    MarkViewportQualityPresetOverride(settings);
                     outNeedsReset = true;
                 }
             }
@@ -1569,18 +1708,28 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             int samplesPerFrame = static_cast<int>(settings.samplesPerFrame);
             if (ImGui::SliderInt("Samples / Frame", &samplesPerFrame, 1, 16)) {
                 settings.samplesPerFrame = static_cast<uint32_t>(std::max(samplesPerFrame, 1));
+                MarkViewportQualityPresetOverride(settings);
+                outNeedsReset = true;
+            }
+
+            int maxDepth = static_cast<int>(settings.maxDepth);
+            if (ImGui::SliderInt("Max Depth", &maxDepth, 1, 64)) {
+                settings.maxDepth = static_cast<uint32_t>(std::clamp(maxDepth, 1, 64));
+                MarkViewportQualityPresetOverride(settings);
                 outNeedsReset = true;
             }
 
             bool rrEnabled = settings.enableRussianRoulette;
             if (ImGui::Checkbox("Russian Roulette", &rrEnabled)) {
                 settings.enableRussianRoulette = rrEnabled;
+                MarkViewportQualityPresetOverride(settings);
                 outNeedsReset = true;
             }
             if (stats.hardwareRaytracingAvailable) {
                 bool softwareOverride = settings.enableSoftwareRayTracing;
                 if (ImGui::Checkbox("Software Ray Tracing", &softwareOverride)) {
                     settings.enableSoftwareRayTracing = softwareOverride;
+                    MarkViewportQualityPresetOverride(settings);
                     outNeedsReset = true;
                 }
                 ImGui::Text("Hardware RT %s", stats.hardwareRaytracingActive ? "active" : "available");
@@ -1956,18 +2105,6 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 outNeedsReset = true;
             }
 
-            float specBase = settings.specularTailClampBase;
-            if (ImGui::SliderFloat("Spec Tail Base", &specBase, 0.0f, 32.0f, "%.2f")) {
-                settings.specularTailClampBase = std::max(specBase, 0.0f);
-                outNeedsReset = true;
-            }
-
-            float specScale = settings.specularTailClampRoughnessScale;
-            if (ImGui::SliderFloat("Spec Tail Roughness Scale", &specScale, 0.0f, 64.0f, "%.2f")) {
-                settings.specularTailClampRoughnessScale = std::max(specScale, 0.0f);
-                outNeedsReset = true;
-            }
-
             float minSpecPdf = settings.minSpecularPdf;
             if (ImGui::SliderFloat("Min Specular PDF", &minSpecPdf, 0.0f, 1.0e-2f, "%.1e", ImGuiSliderFlags_Logarithmic)) {
                 settings.minSpecularPdf = std::clamp(minSpecPdf, 0.0f, 1.0e-2f);
@@ -1980,44 +2117,66 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
-        if (ImGui::CollapsingHeader("Production")) {
-            const char* profileLabels[] = {
+        if (ImGui::CollapsingHeader("Viewport Quality")) {
+            const char* presetLabels[] = {
                 "Custom",
-                "Preview",
-                "Lookdev",
-                "Final",
-                "Reference",
-                "Debug",
+                "Interactive",
+                "Balanced",
+                "Final Preview",
             };
-            m_productionProfile =
-                std::clamp(m_productionProfile, 0, IM_ARRAYSIZE(profileLabels) - 1);
-            if (ImGui::Combo("Render Profile",
-                             &m_productionProfile,
-                             profileLabels,
-                             IM_ARRAYSIZE(profileLabels))) {
-                ApplyProductionProfile(m_productionProfile, settings);
+            m_viewportQualityPreset =
+                std::clamp(static_cast<int>(settings.viewportQualityPreset),
+                           0,
+                           IM_ARRAYSIZE(presetLabels) - 1);
+            if (ImGui::Combo("Viewport Preset",
+                             &m_viewportQualityPreset,
+                             presetLabels,
+                             IM_ARRAYSIZE(presetLabels))) {
+                settings.applyViewportQualityPreset(
+                    static_cast<RenderSettings::ViewportQualityPreset>(m_viewportQualityPreset));
                 outNeedsReset = true;
             }
-            if (ImGui::Button("Apply Profile Defaults")) {
-                ApplyProductionProfile(m_productionProfile, settings);
-                outNeedsReset = true;
+            const auto viewportPreset = settings.viewportQualityPreset;
+            const std::string backendSummary = ViewportBackendSummary(stats);
+            const std::string executionSummary = ViewportExecutionSummary(settings);
+            const std::string denoiseSummary = ViewportDenoiseSummary(settings);
+
+            ImGui::SeparatorText("Render State");
+            ImGui::Text("Backend: %s", backendSummary.c_str());
+            ImGui::Text("Execution: %s", executionSummary.c_str());
+            ImGui::Text("Quality: %u spp/frame, %u-bounce limit, %.2fx render scale",
+                        settings.samplesPerFrame,
+                        settings.maxDepth,
+                        settings.renderScale);
+            ImGui::Text("Denoise: %s", denoiseSummary.c_str());
+            ImGui::TextWrapped("%s", ViewportQualityPresetFinalBoundary(viewportPreset));
+
+            ImGui::SeparatorText("Reuse / ReSTIR");
+            ImGui::Text("Direct light: %s", DirectLightModeName(settings.directLightMode));
+            ImGui::Text("ReSTIR GI: %s", RestirGiModeName(settings.restirGiMode));
+            ImGui::Text("ReSTIR PT: %s", RestirPtModeName(settings.restirPtMode));
+            ImGui::Text("Path guiding: %s", PathGuidingModeName(settings.pathGuidingMode));
+            ImGui::Text("Radiance cache: %s", RadianceCacheModeName(settings.radianceCacheMode));
+            if (settings.restirDebugEnabled) {
+                ImGui::Text("Debug view: %s", RestirDebugViewName(settings.restirDebugView));
             }
-            ImGui::SameLine();
-            ImGui::Text("Active: %s", ProductionProfileName(m_productionProfile));
+
             ImGui::SeparatorText("Headless Parity");
-            ImGui::Text("CLI profile: --renderProfile=%s", ProductionProfileName(m_productionProfile));
-            ImGui::Text("Metadata sidecar: enabled by default in PathTracerHeadless");
-            ImGui::Text("Queue item: --renderQueueItemJson=<path> / --runRenderQueueItemJson=<path>");
-            ImGui::Text("Debug bundle: --debugBundleDir=<dir>");
-            ImGui::Text("Checkpoint: --checkpointManifestJson=<path> / --resumeCheckpointJson=<path>");
-            ImGui::Text("Tile plan: --tileManifestJson=<path> --tileSize=<w,h>");
+            const std::string headlessOverrideFlags = ViewportHeadlessOverrideFlags(settings);
+            ImGui::Text("Closest headless profile: --renderProfile=%s",
+                        ViewportQualityPresetHeadlessProfile(viewportPreset));
+            ImGui::TextWrapped("Viewport-equivalent overrides: %s",
+                               headlessOverrideFlags.c_str());
+            ImGui::TextWrapped("Supported wavefront policies: preview, final, offline, research.");
+            ImGui::TextWrapped("Headless uses --sppTotal for total samples; viewport uses spp/frame.");
+            ImGui::TextWrapped("reference/debug are headless-only expert profiles and map to Custom in the GUI.");
         }
 
         ImGui::SetNextItemOpen(false, ImGuiCond_Once);
         if (ImGui::CollapsingHeader("Tonemapping")) {
-            const char* operators[] = {"Linear", "ACES", "Reinhard", "Hable"};
+            const char* operators[] = {"Linear", "ACES", "Reinhard", "Hable", "Exponential", "Filmic (Tungsten)"};
             int currentOperator = static_cast<int>(settings.tonemapMode) - 1;
-            currentOperator = std::clamp(currentOperator, 0, 3);
+            currentOperator = std::clamp(currentOperator, 0, static_cast<int>(IM_ARRAYSIZE(operators)) - 1);
             if (ImGui::Combo("Operator", &currentOperator, operators, IM_ARRAYSIZE(operators))) {
                 settings.tonemapMode = static_cast<uint32_t>(currentOperator + 1);
             }
@@ -2030,6 +2189,10 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 ImGui::SameLine();
                 if (ImGui::RadioButton("Simple", variant == 1)) {
                     settings.acesVariant = 1;
+                }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Falcor sRGB", variant == 2)) {
+                    settings.acesVariant = 2;
                 }
             } else if (settings.tonemapMode == 3) {
                 if (ImGui::SliderFloat("White Point", &settings.reinhardWhitePoint, 0.1f, 5.0f, "%.2f")) {
@@ -2064,6 +2227,8 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             bool denoiseEnabled = settings.denoiseEnabled;
             if (ImGui::Checkbox("Enable Denoising", &denoiseEnabled)) {
                 settings.denoiseEnabled = denoiseEnabled;
+                MarkViewportQualityPresetOverride(settings);
+                outNeedsReset = true;
             }
 
             if (settings.denoiseEnabled) {
@@ -2072,12 +2237,16 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 currentFilter = std::clamp(currentFilter, 0, 1);
                 if (ImGui::Combo("Filter Type", &currentFilter, filterTypes, IM_ARRAYSIZE(filterTypes))) {
                     settings.denoiseFilterType = static_cast<uint32_t>(currentFilter);
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
                 }
 
                 // Denoising frequency slider
                 int frequency = static_cast<int>(settings.denoiseFrequency);
                 if (ImGui::SliderInt("Denoise Frequency", &frequency, 1, 60, "%d frames")) {
                     settings.denoiseFrequency = std::max(1u, static_cast<uint32_t>(frequency));
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("(every Nth frame)");
@@ -2085,11 +2254,15 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
                 bool useAlbedo = settings.denoiseUseAlbedo;
                 if (ImGui::Checkbox("Use Albedo AOV##denoise", &useAlbedo)) {
                     settings.denoiseUseAlbedo = useAlbedo;
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
                 }
 
                 bool useNormal = settings.denoiseUseNormal;
                 if (ImGui::Checkbox("Use Normal AOV##denoise", &useNormal)) {
                     settings.denoiseUseNormal = useNormal;
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
                 }
 
                 ImGui::TextWrapped("OIDN denoising provides 2-4x faster visual convergence at low sample counts. "
@@ -2105,17 +2278,42 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
             bool svgfEnabled = settings.svgfDenoiseEnabled;
             if (ImGui::Checkbox("Enable SVGF", &svgfEnabled)) {
                 settings.svgfDenoiseEnabled = svgfEnabled;
+                MarkViewportQualityPresetOverride(settings);
+                outNeedsReset = true;
             }
 
             if (settings.svgfDenoiseEnabled) {
+                bool denoiseDirect = settings.svgfDenoiseDirect;
+                if (ImGui::Checkbox("Denoise Direct", &denoiseDirect)) {
+                    settings.svgfDenoiseDirect = denoiseDirect;
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
+                }
+                bool denoiseIndirect = settings.svgfDenoiseIndirect;
+                if (ImGui::Checkbox("Denoise Indirect", &denoiseIndirect)) {
+                    settings.svgfDenoiseIndirect = denoiseIndirect;
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
+                }
                 int iterations = static_cast<int>(settings.svgfAtrousIterations);
                 if (ImGui::SliderInt("A-Trous Iterations", &iterations, 1, 5)) {
                     settings.svgfAtrousIterations =
                         static_cast<uint32_t>(std::clamp(iterations, 1, 5));
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
                 }
-                ImGui::SliderFloat("Normal Sigma", &settings.svgfNormalSigma, 1.0f, 128.0f, "%.1f");
-                ImGui::SliderFloat("Albedo Sigma", &settings.svgfAlbedoSigma, 1.0f, 64.0f, "%.1f");
-                ImGui::SliderFloat("Luminance Sigma", &settings.svgfLuminanceSigma, 0.1f, 16.0f, "%.2f");
+                if (ImGui::SliderFloat("Normal Sigma", &settings.svgfNormalSigma, 1.0f, 128.0f, "%.1f")) {
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
+                }
+                if (ImGui::SliderFloat("Albedo Sigma", &settings.svgfAlbedoSigma, 1.0f, 64.0f, "%.1f")) {
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
+                }
+                if (ImGui::SliderFloat("Luminance Sigma", &settings.svgfLuminanceSigma, 0.1f, 16.0f, "%.2f")) {
+                    MarkViewportQualityPresetOverride(settings);
+                    outNeedsReset = true;
+                }
                 settings.svgfNormalSigma = std::max(settings.svgfNormalSigma, 1.0e-4f);
                 settings.svgfAlbedoSigma = std::max(settings.svgfAlbedoSigma, 1.0e-4f);
                 settings.svgfLuminanceSigma = std::max(settings.svgfLuminanceSigma, 1.0e-4f);
@@ -2593,7 +2791,6 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
 
                         if (m_scenePanelProvider.applyObjectTransform) {
                             ImGuizmo::BeginFrame();
-                            ImGuiIO& io = ImGui::GetIO();
                             ImGuizmo::SetOrthographic(false);
                             ImGuizmo::SetDrawlist(ImGui::GetForegroundDrawList());
                             const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -2754,6 +2951,10 @@ void UIOverlay::buildUI(const PerformanceStats& stats,
         ImGui::SetNextWindowBgAlpha(0.35f);
         if (ImGui::Begin("Presentation Overlay", nullptr, flags)) {
             const char* backendLabel = stats.hardwareRaytracingActive ? "HWRT" : "SWRT";
+            const auto viewportPreset = settings.viewportQualityPreset;
+            ImGui::Text("Preset: %s%s",
+                        ViewportQualityPresetDisplayName(viewportPreset),
+                        settings.viewportQualityPresetOverridden ? " custom" : "");
             ImGui::Text("Backend: %s", backendLabel);
             ImGui::Text("SPP: %u (spf %u)", stats.sampleCount, settings.samplesPerFrame);
             ImGui::Text("Frame: %.2f ms (%.1f fps)", stats.frameTimeMs, fps);

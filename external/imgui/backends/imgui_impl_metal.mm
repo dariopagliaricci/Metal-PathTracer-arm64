@@ -339,11 +339,9 @@ bool ImGui_ImplMetal_CreateFontsTexture(id<MTLDevice> device)
                                                                                                 height:(NSUInteger)height
                                                                                              mipmapped:NO];
     textureDescriptor.usage = MTLTextureUsageShaderRead;
-#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
-    textureDescriptor.storageMode = MTLStorageModeManaged;
-#else
+    // Metal PathTracer local patch to vendored ImGui (re-check on every ImGui update): upstream still
+    // uses MTLStorageModeManaged on macOS, which the macOS 27 SDK deprecates (no effect on Apple Silicon).
     textureDescriptor.storageMode = MTLStorageModeShared;
-#endif
     id <MTLTexture> texture = [device newTextureWithDescriptor:textureDescriptor];
     [texture replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height) mipmapLevel:0 withBytes:pixels bytesPerRow:(NSUInteger)width * 4];
     bd->SharedMetalContext.fontTexture = texture;

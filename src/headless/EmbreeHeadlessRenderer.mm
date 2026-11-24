@@ -5,6 +5,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -21,9 +22,16 @@
 #include <unordered_map>
 #include <vector>
 
+#include <mach/mach.h>
+
 #include "headless/EmbreeHeadlessRenderer.h"
 #include "renderer/EnvImportanceSampler.h"
 #include "MetalShaderTypes.h"
+// EP8: the Tungsten source closures, compiled from the same headers as the Metal shaders (shaders/shared); they
+// live in namespace pt_shared.
+#include "shared/cpp_prelude.h"
+#include "shared/source_closures.h"
+#include "renderer/RadianceCacheTraining.h"
 #include <simd/simd.h>
 
 #if defined(PATH_TRACER_ENABLE_EMBREE)
@@ -35,14 +43,30 @@
 
 namespace {
 
+// Everything in this namespace serves the Embree render path only; without Embree, render() is a stub.
+#if defined(PATH_TRACER_ENABLE_EMBREE)
+
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kEpsilon = 1.0e-4f;
 constexpr float kSpecularNeePdfFloor = 1.0e-4f;
-constexpr float kSpecularNeeInvPdfClamp = 1.0e4f;
 constexpr float kMisWeightClampMin = 1.0e-4f;
 constexpr float kMisWeightClampMax = 0.9999f;
 constexpr uint32_t kInvalidTextureIndex = 0xFFFFFFFFu;
-constexpr uint32_t kCpuRisPayloadAnalyticRectFlag = 1u << 31u;
+
+// EP22: the process's memory at each load stage (phys_footprint counts compressed pages, as the OS's memory limits do).
+void LogLoadMemory(const char* stage) {
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        return;
+    }
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(2) << "[LoadMemory] " << stage << ": footprint "
+         << static_cast<double>(info.phys_footprint) / 1073741824.0 << " GB (peak so far "
+         << static_cast<double>(info.ledger_phys_footprint_peak) / 1073741824.0 << " GB), resident "
+         << static_cast<double>(info.resident_size) / 1073741824.0 << " GB";
+    std::cout << line.str() << std::endl;
+}
 
 std::string FormatEta(double secondsRemaining) {
     if (!std::isfinite(secondsRemaining) || secondsRemaining < 0.0) {
@@ -104,13 +128,7 @@ uint32_t CpuPcgHash(uint32_t state) {
 }
 
 struct EnvironmentMap {
-    struct MipLevel {
-        std::vector<float> rgba;
-        uint32_t width = 0;
-        uint32_t height = 0;
-    };
     std::vector<float> rgba;
-    std::vector<MipLevel> mipLevels;
     uint32_t width = 0;
     uint32_t height = 0;
     PathTracer::EnvImportanceDistribution distribution;
@@ -127,16 +145,20 @@ struct GeometryData {
     GeometryType type = GeometryType::Mesh;
     const simd::float3* positions = nullptr;
     const simd::float3* normals = nullptr;
-    const simd::float2* uvs = nullptr;
-    const simd::float2* uvs1 = nullptr;
+    // A mesh's own vertices in SceneResources, read for uv and uv1 (they are not transformed). Null for the
+    // sphere and rectangle geometries, disks included.
+    const PathTracer::SceneResources::MeshVertex* vertices = nullptr;
     const simd::float4* tangents = nullptr;
     const uint32_t* indices = nullptr;
     const simd::float4* spheres = nullptr;
     const uint32_t* materialIndices = nullptr;
+    const PathTracerShaderTypes::RectData* disk = nullptr;
     uint32_t indexCount = 0;
     uint32_t count = 0;
     uint32_t materialIndex = 0;
     uint32_t triangleOffset = 0;
+    // Index in SceneResources::meshes(), as Metal's MeshInfo index.
+    uint32_t meshIndex = std::numeric_limits<uint32_t>::max();
 };
 
 struct HitInfo {
@@ -160,6 +182,7 @@ struct HitInfo {
     uint32_t materialIndex = 0;
     bool frontFace = true;
     bool twoSided = false;
+    bool twoSidedAlphaCutout = false;  // Metal's material_is_two_sided_alpha_cutout; set when the hit is shaded.
     bool hasUv = false;
     bool hasUv1 = false;
     bool hasSurfacePartials0 = false;
@@ -167,8 +190,17 @@ struct HitInfo {
     bool hasIgehyGradients0 = false;
     bool hasIgehyGradients1 = false;
     bool hasTangent = false;
+    bool hasVertexTangent = false;
+    bool authoredNormalWasFaced = false;
+    // A mesh triangle's world edges p1 - p0, p2 - p0 and uv0 edges, for the source bump frame (SourceBumpNormal).
+    bool hasSourceBumpFrame = false;
+    simd::float3 sourceBumpQ1{0.0f, 0.0f, 0.0f};
+    simd::float3 sourceBumpQ2{0.0f, 0.0f, 0.0f};
+    simd::float2 sourceBumpE1{0.0f, 0.0f};
+    simd::float2 sourceBumpE2{0.0f, 0.0f};
     GeometryType primitiveType = GeometryType::Mesh;
     uint32_t primitiveIndex = 0;
+    uint32_t meshIndex = std::numeric_limits<uint32_t>::max();  // Set for mesh triangles only.
 };
 
 struct RectLightInfo {
@@ -180,6 +212,10 @@ struct RectLightInfo {
     simd::float3 baseEmission{0.0f, 0.0f, 0.0f};
     bool twoSided = false;
     bool isDisk = false;
+    bool isReferencePoint = false;
+    bool inverseSquareFalloff = false;
+    float jitterRadius = 0.0f;
+    float legacyMinimumDistanceSq = 0.0f;
     bool emissionUsesEnv = false;
     float area = 0.0f;
 };
@@ -195,16 +231,27 @@ struct MeshLightInfo {
     float power = 0.0f;
     float selectionPdf = 0.0f;
     float cumulativePower = 0.0f;
+    bool twoSided = false;
+    bool texturedEmission = false;
+    const PathTracer::SceneResources::Mesh* texturedMesh = nullptr;
+    const PathTracerShaderTypes::MaterialData* texturedMaterial = nullptr;
+    uint32_t localTriangle = 0u;
 };
 
 struct DirectionalLightInfo {
     simd::float3 direction{0.0f, 1.0f, 0.0f};
     simd::float3 emission{0.0f, 0.0f, 0.0f};
+    float cosDelta = 0.0f;  // 1 - cos(angular radius); zero is a delta sun.
 };
 
 bool AreaPrimitiveIsDisk(const PathTracerShaderTypes::RectData& rect) {
     return rect.materialTwoSided.z ==
            static_cast<uint32_t>(PathTracerShaderTypes::AreaPrimitiveShape::Disk);
+}
+
+bool AreaPrimitiveIsReferencePoint(const PathTracerShaderTypes::RectData& rect) {
+    return rect.materialTwoSided.z ==
+           static_cast<uint32_t>(PathTracerShaderTypes::AreaPrimitiveShape::ReferencePoint);
 }
 
 float AreaPrimitiveArea(const PathTracerShaderTypes::RectData& rect) {
@@ -227,6 +274,10 @@ struct BsdfSample {
     uint32_t lobeType = 0u;
     float lobeRoughness = 0.0f;
     bool isDelta = false;
+    int mediumEvent = 0;        // a solid dielectric refraction: +1 at a front face, -1 at a back face (Metal's)
+    // Set at a subsurface walk's exit vertex, as Metal sets it there: ReSTIR GI, ReSTIR PT, path guiding and the
+    // radiance cache refuse the sample, because their per-pixel state belongs to the primary hit, not the exit point.
+    bool isBssrdf = false;
 };
 
 struct CpuRisSamplePayload {
@@ -244,32 +295,6 @@ struct CpuReservoir {
     uint32_t M = 0u;
     float W = 0.0f;
     bool valid = false;
-};
-
-struct CpuRestirDiReservoirState {
-    simd::float3 position{0.0f, 0.0f, 0.0f};
-    float pdf = 0.0f;
-    simd::float3 normal{0.0f, 1.0f, 0.0f};
-    float targetPdf = 0.0f;
-    simd::float3 emission{0.0f, 0.0f, 0.0f};
-    float weight = 0.0f;
-    uint32_t primitiveIndex = std::numeric_limits<uint32_t>::max();
-    uint32_t flags = 0u;
-    uint32_t stateFlags = 0u;
-    uint32_t frameTag = 0u;
-    uint32_t candidateCount = 0u;
-    uint32_t temporalAccepted = 0u;
-    uint32_t spatialAccepted = 0u;
-    uint32_t surfacePrimitiveIndex = std::numeric_limits<uint32_t>::max();
-};
-
-struct CpuRestirDiVisibilityState {
-    simd::float3 contribution{0.0f, 0.0f, 0.0f};
-    float visible = 0.0f;
-    uint32_t primitiveIndex = std::numeric_limits<uint32_t>::max();
-    uint32_t flags = 0u;
-    uint32_t stateFlags = 0u;
-    uint32_t frameTag = 0u;
 };
 
 struct CpuPathReservoirState {
@@ -318,19 +343,47 @@ struct CpuRadianceCacheCell {
     float confidence = 0.0f;
 };
 
+// A cacheable vertex of a radiance cache training path (RadianceCacheTraining.h): its cell and metadata, the
+// throughput at the cache query and the radiance accumulated by then.
+struct CpuRadianceCacheTrainRecord {
+    size_t cellIndex = 0u;
+    uint32_t domainKey = 0u;
+    uint32_t materialType = 0u;
+    simd::float3 position{0.0f, 0.0f, 0.0f};
+    simd::float3 normal{0.0f, 1.0f, 0.0f};
+    float roughness = 0.0f;
+    simd::float3 throughputAtQuery{0.0f, 0.0f, 0.0f};
+    simd::float3 radianceBaseline{0.0f, 0.0f, 0.0f};
+};
+
 struct CpuTexture {
+    bool normalMap = false;
     struct MipLevel {
         uint32_t width = 0;
         uint32_t height = 0;
-        std::vector<float> rgba;
+        std::vector<float> rgba;     // float texels; empty when rgba8 holds the level
+        std::vector<uint8_t> rgba8;  // a level decoded from 8-bit texels, read through the tables below (EP22)
     };
 
     uint32_t width = 0;
     uint32_t height = 0;
-    std::vector<float> rgba;
-    std::vector<MipLevel> mipLevels;
+    std::vector<MipLevel> mipLevels;  // level 0 is the full-size texture
+    // EP22: the float each byte decodes to, for colour and for alpha, taken from SceneResources' own decode of this
+    // texture and checked on every texel of every level kept as bytes, so those levels read exactly the floats they
+    // replace at a quarter of the memory.
+    std::array<float, 256> rgbFromByte{};
+    std::array<float, 256> alphaFromByte{};
     PathTracer::MaterialTextureSamplerDesc samplerDesc{};
 };
+
+simd::float4 CpuTextureTexel(const CpuTexture& texture, const CpuTexture::MipLevel& level, size_t index) {
+    if (!level.rgba8.empty()) {
+        const uint8_t* texel = level.rgba8.data() + index;
+        return simd_make_float4(texture.rgbFromByte[texel[0]], texture.rgbFromByte[texel[1]],
+                                texture.rgbFromByte[texel[2]], texture.alphaFromByte[texel[3]]);
+    }
+    return simd_make_float4(level.rgba[index], level.rgba[index + 1u], level.rgba[index + 2u], level.rgba[index + 3u]);
+}
 
 struct RayCone {
     float width = 0.0f;
@@ -353,8 +406,6 @@ struct FireflyClampParams {
     float clampFactor = 0.0f;
     float clampFloor = 0.0f;
     float throughputClamp = 0.0f;
-    float specularTailClampBase = 0.0f;
-    float specularTailClampRoughnessScale = 0.0f;
     float minSpecularPdf = 1.0e-8f;
     float maxContribution = 0.0f;
     float enabled = 0.0f;
@@ -522,11 +573,6 @@ float SurfaceFootprintFromCone(float coneFootprintWorld,
     return coneFootprintWorld / std::max(cosTheta, 1.0e-3f);
 }
 
-float PrimarySurfaceFootprint(const RayCone& cone, const HitInfo& hit, const Ray& ray) {
-    float coneFootprintWorld = RayConeWidthAtDistance(cone, hit.t);
-    return SurfaceFootprintFromCone(coneFootprintWorld, hit.normal, -ray.direction);
-}
-
 bool ComputeTriangleSurfacePartials(const simd::float3& p0,
                                     const simd::float3& p1,
                                     const simd::float3& p2,
@@ -576,43 +622,6 @@ bool ComputeTriangleSurfacePartials(const simd::float3& p0,
         return std::isfinite(uvPerWorldOut) && uvPerWorldOut > 0.0f;
     }
     return false;
-}
-
-float ComputeTriangleUvPerWorld(const simd::float3& p0,
-                                const simd::float3& p1,
-                                const simd::float3& p2,
-                                const simd::float2& uv0,
-                                const simd::float2& uv1,
-                                const simd::float2& uv2) {
-    simd::float3 dPdu;
-    simd::float3 dPdv;
-    float uvPerWorld = 0.0f;
-    if (ComputeTriangleSurfacePartials(p0, p1, p2, uv0, uv1, uv2, dPdu, dPdv, uvPerWorld)) {
-        return uvPerWorld;
-    }
-
-    simd::float3 edge1 = p1 - p0;
-    simd::float3 edge2 = p2 - p0;
-    simd::float2 dUV1 = uv1 - uv0;
-    simd::float2 dUV2 = uv2 - uv0;
-    float det = dUV1.x * dUV2.y - dUV1.y * dUV2.x;
-    if (std::fabs(det) > 1.0e-9f) {
-        float invDet = 1.0f / det;
-        simd::float3 dPdu = (edge1 * dUV2.y - edge2 * dUV1.y) * invDet;
-        simd::float3 dPdv = (edge2 * dUV1.x - edge1 * dUV2.x) * invDet;
-        float lenU = simd::length(dPdu);
-        float lenV = simd::length(dPdv);
-        if (lenU > 1.0e-8f && lenV > 1.0e-8f) {
-            return std::max(1.0f / lenU, 1.0f / lenV);
-        }
-    }
-
-    float worldArea = simd::length(simd::cross(edge1, edge2));
-    float uvArea = std::fabs(det);
-    if (worldArea > 1.0e-12f && uvArea > 1.0e-12f) {
-        return std::sqrt(uvArea / worldArea);
-    }
-    return 0.0f;
 }
 
 bool UvWorldGradientsFromPartials(const simd::float3& dPdu,
@@ -677,7 +686,9 @@ bool FirstHitUvGradientsIgehy(const Ray& ray,
            std::isfinite(dUVdy.x) && std::isfinite(dUVdy.y);
 }
 
-void PopulateFirstHitUvGradients(HitInfo& hit, const Ray& ray, const PrimaryRayDiff& rayDiff) {
+void PopulateFirstHitUvGradients(HitInfo& hit, const Ray& ray, const PrimaryRayDiff& rayDiff,
+                                bool referenceGradientPlane = false) {
+    const simd::float3 gradientNormal = referenceGradientPlane ? hit.shadingNormal : hit.normal;
     hit.hasIgehyGradients0 = false;
     hit.hasIgehyGradients1 = false;
     hit.dUVdx0 = simd_make_float2(0.0f, 0.0f);
@@ -691,7 +702,7 @@ void PopulateFirstHitUvGradients(HitInfo& hit, const Ray& ray, const PrimaryRayD
             hit.hasIgehyGradients0 = FirstHitUvGradientsIgehy(ray,
                                                               rayDiff,
                                                               hit.t,
-                                                              hit.normal,
+                                                              gradientNormal,
                                                               dudP,
                                                               dvdP,
                                                               hit.dUVdx0,
@@ -705,7 +716,7 @@ void PopulateFirstHitUvGradients(HitInfo& hit, const Ray& ray, const PrimaryRayD
             hit.hasIgehyGradients1 = FirstHitUvGradientsIgehy(ray,
                                                               rayDiff,
                                                               hit.t,
-                                                              hit.normal,
+                                                              gradientNormal,
                                                               dudP,
                                                               dvdP,
                                                               hit.dUVdx1,
@@ -777,64 +788,21 @@ simd::float3 SampleEnvironmentData(const std::vector<float>& rgba,
     return color * std::max(intensity, 0.0f);
 }
 
-simd::float3 SampleEnvironmentLod(const EnvironmentMap& env,
-                                  const simd::float3& direction,
-                                  float rotation,
-                                  float intensity,
-                                  float lod) {
-    if (env.mipLevels.empty()) {
-        return SampleEnvironmentData(env.rgba, env.width, env.height, direction, rotation, intensity);
-    }
-    float maxMip = static_cast<float>(env.mipLevels.size() - 1u);
-    float clampedLod = std::clamp(std::isfinite(lod) ? lod : 0.0f, 0.0f, maxMip);
-    uint32_t level0 = static_cast<uint32_t>(std::floor(clampedLod));
-    uint32_t level1 = std::min<uint32_t>(level0 + 1u, static_cast<uint32_t>(env.mipLevels.size() - 1u));
-    float t = clampedLod - static_cast<float>(level0);
-    const auto& mip0 = env.mipLevels[level0];
-    const auto& mip1 = env.mipLevels[level1];
-    simd::float3 c0 = SampleEnvironmentData(mip0.rgba, mip0.width, mip0.height, direction, rotation, intensity);
-    simd::float3 c1 = SampleEnvironmentData(mip1.rgba, mip1.width, mip1.height, direction, rotation, intensity);
-    return c0 * (1.0f - t) + c1 * t;
-}
-
 simd::float3 SampleEnvironment(const EnvironmentMap& env,
                                const simd::float3& direction,
                                float rotation,
                                float intensity) {
-    return SampleEnvironmentLod(env, direction, rotation, intensity, 0.0f);
-}
-
-float EnvironmentMaxMip(const EnvironmentMap& env) {
-    return env.mipLevels.empty() ? 0.0f : static_cast<float>(env.mipLevels.size() - 1u);
-}
-
-float EnvironmentLodFromRoughness(float roughness, const EnvironmentMap& env) {
-    const float maxMip = EnvironmentMaxMip(env);
-    if (maxMip <= 0.0f) {
-        return 0.0f;
-    }
-    float alpha = std::clamp(roughness, 0.0f, 1.0f);
-    alpha *= alpha;
-    return std::clamp(alpha * maxMip, 0.0f, maxMip);
+    return SampleEnvironmentData(env.rgba, env.width, env.height, direction, rotation, intensity);
 }
 
 simd::float3 EvaluateBackground(const PathTracer::RenderSettings& settings,
                                 const EnvironmentMap* env,
-                                const simd::float3& direction,
-                                bool lodActive = false,
-                                float lod = 0.0f) {
+                                const simd::float3& direction) {
     switch (settings.backgroundMode) {
         case PathTracer::RenderSettings::BackgroundMode::Solid:
             return settings.backgroundColor;
         case PathTracer::RenderSettings::BackgroundMode::Environment:
             if (env) {
-                if (lodActive && EnvironmentMaxMip(*env) > 0.0f) {
-                    return SampleEnvironmentLod(*env,
-                                                direction,
-                                                settings.environmentRotation,
-                                                settings.environmentIntensity,
-                                                lod);
-                }
                 return SampleEnvironment(*env,
                                          direction,
                                          settings.environmentRotation,
@@ -845,96 +813,6 @@ simd::float3 EvaluateBackground(const PathTracer::RenderSettings& settings,
         default:
             return SkyColor(direction);
     }
-}
-
-float SrgbToLinear(float value) {
-    value = std::clamp(value, 0.0f, 1.0f);
-    if (value <= 0.04045f) {
-        return value / 12.92f;
-    }
-    return std::pow((value + 0.055f) / 1.055f, 2.4f);
-}
-
-bool ReadMaterialTexture(id<MTLTexture> texture, CpuTexture& outTexture) {
-    outTexture = CpuTexture{};
-    if (!texture) {
-        return false;
-    }
-
-    const NSUInteger width = texture.width;
-    const NSUInteger height = texture.height;
-    if (width == 0 || height == 0) {
-        return false;
-    }
-
-    outTexture.width = static_cast<uint32_t>(width);
-    outTexture.height = static_cast<uint32_t>(height);
-
-    const MTLPixelFormat format = texture.pixelFormat;
-    const NSUInteger mipCount = std::max<NSUInteger>(texture.mipmapLevelCount, 1u);
-    outTexture.mipLevels.resize(mipCount);
-
-    auto readLevel = [&](NSUInteger level, CpuTexture::MipLevel& outLevel) -> bool {
-        const NSUInteger levelWidth = std::max<NSUInteger>(texture.width >> level, 1u);
-        const NSUInteger levelHeight = std::max<NSUInteger>(texture.height >> level, 1u);
-        outLevel.width = static_cast<uint32_t>(levelWidth);
-        outLevel.height = static_cast<uint32_t>(levelHeight);
-        outLevel.rgba.resize(static_cast<size_t>(levelWidth) * static_cast<size_t>(levelHeight) * 4ull, 0.0f);
-        const MTLRegion region = MTLRegionMake2D(0, 0, levelWidth, levelHeight);
-
-        if (format == MTLPixelFormatRGBA8Unorm ||
-            format == MTLPixelFormatRGBA8Unorm_sRGB ||
-            format == MTLPixelFormatBGRA8Unorm ||
-            format == MTLPixelFormatBGRA8Unorm_sRGB) {
-            std::vector<uint8_t> bytes(static_cast<size_t>(levelWidth) * static_cast<size_t>(levelHeight) * 4ull, 0u);
-            [texture getBytes:bytes.data()
-                  bytesPerRow:levelWidth * 4u
-                   fromRegion:region
-                  mipmapLevel:level];
-
-            const bool isBgra = (format == MTLPixelFormatBGRA8Unorm ||
-                                 format == MTLPixelFormatBGRA8Unorm_sRGB);
-            const bool isSrgb = (format == MTLPixelFormatRGBA8Unorm_sRGB ||
-                                 format == MTLPixelFormatBGRA8Unorm_sRGB);
-            for (size_t i = 0; i < static_cast<size_t>(levelWidth) * static_cast<size_t>(levelHeight); ++i) {
-                size_t src = i * 4ull;
-                float r = bytes[src + (isBgra ? 2u : 0u)] / 255.0f;
-                float g = bytes[src + 1u] / 255.0f;
-                float b = bytes[src + (isBgra ? 0u : 2u)] / 255.0f;
-                float a = bytes[src + 3u] / 255.0f;
-                if (isSrgb) {
-                    r = SrgbToLinear(r);
-                    g = SrgbToLinear(g);
-                    b = SrgbToLinear(b);
-                }
-                size_t dst = i * 4ull;
-                outLevel.rgba[dst + 0u] = r;
-                outLevel.rgba[dst + 1u] = g;
-                outLevel.rgba[dst + 2u] = b;
-                outLevel.rgba[dst + 3u] = a;
-            }
-            return true;
-        }
-
-        if (format == MTLPixelFormatRGBA32Float) {
-            [texture getBytes:outLevel.rgba.data()
-                  bytesPerRow:levelWidth * sizeof(float) * 4u
-                   fromRegion:region
-                  mipmapLevel:level];
-            return true;
-        }
-
-        return false;
-    };
-
-    for (NSUInteger level = 0; level < mipCount; ++level) {
-        if (!readLevel(level, outTexture.mipLevels[level])) {
-            outTexture = CpuTexture{};
-            return false;
-        }
-    }
-    outTexture.rgba = outTexture.mipLevels.front().rgba;
-    return true;
 }
 
 simd::float2 ApplyTextureTransform(const simd::float2& uv,
@@ -987,17 +865,42 @@ float ApplyWrapMode(float value, int32_t wrapMode) {
     }
 }
 
-simd::float4 SampleCpuTextureData(const std::vector<float>& rgba,
-                                  uint32_t width,
-                                  uint32_t height,
-                                  const PathTracer::MaterialTextureSamplerDesc& samplerDesc,
+// True when Metal samples this texture at its nearest texel at every LOD: the magnification filter is NEAREST and the
+// minification filter picks a texel within a level (NEAREST, NEAREST_MIPMAP_NEAREST, NEAREST_MIPMAP_LINEAR), so both
+// map to MTLSamplerMinMagFilterNearest (SceneResources::materialSamplerIndexForDesc). A texture that mixes a nearest
+// and a linear filter is sampled bilinear on Embree; BuildEmbreeScene logs it, and refuses it on a source material.
+bool CpuTextureNearestTexel(const PathTracer::MaterialTextureSamplerDesc& samplerDesc) {
+    const int32_t minFilter = samplerDesc.minFilter;
+    return samplerDesc.magFilter == 9728 && (minFilter == 9728 || minFilter == 9984 || minFilter == 9986);
+}
+
+// True when one of the two filters picks the nearest texel and the other filters linearly.
+bool CpuTextureMixesNearestAndLinear(const PathTracer::MaterialTextureSamplerDesc& samplerDesc) {
+    const int32_t minFilter = samplerDesc.minFilter;
+    const bool minNearest = minFilter == 9728 || minFilter == 9984 || minFilter == 9986;
+    return (samplerDesc.magFilter == 9728) != minNearest;
+}
+
+simd::float4 SampleCpuTextureData(const CpuTexture& texture, const CpuTexture::MipLevel& level,
                                   const simd::float2& uv) {
-    if (width == 0 || height == 0 || rgba.empty()) {
+    const uint32_t width = level.width;
+    const uint32_t height = level.height;
+    const PathTracer::MaterialTextureSamplerDesc& samplerDesc = texture.samplerDesc;
+    const bool normalMap = texture.normalMap;
+    if (width == 0 || height == 0 || (level.rgba.empty() && level.rgba8.empty())) {
         return simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f);
     }
 
     float u = ApplyWrapMode(uv.x, samplerDesc.wrapS);
     float v = ApplyWrapMode(uv.y, samplerDesc.wrapT);
+    if (CpuTextureNearestTexel(samplerDesc)) {
+        // The texel that contains the wrapped coordinate, as Metal's nearest filter picks it.
+        const int x = std::clamp(static_cast<int>(std::floor(u * static_cast<float>(width))), 0,
+                                 static_cast<int>(width) - 1);
+        const int y = std::clamp(static_cast<int>(std::floor(v * static_cast<float>(height))), 0,
+                                 static_cast<int>(height) - 1);
+        return CpuTextureTexel(texture, level, (static_cast<size_t>(y) * width + static_cast<size_t>(x)) * 4ull);
+    }
     float fx = u * static_cast<float>(width) - 0.5f;
     float fy = v * static_cast<float>(height) - 0.5f;
     int x0 = static_cast<int>(std::floor(fx));
@@ -1018,28 +921,28 @@ simd::float4 SampleCpuTextureData(const std::vector<float>& rgba,
     y1 = wrapIndex(y1, static_cast<int>(height));
 
     auto fetch = [&](int px, int py) {
-        size_t idx = (static_cast<size_t>(py) * width + static_cast<size_t>(px)) * 4ull;
-        return simd_make_float4(rgba[idx + 0u],
-                                rgba[idx + 1u],
-                                rgba[idx + 2u],
-                                rgba[idx + 3u]);
+        return CpuTextureTexel(texture, level, (static_cast<size_t>(py) * width + static_cast<size_t>(px)) * 4ull);
     };
 
     simd::float4 c00 = fetch(x0, y0);
     simd::float4 c10 = fetch(x1, y0);
     simd::float4 c01 = fetch(x0, y1);
     simd::float4 c11 = fetch(x1, y1);
+    if (normalMap) {
+        simd::float4 n0 = c00 + (c10 - c00) * tx;
+        simd::float4 n1 = c01 + (c11 - c01) * tx;
+        return n0 + (n1 - n0) * ty;
+    }
     simd::float4 c0 = c00 * (1.0f - tx) + c10 * tx;
     simd::float4 c1 = c01 * (1.0f - tx) + c11 * tx;
     return c0 * (1.0f - ty) + c1 * ty;
 }
 
 simd::float4 SampleCpuTexture(const CpuTexture& texture, const simd::float2& uv) {
-    return SampleCpuTextureData(texture.rgba,
-                                texture.width,
-                                texture.height,
-                                texture.samplerDesc,
-                                uv);
+    if (texture.mipLevels.empty()) {
+        return simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+    return SampleCpuTextureData(texture, texture.mipLevels.front(), uv);
 }
 
 simd::float4 SampleCpuTextureLevel(const CpuTexture& texture, const simd::float2& uv, uint32_t levelIndex) {
@@ -1047,27 +950,51 @@ simd::float4 SampleCpuTextureLevel(const CpuTexture& texture, const simd::float2
         return SampleCpuTexture(texture, uv);
     }
     levelIndex = std::min<uint32_t>(levelIndex, static_cast<uint32_t>(texture.mipLevels.size() - 1u));
-    const auto& level = texture.mipLevels[levelIndex];
-    return SampleCpuTextureData(level.rgba,
-                                level.width,
-                                level.height,
-                                texture.samplerDesc,
-                                uv);
+    return SampleCpuTextureData(texture, texture.mipLevels[levelIndex], uv);
+}
+
+// Mip mode of the glTF minification filter, as the Metal sampler maps it
+// (SceneResources::materialSamplerIndexForDesc): NEAREST and LINEAR are not
+// mipmapped and read level 0 only; *_MIPMAP_NEAREST reads the nearest level.
+enum class CpuTextureMipMode { None, Nearest, Linear };
+
+CpuTextureMipMode CpuTextureMipModeFor(const CpuTexture& texture) {
+    switch (texture.samplerDesc.minFilter) {
+        case 9728:  // NEAREST
+        case 9729:  // LINEAR
+            return CpuTextureMipMode::None;
+        case 9984:  // NEAREST_MIPMAP_NEAREST
+        case 9985:  // LINEAR_MIPMAP_NEAREST
+            return CpuTextureMipMode::Nearest;
+        default:    // *_MIPMAP_LINEAR, or unset (LINEAR_MIPMAP_LINEAR)
+            return CpuTextureMipMode::Linear;
+    }
+}
+
+// Metal enables anisotropy only for a linear minification filter with mips.
+bool CpuTextureAnisotropyEnabled(const CpuTexture& texture) {
+    const int32_t minFilter = texture.samplerDesc.minFilter;
+    return minFilter != 9728 && minFilter != 9729 && minFilter != 9984 && minFilter != 9986;
 }
 
 simd::float4 SampleCpuTexture(const CpuTexture& texture, const simd::float2& uv, float lod) {
     if (texture.mipLevels.empty()) {
         return SampleCpuTexture(texture, uv);
     }
-    if (texture.mipLevels.size() == 1u) {
+    const CpuTextureMipMode mipMode = CpuTextureMipModeFor(texture);
+    if (texture.mipLevels.size() == 1u || mipMode == CpuTextureMipMode::None) {
         return SampleCpuTextureLevel(texture, uv, 0u);
     }
     float clampedLod = std::clamp(lod, 0.0f, static_cast<float>(texture.mipLevels.size() - 1u));
+    if (mipMode == CpuTextureMipMode::Nearest) {
+        return SampleCpuTextureLevel(texture, uv, static_cast<uint32_t>(std::floor(clampedLod + 0.5f)));
+    }
     uint32_t level0 = static_cast<uint32_t>(std::floor(clampedLod));
     uint32_t level1 = std::min<uint32_t>(level0 + 1u, static_cast<uint32_t>(texture.mipLevels.size() - 1u));
     float t = clampedLod - static_cast<float>(level0);
     simd::float4 c0 = SampleCpuTextureLevel(texture, uv, level0);
     simd::float4 c1 = SampleCpuTextureLevel(texture, uv, level1);
+    if (texture.normalMap) return c0 + (c1 - c0) * t;
     return c0 * (1.0f - t) + c1 * t;
 }
 
@@ -1075,18 +1002,24 @@ simd::float4 SampleCpuTextureAnisotropic(const CpuTexture& texture,
                                          const simd::float2& uv,
                                          const simd::float2& dUVdx,
                                          const simd::float2& dUVdy,
-                                         float fallbackLod) {
-    if (texture.mipLevels.size() <= 1u || texture.width == 0u || texture.height == 0u) {
+                                         float fallbackLod,
+                                         float textureLodBias = 0.0f) {
+    if (texture.mipLevels.size() <= 1u || texture.width == 0u || texture.height == 0u ||
+        !CpuTextureAnisotropyEnabled(texture) ||
+        CpuTextureMipModeFor(texture) == CpuTextureMipMode::None) {
         return SampleCpuTexture(texture, uv, fallbackLod);
     }
     if (!std::isfinite(dUVdx.x) || !std::isfinite(dUVdx.y) ||
         !std::isfinite(dUVdy.x) || !std::isfinite(dUVdy.y)) {
         return SampleCpuTexture(texture, uv, fallbackLod);
     }
-    simd::float2 texelDx = simd_make_float2(dUVdx.x * static_cast<float>(texture.width),
-                                            dUVdx.y * static_cast<float>(texture.height));
-    simd::float2 texelDy = simd_make_float2(dUVdy.x * static_cast<float>(texture.width),
-                                            dUVdy.y * static_cast<float>(texture.height));
+    const float gradientScale = std::exp2(textureLodBias);
+    const simd::float2 scaledDx = dUVdx * gradientScale;
+    const simd::float2 scaledDy = dUVdy * gradientScale;
+    simd::float2 texelDx = simd_make_float2(scaledDx.x * static_cast<float>(texture.width),
+                                            scaledDx.y * static_cast<float>(texture.height));
+    simd::float2 texelDy = simd_make_float2(scaledDy.x * static_cast<float>(texture.width),
+                                            scaledDy.y * static_cast<float>(texture.height));
     const float lenX = simd::length(texelDx);
     const float lenY = simd::length(texelDy);
     if (!std::isfinite(lenX) || !std::isfinite(lenY) || std::max(lenX, lenY) <= 1.0f) {
@@ -1095,31 +1028,31 @@ simd::float4 SampleCpuTextureAnisotropic(const CpuTexture& texture,
     const bool xMajor = lenX >= lenY;
     const float majorLen = std::max(xMajor ? lenX : lenY, 1.0f);
     const float minorLen = std::max(xMajor ? lenY : lenX, 1.0f);
-    const simd::float2 majorUv = xMajor ? dUVdx : dUVdy;
+    const simd::float2 majorUv = xMajor ? scaledDx : scaledDy;
     const float minorLod =
         std::clamp(std::log2(std::max(minorLen, 1.0e-8f)),
                    0.0f,
                    static_cast<float>(texture.mipLevels.size() - 1u));
     const uint32_t taps =
-        std::clamp(static_cast<uint32_t>(std::ceil(majorLen / minorLen)), 1u, 8u);
+        std::clamp(static_cast<uint32_t>(std::ceil(majorLen / minorLen)), 1u,
+                   std::clamp(texture.samplerDesc.maxAnisotropy, 1u, 16u));
     if (taps <= 1u) {
         return SampleCpuTexture(texture, uv, minorLod);
     }
+    simd::float4 reference = texture.normalMap ? SampleCpuTexture(texture, uv, minorLod) : simd_make_float4(0.0f);
     simd::float4 accum = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     for (uint32_t i = 0; i < taps; ++i) {
         float offset = (static_cast<float>(i) + 0.5f) / static_cast<float>(taps) - 0.5f;
-        accum += SampleCpuTexture(texture, uv + majorUv * offset, minorLod);
+        accum += SampleCpuTexture(texture, uv + majorUv * offset, minorLod) - reference;
     }
-    return accum / static_cast<float>(taps);
+    return reference + accum / static_cast<float>(taps);
 }
 
 simd::float3 DecodeNormalMap(const simd::float3& encoded, float normalScale) {
     simd::float3 n = encoded * 2.0f - simd_make_float3(1.0f, 1.0f, 1.0f);
     n.x *= normalScale;
     n.y *= normalScale;
-    float xy2 = n.x * n.x + n.y * n.y;
-    n.z = std::sqrt(std::max(1.0f - std::min(xy2, 1.0f), 0.0f));
-    return simd::normalize(n);
+    return simd::dot(n, n) > 1.0e-12f ? simd::normalize(n) : simd_make_float3(0.0f, 0.0f, 1.0f);
 }
 
 float TextureLodFromFootprint(const CpuTexture& texture, float uvPerWorld, float footprintWorld) {
@@ -1166,7 +1099,8 @@ float TextureLodWithFallback(const CpuTexture& texture,
                              const simd::float2& dUVdx,
                              const simd::float2& dUVdy,
                              float uvPerWorld,
-                             float surfaceFootprintWorld) {
+                             float surfaceFootprintWorld,
+                             float textureLodBias = 0.0f) {
     float lod = 0.0f;
     bool gradientOk = false;
     if (hasIgehyGradients) {
@@ -1178,7 +1112,7 @@ float TextureLodWithFallback(const CpuTexture& texture,
     if (!std::isfinite(lod)) {
         lod = TextureLodFromFootprint(texture, uvPerWorld, surfaceFootprintWorld);
     }
-    return std::max(lod, 0.0f);
+    return std::max(lod + textureLodBias, 0.0f);
 }
 
 struct CpuTextureSamplingContext {
@@ -1228,13 +1162,6 @@ bool Refract(const simd::float3& v, const simd::float3& n, float eta, simd::floa
     simd::float3 rOutParallel = -std::sqrt(k) * n;
     out = rOutPerp + rOutParallel;
     return true;
-}
-
-float Schlick(float cosine, float refIdx) {
-    float r0 = (1.0f - refIdx) / (1.0f + refIdx);
-    r0 = r0 * r0;
-    float t = 1.0f - cosine;
-    return r0 + (1.0f - r0) * t * t * t * t * t;
 }
 
 struct Onb {
@@ -1289,12 +1216,21 @@ FireflyClampParams MakeFireflyParams(const PathTracer::RenderSettings& settings)
     params.clampFactor = std::max(settings.fireflyClampFactor, 0.0f);
     params.clampFloor = std::max(settings.fireflyClampFloor, 0.0f);
     params.throughputClamp = std::max(settings.throughputClamp, 0.0f);
-    params.specularTailClampBase = std::max(settings.specularTailClampBase, 0.0f);
-    params.specularTailClampRoughnessScale = std::max(settings.specularTailClampRoughnessScale, 0.0f);
     params.minSpecularPdf = std::max(settings.minSpecularPdf, 1.0e-8f);
     params.maxContribution = std::max(settings.fireflyClampMaxContribution, 0.0f);
     params.enabled = settings.fireflyClampEnabled ? 1.0f : 0.0f;
     return params;
+}
+
+// The rule RenderLoop.mm's EnvFlagEnabled applies to Metal's environment switches: set, non-empty, and not
+// 0, false or no.
+bool MetalEnvFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+           std::strcmp(value, "no") != 0 && std::strcmp(value, "NO") != 0;
 }
 
 float LoadEmbreeEmissionScale() {
@@ -1306,19 +1242,6 @@ float LoadEmbreeEmissionScale() {
     float parsed = std::strtof(value, &end);
     if (end == value || !std::isfinite(parsed) || parsed <= 0.0f) {
         return 1.0f;
-    }
-    return parsed;
-}
-
-float LoadEmbreeSssTravelScale() {
-    const char* value = std::getenv("PATH_TRACER_EMBREE_SSS_TRAVEL_SCALE");
-    if (!value || *value == '\0') {
-        return 0.55f;
-    }
-    char* end = nullptr;
-    float parsed = std::strtof(value, &end);
-    if (end == value || !std::isfinite(parsed) || parsed < 0.0f) {
-        return 0.55f;
     }
     return parsed;
 }
@@ -1423,27 +1346,12 @@ simd::float3 ClampPathThroughput(const simd::float3& throughput,
     return throughput;
 }
 
-simd::float3 ClampSpecularTail(const simd::float3& value,
-                               float roughness,
-                               const simd::float3& f0,
-                               const FireflyClampParams& params) {
+simd::float3 SanitizeSpecularValue(const simd::float3& value) {
     if (!IsFinite(value)) {
         return simd_make_float3(0.0f, 0.0f, 0.0f);
     }
-    simd::float3 positive = simd::max(value, simd_make_float3(0.0f, 0.0f, 0.0f));
-    if (params.enabled < 0.5f) {
-        return positive;
-    }
-    float strength = std::max({f0.x, f0.y, f0.z, 1.0e-3f});
-    float limit = (params.specularTailClampBase +
-                   params.specularTailClampRoughnessScale * roughness) * strength;
-    limit = std::max(limit, params.clampFloor);
-    float lum = Luminance(positive);
-    if (lum > limit && lum > 0.0f) {
-        float scale = limit / std::max(lum, 1.0e-6f);
-        positive *= scale;
-    }
-    return positive;
+    // Mirrors sanitize_specular_value (closures_eval.metal): sanitize, never cap f.
+    return simd::max(value, simd_make_float3(0.0f, 0.0f, 0.0f));
 }
 
 float FresnelDielectricExact(float cosThetaI, float etaI, float etaT, float& outCosThetaT) {
@@ -1482,34 +1390,84 @@ float DielectricF0FromIor(float ior) {
     return std::clamp(f0, 0.0f, 0.99f);
 }
 
-simd::float2 DfgApprox(float roughness, float NoV) {
-    const simd::float4 c0 = {-1.0f, -0.0275f, -0.572f, 0.022f};
-    const simd::float4 c1 = {1.0f, 0.0425f, 1.04f, -0.04f};
-    simd::float4 r = roughness * c0 + c1;
-    float a004 = std::min(r.x * r.x, std::exp2(-9.28f * NoV)) * r.x + r.y;
-    return simd_make_float2(-1.04f * a004 + r.z,
-                            1.04f * a004 + r.w);
+// Generated offline by generate_ess.py, a local tool script that is not part of this repository.
+// Ess: separable Smith GGX, alpha=max(r*r,1e-4), 49 roughness x 49 sqrt(NoV).
+static constexpr float kGgxSingleScatterAlbedo[2401] = {
+    0.9360666f, 0.9690419f, 0.9982691f, 0.9998319f, 0.9999479f, 0.9999787f, 0.9999898f, 0.9999945f, 0.9999968f, 0.9999980f, 0.9999987f, 0.9999991f, 0.9999994f, 0.9999995f, 0.9999997f, 0.9999997f, 0.9999998f, 0.9999998f, 0.9999999f, 0.9999999f, 0.9999999f, 0.9999999f, 0.9999999f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f,
+    0.9361361f, 0.8816224f, 0.9642667f, 0.9927504f, 0.9978852f, 0.9991537f, 0.9998001f, 0.9998946f, 0.9999386f, 0.9999618f, 0.9999750f, 0.9999829f, 0.9999880f, 0.9999913f, 0.9999935f, 0.9999951f, 0.9999962f, 0.9999971f, 0.9999977f, 0.9999981f, 0.9999985f, 0.9999988f, 0.9999990f, 0.9999992f, 0.9999993f, 0.9999994f, 0.9999995f, 0.9999996f, 0.9999996f, 0.9999997f, 0.9999997f, 0.9999998f, 0.9999998f, 0.9999998f, 0.9999999f, 0.9999999f, 0.9999999f, 0.9999999f, 0.9999999f, 0.9999999f, 0.9999999f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f, 1.0000000f,
+    0.9361514f, 0.9130131f, 0.8816218f, 0.9203838f, 0.9642662f, 0.9846032f, 0.9927503f, 0.9962251f, 0.9978853f, 0.9986857f, 0.9991540f, 0.9996917f, 0.9998008f, 0.9998580f, 0.9998953f, 0.9999210f, 0.9999393f, 0.9999526f, 0.9999625f, 0.9999700f, 0.9999757f, 0.9999801f, 0.9999836f, 0.9999864f, 0.9999887f, 0.9999905f, 0.9999920f, 0.9999932f, 0.9999942f, 0.9999951f, 0.9999958f, 0.9999964f, 0.9999969f, 0.9999974f, 0.9999978f, 0.9999981f, 0.9999984f, 0.9999986f, 0.9999988f, 0.9999990f, 0.9999992f, 0.9999993f, 0.9999995f, 0.9999996f, 0.9999997f, 0.9999998f, 0.9999999f, 0.9999999f, 1.0000000f,
+    0.9361532f, 0.9258218f, 0.8977168f, 0.8816192f, 0.9026362f, 0.9376927f, 0.9642641f, 0.9797618f, 0.9881630f, 0.9927498f, 0.9953644f, 0.9969226f, 0.9978859f, 0.9985034f, 0.9988483f, 0.9991554f, 0.9995859f, 0.9997437f, 0.9998039f, 0.9998448f, 0.9998751f, 0.9998984f, 0.9999165f, 0.9999309f, 0.9999424f, 0.9999517f, 0.9999593f, 0.9999656f, 0.9999708f, 0.9999751f, 0.9999788f, 0.9999818f, 0.9999845f, 0.9999867f, 0.9999886f, 0.9999903f, 0.9999917f, 0.9999930f, 0.9999941f, 0.9999951f, 0.9999959f, 0.9999966f, 0.9999973f, 0.9999979f, 0.9999984f, 0.9999989f, 0.9999993f, 0.9999997f, 1.0000000f,
+    0.9361498f, 0.9303861f, 0.9130073f, 0.8907768f, 0.8816118f, 0.8947193f, 0.9203716f, 0.9454729f, 0.9642585f, 0.9767108f, 0.9846001f, 0.9895774f, 0.9927495f, 0.9948450f, 0.9962264f, 0.9971820f, 0.9978874f, 0.9983989f, 0.9986893f, 0.9989281f, 0.9991587f, 0.9994510f, 0.9997028f, 0.9997699f, 0.9998121f, 0.9998440f, 0.9998692f, 0.9998897f, 0.9999066f, 0.9999206f, 0.9999323f, 0.9999422f, 0.9999506f, 0.9999578f, 0.9999639f, 0.9999692f, 0.9999738f, 0.9999778f, 0.9999813f, 0.9999843f, 0.9999870f, 0.9999894f, 0.9999914f, 0.9999933f, 0.9999949f, 0.9999964f, 0.9999977f, 0.9999989f, 1.0000000f,
+    0.9361346f, 0.9324719f, 0.9212103f, 0.9038151f, 0.8872933f, 0.8815947f, 0.8905932f, 0.9095501f, 0.9309634f, 0.9497739f, 0.9642462f, 0.9746372f, 0.9818715f, 0.9868588f, 0.9903208f, 0.9927484f, 0.9944739f, 0.9957235f, 0.9966848f, 0.9973256f, 0.9978907f, 0.9983308f, 0.9985875f, 0.9987925f, 0.9989788f, 0.9991653f, 0.9993851f, 0.9996689f, 0.9997523f, 0.9997968f, 0.9998294f, 0.9998555f, 0.9998771f, 0.9998953f, 0.9999107f, 0.9999239f, 0.9999353f, 0.9999452f, 0.9999538f, 0.9999614f, 0.9999680f, 0.9999738f, 0.9999789f, 0.9999835f, 0.9999875f, 0.9999912f, 0.9999944f, 0.9999973f, 0.9999999f,
+    0.9360860f, 0.9335551f, 0.9257578f, 0.9129522f, 0.8976601f, 0.8853319f, 0.8815572f, 0.8881612f, 0.9025676f, 0.9203152f, 0.9376351f, 0.9524678f, 0.9642238f, 0.9731342f, 0.9797367f, 0.9845840f, 0.9881489f, 0.9907772f, 0.9927439f, 0.9942181f, 0.9953644f, 0.9962272f, 0.9969271f, 0.9974190f, 0.9978951f, 0.9982833f, 0.9985164f, 0.9986995f, 0.9988614f, 0.9990164f, 0.9991747f, 0.9993571f, 0.9996368f, 0.9997508f, 0.9998004f, 0.9998342f, 0.9998608f, 0.9998829f, 0.9999018f, 0.9999180f, 0.9999322f, 0.9999445f, 0.9999554f, 0.9999651f, 0.9999736f, 0.9999812f, 0.9999880f, 0.9999941f, 0.9999995f,
+    0.9359633f, 0.9341098f, 0.9284128f, 0.9188502f, 0.9063293f, 0.8934533f, 0.8840785f, 0.8814683f, 0.8865601f, 0.8978307f, 0.9125023f, 0.9278824f, 0.9421147f, 0.9542840f, 0.9641797f, 0.9719792f, 0.9780217f, 0.9826624f, 0.9862258f, 0.9889625f, 0.9910860f, 0.9927320f, 0.9940250f, 0.9950715f, 0.9958606f, 0.9965654f, 0.9970769f, 0.9974804f, 0.9978955f, 0.9982458f, 0.9984604f, 0.9986270f, 0.9987724f, 0.9989082f, 0.9990417f, 0.9991818f, 0.9993426f, 0.9995991f, 0.9997664f, 0.9998261f, 0.9998624f, 0.9998898f, 0.9999123f, 0.9999316f, 0.9999483f, 0.9999630f, 0.9999761f, 0.9999876f, 0.9999980f,
+    0.9357265f, 0.9343089f, 0.9299624f, 0.9226171f, 0.9125872f, 0.9010908f, 0.8903674f, 0.8830809f, 0.8812215f, 0.8853026f, 0.8943621f, 0.9065899f, 0.9200672f, 0.9332667f, 0.9452322f, 0.9555272f, 0.9640784f, 0.9710207f, 0.9765784f, 0.9809978f, 0.9845018f, 0.9872864f, 0.9895032f, 0.9912761f, 0.9926925f, 0.9938476f, 0.9948023f, 0.9955551f, 0.9961917f, 0.9967510f, 0.9971559f, 0.9975007f, 0.9978709f, 0.9981921f, 0.9983912f, 0.9985427f, 0.9986732f, 0.9987929f, 0.9989091f, 0.9990269f, 0.9991541f, 0.9993039f, 0.9995246f, 0.9997929f, 0.9998750f, 0.9999169f, 0.9999463f, 0.9999698f, 0.9999896f,
+    0.9353646f, 0.9342429f, 0.9308137f, 0.9250028f, 0.9169062f, 0.9070930f, 0.8967978f, 0.8878056f, 0.8819611f, 0.8805345f, 0.8838269f, 0.8912055f, 0.9014480f, 0.9131736f, 0.9251686f, 0.9365553f, 0.9468137f, 0.9557204f, 0.9632566f, 0.9695223f, 0.9746772f, 0.9788889f, 0.9823188f, 0.9851196f, 0.9874029f, 0.9892747f, 0.9908168f, 0.9920777f, 0.9931382f, 0.9940215f, 0.9947633f, 0.9953585f, 0.9959319f, 0.9963714f, 0.9967152f, 0.9970226f, 0.9973651f, 0.9976686f, 0.9978530f, 0.9979871f, 0.9980962f, 0.9981906f, 0.9982752f, 0.9983539f, 0.9984301f, 0.9985091f, 0.9986036f, 0.9987697f, 0.9993496f,
+    0.9348755f, 0.9339640f, 0.9311864f, 0.9264711f, 0.9198382f, 0.9115469f, 0.9022663f, 0.8931033f, 0.8854477f, 0.8807553f, 0.8797146f, 0.8825044f, 0.8886887f, 0.8974120f, 0.9076630f, 0.9184900f, 0.9291358f, 0.9390797f, 0.9480280f, 0.9558614f, 0.9625848f, 0.9682756f, 0.9730474f, 0.9770273f, 0.9803379f, 0.9830840f, 0.9853666f, 0.9872684f, 0.9888587f, 0.9901962f, 0.9913042f, 0.9922573f, 0.9930433f, 0.9937488f, 0.9943024f, 0.9948056f, 0.9952769f, 0.9956201f, 0.9959029f, 0.9961672f, 0.9964805f, 0.9967681f, 0.9969343f, 0.9970478f, 0.9971353f, 0.9972074f, 0.9972688f, 0.9973220f, 0.9973688f,
+    0.9342409f, 0.9334842f, 0.9311841f, 0.9272788f, 0.9217586f, 0.9147371f, 0.9065756f, 0.8980835f, 0.8901638f, 0.8838195f, 0.8799713f, 0.8791901f, 0.8815844f, 0.8868415f, 0.8943481f, 0.9033522f, 0.9131077f, 0.9229758f, 0.9324731f, 0.9412814f, 0.9492248f, 0.9562387f, 0.9623359f, 0.9675783f, 0.9720496f, 0.9758439f, 0.9790533f, 0.9817684f, 0.9840646f, 0.9860072f, 0.9876510f, 0.9890464f, 0.9902491f, 0.9912581f, 0.9921465f, 0.9928807f, 0.9935642f, 0.9941105f, 0.9945787f, 0.9950630f, 0.9954463f, 0.9957404f, 0.9959951f, 0.9962467f, 0.9965752f, 0.9969033f, 0.9970862f, 0.9972061f, 0.9972958f,
+    0.9334313f, 0.9327918f, 0.9308514f, 0.9275569f, 0.9228946f, 0.9169010f, 0.9098669f, 0.9022125f, 0.8945032f, 0.8875210f, 0.8820747f, 0.8788269f, 0.8781767f, 0.8802002f, 0.8846692f, 0.8911337f, 0.8990259f, 0.9077583f, 0.9168011f, 0.9257232f, 0.9342108f, 0.9420600f, 0.9491636f, 0.9554857f, 0.9610405f, 0.9658783f, 0.9700608f, 0.9736603f, 0.9767526f, 0.9794011f, 0.9816692f, 0.9836149f, 0.9852867f, 0.9867236f, 0.9879495f, 0.9890268f, 0.9899372f, 0.9907546f, 0.9914282f, 0.9920636f, 0.9925880f, 0.9930175f, 0.9934277f, 0.9938508f, 0.9941368f, 0.9943434f, 0.9945050f, 0.9946400f, 0.9948315f,
+    0.9324150f, 0.9318659f, 0.9302026f, 0.9273802f, 0.9233828f, 0.9182337f, 0.9121512f, 0.9052897f, 0.8980574f, 0.8910110f, 0.8847853f, 0.8800090f, 0.8772820f, 0.8767937f, 0.8785902f, 0.8825023f, 0.8881923f, 0.8952238f, 0.9031286f, 0.9114669f, 0.9198629f, 0.9280223f, 0.9357344f, 0.9428663f, 0.9493480f, 0.9551618f, 0.9603209f, 0.9648646f, 0.9688427f, 0.9723136f, 0.9753291f, 0.9779497f, 0.9802259f, 0.9822007f, 0.9839131f, 0.9854081f, 0.9867158f, 0.9878414f, 0.9888469f, 0.9897050f, 0.9904947f, 0.9911483f, 0.9917648f, 0.9923150f, 0.9927520f, 0.9931437f, 0.9936275f, 0.9940379f, 0.9943113f,
+    0.9311595f, 0.9306815f, 0.9292353f, 0.9267862f, 0.9233119f, 0.9188703f, 0.9135277f, 0.9073891f, 0.9007196f, 0.8939253f, 0.8875938f, 0.8821338f, 0.8780237f, 0.8756356f, 0.8751864f, 0.8767086f, 0.8800694f, 0.8850247f, 0.8912735f, 0.8984005f, 0.9060390f, 0.9138648f, 0.9216093f, 0.9290673f, 0.9360955f, 0.9426031f, 0.9485439f, 0.9539071f, 0.9587065f, 0.9629734f, 0.9667487f, 0.9700729f, 0.9729986f, 0.9755644f, 0.9778150f, 0.9797895f, 0.9815238f, 0.9830456f, 0.9843758f, 0.9855631f, 0.9865945f, 0.9875230f, 0.9883190f, 0.9890718f, 0.9896901f, 0.9902528f, 0.9908378f, 0.9912659f, 0.9915830f,
+    0.9296326f, 0.9292112f, 0.9279375f, 0.9257841f, 0.9227252f, 0.9188455f, 0.9141112f, 0.9086042f, 0.9025239f, 0.8962251f, 0.8899640f, 0.8841423f, 0.8792094f, 0.8756120f, 0.8735548f, 0.8731933f, 0.8745531f, 0.8775358f, 0.8819453f, 0.8875089f, 0.8939275f, 0.9009011f, 0.9081517f, 0.9154445f, 0.9226017f, 0.9294592f, 0.9359137f, 0.9419015f, 0.9473927f, 0.9523809f, 0.9568797f, 0.9609136f, 0.9645145f, 0.9677187f, 0.9705614f, 0.9730828f, 0.9753145f, 0.9772886f, 0.9790336f, 0.9805842f, 0.9819628f, 0.9831724f, 0.9842634f, 0.9852230f, 0.9860923f, 0.9868340f, 0.9875696f, 0.9881522f, 0.9885970f,
+    0.9278021f, 0.9274262f, 0.9262910f, 0.9243747f, 0.9216652f, 0.9182165f, 0.9139840f, 0.9090163f, 0.9035445f, 0.8976635f, 0.8916184f, 0.8858313f, 0.8805540f, 0.8761258f, 0.8728672f, 0.8710460f, 0.8707305f, 0.8719318f, 0.8745711f, 0.8784933f, 0.8834881f, 0.8893129f, 0.8957145f, 0.9024562f, 0.9093401f, 0.9161870f, 0.9228414f, 0.9291963f, 0.9351783f, 0.9407425f, 0.9458672f, 0.9505506f, 0.9548042f, 0.9586478f, 0.9621059f, 0.9652104f, 0.9679878f, 0.9704692f, 0.9726853f, 0.9746642f, 0.9764319f, 0.9780094f, 0.9794102f, 0.9806786f, 0.9818047f, 0.9828170f, 0.9837224f, 0.9845615f, 0.9852169f,
+    0.9256360f, 0.9252971f, 0.9242741f, 0.9225493f, 0.9201251f, 0.9170224f, 0.9131995f, 0.9087431f, 0.9037337f, 0.8982686f, 0.8926117f, 0.8869123f, 0.8815072f, 0.8766837f, 0.8726711f, 0.8697375f, 0.8680964f, 0.8677896f, 0.8688339f, 0.8711626f, 0.8746517f, 0.8791325f, 0.8844456f, 0.8903556f, 0.8966500f, 0.9031420f, 0.9096669f, 0.9160907f, 0.9223052f, 0.9282329f, 0.9338197f, 0.9390326f, 0.9438551f, 0.9482862f, 0.9523346f, 0.9560160f, 0.9593534f, 0.9623678f, 0.9650888f, 0.9675397f, 0.9697442f, 0.9717260f, 0.9735045f, 0.9751089f, 0.9765582f, 0.9778503f, 0.9790246f, 0.9800923f, 0.9810641f,
+    0.9231030f, 0.9227942f, 0.9218627f, 0.9202938f, 0.9181018f, 0.9152778f, 0.9117956f, 0.9077572f, 0.9031422f, 0.8981266f, 0.8927671f, 0.8873183f, 0.8819382f, 0.8769069f, 0.8724540f, 0.8687737f, 0.8661346f, 0.8646210f, 0.8642959f, 0.8651756f, 0.8672496f, 0.8704010f, 0.8744783f, 0.8793184f, 0.8847428f, 0.8905786f, 0.8966626f, 0.9028486f, 0.9090114f, 0.9150442f, 0.9208647f, 0.9264127f, 0.9316476f, 0.9365447f, 0.9410928f, 0.9452923f, 0.9491498f, 0.9526780f, 0.9558973f, 0.9588250f, 0.9614825f, 0.9638932f, 0.9660776f, 0.9680560f, 0.9698483f, 0.9714694f, 0.9729222f, 0.9742611f, 0.9754538f,
+    0.9201727f, 0.9198886f, 0.9190319f, 0.9175902f, 0.9155863f, 0.9129887f, 0.9098121f, 0.9060911f, 0.9018540f, 0.8971771f, 0.8921729f, 0.8869409f, 0.8817160f, 0.8766182f, 0.8719243f, 0.8677676f, 0.8644157f, 0.8619624f, 0.8605210f, 0.8602045f, 0.8609833f, 0.8628100f, 0.8656044f, 0.8692607f, 0.8736682f, 0.8786602f, 0.8840863f, 0.8898007f, 0.8956689f, 0.9015743f, 0.9074174f, 0.9131173f, 0.9186116f, 0.9238551f, 0.9288139f, 0.9334674f, 0.9378074f, 0.9418341f, 0.9455516f, 0.9489743f, 0.9521126f, 0.9549873f, 0.9576143f, 0.9600107f, 0.9621953f, 0.9641847f, 0.9659904f, 0.9676437f, 0.9691827f,
+    0.9168158f, 0.9165519f, 0.9157564f, 0.9144195f, 0.9125669f, 0.9101545f, 0.9072279f, 0.9037653f, 0.8998483f, 0.8954905f, 0.8907670f, 0.8858183f, 0.8807442f, 0.8757000f, 0.8708927f, 0.8664505f, 0.8626012f, 0.8594440f, 0.8571661f, 0.8558152f, 0.8554395f, 0.8560914f, 0.8577020f, 0.8602070f, 0.8635094f, 0.8675100f, 0.8720999f, 0.8771316f, 0.8824798f, 0.8880285f, 0.8936676f, 0.8993017f, 0.9048529f, 0.9102569f, 0.9154641f, 0.9204388f, 0.9251546f, 0.9295941f, 0.9337514f, 0.9376248f, 0.9412192f, 0.9445453f, 0.9476141f, 0.9504379f, 0.9530329f, 0.9554152f, 0.9576011f, 0.9596084f, 0.9614693f,
+    0.9130047f, 0.9127572f, 0.9120117f, 0.9107643f, 0.9090300f, 0.9067695f, 0.9040443f, 0.9008213f, 0.8971382f, 0.8930602f, 0.8886170f, 0.8838943f, 0.8790001f, 0.8740651f, 0.8692320f, 0.8646365f, 0.8604466f, 0.8568127f, 0.8538486f, 0.8516833f, 0.8503756f, 0.8499633f, 0.8504807f, 0.8518782f, 0.8540964f, 0.8570786f, 0.8607339f, 0.8649476f, 0.8696064f, 0.8746000f, 0.8798267f, 0.8851879f, 0.8905946f, 0.8959719f, 0.9012640f, 0.9064160f, 0.9113848f, 0.9161366f, 0.9206508f, 0.9249150f, 0.9289231f, 0.9326723f, 0.9361705f, 0.9394204f, 0.9424337f, 0.9452246f, 0.9478019f, 0.9501791f, 0.9523309f,
+    0.9087132f, 0.9084792f, 0.9077742f, 0.9065990f, 0.9049603f, 0.9028357f, 0.9002586f, 0.8972292f, 0.8937666f, 0.8899067f, 0.8856891f, 0.8811826f, 0.8764736f, 0.8716622f, 0.8668599f, 0.8621944f, 0.8577960f, 0.8538046f, 0.8503530f, 0.8475297f, 0.8454522f, 0.8441518f, 0.8436984f, 0.8440712f, 0.8452588f, 0.8472326f, 0.8499131f, 0.8532183f, 0.8570655f, 0.8613746f, 0.8660387f, 0.8709654f, 0.8760616f, 0.8812473f, 0.8864532f, 0.8916156f, 0.8966802f, 0.9016045f, 0.9063553f, 0.9109082f, 0.9152480f, 0.9193640f, 0.9232464f, 0.9268962f, 0.9303124f, 0.9335057f, 0.9364804f, 0.9392497f, 0.9418461f,
+    0.9039177f, 0.9036944f, 0.9030221f, 0.9019046f, 0.9003425f, 0.8983279f, 0.8958709f, 0.8929928f, 0.8897063f, 0.8860382f, 0.8820176f, 0.8777020f, 0.8731592f, 0.8684684f, 0.8637252f, 0.8590389f, 0.8545223f, 0.8502921f, 0.8464622f, 0.8431405f, 0.8404342f, 0.8383967f, 0.8371010f, 0.8365621f, 0.8368051f, 0.8377924f, 0.8395100f, 0.8419008f, 0.8448887f, 0.8484018f, 0.8523716f, 0.8567118f, 0.8613321f, 0.8661555f, 0.8711065f, 0.8761163f, 0.8811265f, 0.8860874f, 0.8909521f, 0.8956883f, 0.9002652f, 0.9046617f, 0.9088651f, 0.9128604f, 0.9166435f, 0.9202102f, 0.9235672f, 0.9267132f, 0.9296823f,
+    0.8985965f, 0.8983818f, 0.8977353f, 0.8966634f, 0.8951617f, 0.8932336f, 0.8908807f, 0.8881248f, 0.8849761f, 0.8814620f, 0.8776035f, 0.8734479f, 0.8690498f, 0.8644737f, 0.8598031f, 0.8551259f, 0.8505376f, 0.8461410f, 0.8420397f, 0.8383346f, 0.8351235f, 0.8324799f, 0.8304650f, 0.8291373f, 0.8285119f, 0.8286056f, 0.8293961f, 0.8308713f, 0.8329726f, 0.8356502f, 0.8388506f, 0.8424956f, 0.8465108f, 0.8508234f, 0.8553658f, 0.8600770f, 0.8648851f, 0.8697351f, 0.8745768f, 0.8793629f, 0.8840567f, 0.8886291f, 0.8930578f, 0.8973206f, 0.9014022f, 0.9052973f, 0.9089962f, 0.9125020f, 0.9157907f,
+    0.8927310f, 0.8925229f, 0.8918965f, 0.8908597f, 0.8894046f, 0.8875428f, 0.8852704f, 0.8826121f, 0.8795725f, 0.8761782f, 0.8724495f, 0.8684271f, 0.8641514f, 0.8596794f, 0.8550812f, 0.8504257f, 0.8457960f, 0.8412840f, 0.8369826f, 0.8329809f, 0.8293655f, 0.8262174f, 0.8236094f, 0.8215915f, 0.8202025f, 0.8194759f, 0.8194099f, 0.8200036f, 0.8212266f, 0.8230562f, 0.8254340f, 0.8283104f, 0.8316354f, 0.8353372f, 0.8393503f, 0.8436126f, 0.8480676f, 0.8526564f, 0.8573241f, 0.8620187f, 0.8666994f, 0.8713281f, 0.8758701f, 0.8803008f, 0.8845998f, 0.8887506f, 0.8927387f, 0.8965536f, 0.9001849f,
+    0.8863051f, 0.8861020f, 0.8854905f, 0.8844799f, 0.8830603f, 0.8812469f, 0.8790350f, 0.8764475f, 0.8734940f, 0.8701994f, 0.8665691f, 0.8626491f, 0.8584716f, 0.8540861f, 0.8495462f, 0.8449150f, 0.8402668f, 0.8356712f, 0.8312170f, 0.8269813f, 0.8230446f, 0.8194845f, 0.8163704f, 0.8137615f, 0.8117062f, 0.8102406f, 0.8093914f, 0.8091570f, 0.8095401f, 0.8105179f, 0.8120679f, 0.8141433f, 0.8167111f, 0.8197131f, 0.8230938f, 0.8268016f, 0.8307817f, 0.8349758f, 0.8393288f, 0.8437919f, 0.8483184f, 0.8528652f, 0.8574002f, 0.8618865f, 0.8662950f, 0.8706052f, 0.8747972f, 0.8788567f, 0.8827458f,
+    0.8793061f, 0.8791065f, 0.8785056f, 0.8775134f, 0.8761219f, 0.8743404f, 0.8721741f, 0.8696402f, 0.8667504f, 0.8635201f, 0.8599693f, 0.8561226f, 0.8520192f, 0.8476989f, 0.8432040f, 0.8385938f, 0.8339275f, 0.8292682f, 0.8246923f, 0.8202657f, 0.8160663f, 0.8121644f, 0.8086259f, 0.8055118f, 0.8028749f, 0.8007580f, 0.7991909f, 0.7981950f, 0.7977825f, 0.7979435f, 0.7986690f, 0.7999351f, 0.8017120f, 0.8039581f, 0.8066384f, 0.8096997f, 0.8130917f, 0.8167729f, 0.8206897f, 0.8247917f, 0.8290342f, 0.8333715f, 0.8377659f, 0.8421797f, 0.8465795f, 0.8509415f, 0.8552342f, 0.8594387f, 0.8635456f,
+    0.8717244f, 0.8715269f, 0.8709328f, 0.8699523f, 0.8685790f, 0.8668216f, 0.8646856f, 0.8621829f, 0.8593340f, 0.8561535f, 0.8526515f, 0.8488580f, 0.8448044f, 0.8405272f, 0.8360640f, 0.8314627f, 0.8267756f, 0.8220599f, 0.8173795f, 0.8127965f, 0.8083746f, 0.8041842f, 0.8002838f, 0.7967331f, 0.7935880f, 0.7908931f, 0.7886856f, 0.7869935f, 0.7858367f, 0.7852249f, 0.7851533f, 0.7856144f, 0.7865927f, 0.7880576f, 0.7899837f, 0.7923315f, 0.7950598f, 0.7981318f, 0.8015003f, 0.8051209f, 0.8089497f, 0.8129468f, 0.8170719f, 0.8212840f, 0.8255504f, 0.8298354f, 0.8341127f, 0.8383564f, 0.8425490f,
+    0.8635539f, 0.8633575f, 0.8627667f, 0.8617920f, 0.8604283f, 0.8586836f, 0.8565636f, 0.8540774f, 0.8512557f, 0.8481008f, 0.8446289f, 0.8408661f, 0.8368410f, 0.8325856f, 0.8281338f, 0.8235284f, 0.8188146f, 0.8140429f, 0.8092665f, 0.8045434f, 0.7999320f, 0.7954909f, 0.7912770f, 0.7873498f, 0.7837568f, 0.7805497f, 0.7777672f, 0.7754422f, 0.7736010f, 0.7722609f, 0.7714300f, 0.7711116f, 0.7712979f, 0.7719728f, 0.7731203f, 0.7747100f, 0.7767169f, 0.7791020f, 0.7818344f, 0.7848739f, 0.7881805f, 0.7917145f, 0.7954414f, 0.7993230f, 0.8033207f, 0.8074040f, 0.8115381f, 0.8157023f, 0.8198654f,
+    0.8547920f, 0.8545957f, 0.8540056f, 0.8530311f, 0.8516695f, 0.8499277f, 0.8478110f, 0.8453340f, 0.8425169f, 0.8393730f, 0.8359122f, 0.8321598f, 0.8281437f, 0.8238901f, 0.8194320f, 0.8148062f, 0.8100555f, 0.8052217f, 0.8003534f, 0.7955006f, 0.7907158f, 0.7860519f, 0.7815628f, 0.7772996f, 0.7733128f, 0.7696493f, 0.7663489f, 0.7634487f, 0.7609798f, 0.7589645f, 0.7574190f, 0.7563529f, 0.7557685f, 0.7556625f, 0.7560238f, 0.7568348f, 0.7580790f, 0.7597272f, 0.7617552f, 0.7641291f, 0.7668165f, 0.7697864f, 0.7730021f, 0.7764288f, 0.7800337f, 0.7837847f, 0.7876477f, 0.7915942f, 0.7956033f,
+    0.8454398f, 0.8452427f, 0.8446509f, 0.8436720f, 0.8423057f, 0.8405580f, 0.8384389f, 0.8359540f, 0.8331305f, 0.8299833f, 0.8265140f, 0.8227529f, 0.8187264f, 0.8144563f, 0.8099753f, 0.8053148f, 0.8005139f, 0.7956093f, 0.7906457f, 0.7856674f, 0.7807201f, 0.7758529f, 0.7711136f, 0.7665500f, 0.7622088f, 0.7581350f, 0.7543686f, 0.7509461f, 0.7479021f, 0.7452621f, 0.7430470f, 0.7412734f, 0.7399507f, 0.7390828f, 0.7386666f, 0.7386951f, 0.7391564f, 0.7400352f, 0.7413088f, 0.7429574f, 0.7449515f, 0.7472651f, 0.7498700f, 0.7527349f, 0.7558291f, 0.7591234f, 0.7625869f, 0.7661904f, 0.7699123f,
+    0.8355022f, 0.8353035f, 0.8347075f, 0.8337203f, 0.8323436f, 0.8305839f, 0.8284514f, 0.8259520f, 0.8231067f, 0.8199412f, 0.8164499f, 0.8126653f, 0.8086108f, 0.8043081f, 0.7997849f, 0.7950754f, 0.7902111f, 0.7852267f, 0.7801613f, 0.7750566f, 0.7699523f, 0.7648935f, 0.7599219f, 0.7550831f, 0.7504195f, 0.7459726f, 0.7417821f, 0.7378842f, 0.7343127f, 0.7310957f, 0.7282588f, 0.7258198f, 0.7237954f, 0.7221942f, 0.7210209f, 0.7202755f, 0.7199537f, 0.7200459f, 0.7205387f, 0.7214188f, 0.7226635f, 0.7242551f, 0.7261679f, 0.7283770f, 0.7308576f, 0.7335834f, 0.7365281f, 0.7396632f, 0.7429603f,
+    0.8249874f, 0.8247865f, 0.8241843f, 0.8231854f, 0.8217933f, 0.8200168f, 0.8178601f, 0.8153369f, 0.8124607f, 0.8092637f, 0.8057393f, 0.8019155f, 0.7978173f, 0.7934657f, 0.7888880f, 0.7841128f, 0.7791725f, 0.7740977f, 0.7689239f, 0.7636883f, 0.7584287f, 0.7531832f, 0.7479924f, 0.7428966f, 0.7379341f, 0.7331452f, 0.7285661f, 0.7242323f, 0.7201759f, 0.7164267f, 0.7130114f, 0.7099512f, 0.7072652f, 0.7049659f, 0.7030643f, 0.7015656f, 0.7004706f, 0.6997771f, 0.6994795f, 0.6995669f, 0.7000275f, 0.7008476f, 0.7020074f, 0.7034892f, 0.7052718f, 0.7073335f, 0.7096528f, 0.7122037f, 0.7149673f,
+    0.8139078f, 0.8137041f, 0.8130937f, 0.8120802f, 0.8106700f, 0.8088690f, 0.8066842f, 0.8041276f, 0.8012125f, 0.7979715f, 0.7944034f, 0.7905261f, 0.7863721f, 0.7819580f, 0.7773101f, 0.7724574f, 0.7674282f, 0.7622525f, 0.7569613f, 0.7515901f, 0.7461721f, 0.7407444f, 0.7353419f, 0.7300015f, 0.7247598f, 0.7196520f, 0.7147132f, 0.7099761f, 0.7054732f, 0.7012324f, 0.6972807f, 0.6936413f, 0.6903345f, 0.6873767f, 0.6847815f, 0.6825581f, 0.6807122f, 0.6792471f, 0.6781621f, 0.6774526f, 0.6771118f, 0.6771314f, 0.6774985f, 0.6782003f, 0.6792209f, 0.6805426f, 0.6821485f, 0.6840179f, 0.6861334f,
+    0.8022790f, 0.8020720f, 0.8014519f, 0.8004222f, 0.7989893f, 0.7971584f, 0.7949398f, 0.7923431f, 0.7893814f, 0.7860883f, 0.7824647f, 0.7785235f, 0.7743034f, 0.7698138f, 0.7650849f, 0.7601414f, 0.7550115f, 0.7497242f, 0.7443079f, 0.7387949f, 0.7332168f, 0.7276056f, 0.7219967f, 0.7164211f, 0.7109132f, 0.7055059f, 0.7002310f, 0.6951200f, 0.6902026f, 0.6855066f, 0.6810575f, 0.6768793f, 0.6729932f, 0.6694170f, 0.6661660f, 0.6632535f, 0.6606871f, 0.6584751f, 0.6566198f, 0.6551223f, 0.6539804f, 0.6531900f, 0.6527441f, 0.6526343f, 0.6528491f, 0.6533767f, 0.6542044f, 0.6553157f, 0.6566931f,
+    0.7901203f, 0.7899095f, 0.7892784f, 0.7882303f, 0.7867714f, 0.7849070f, 0.7826486f, 0.7800069f, 0.7769938f, 0.7736386f, 0.7699508f, 0.7659377f, 0.7616404f, 0.7570641f, 0.7522435f, 0.7472000f, 0.7419598f, 0.7365504f, 0.7310021f, 0.7253406f, 0.7195980f, 0.7138042f, 0.7079901f, 0.7021867f, 0.6964234f, 0.6907318f, 0.6851408f, 0.6796795f, 0.6743765f, 0.6692571f, 0.6643467f, 0.6596681f, 0.6552429f, 0.6510893f, 0.6472238f, 0.6436607f, 0.6404118f, 0.6374852f, 0.6348885f, 0.6326251f, 0.6306970f, 0.6291037f, 0.6278433f, 0.6269095f, 0.6262976f, 0.6259994f, 0.6260057f, 0.6263050f, 0.6268855f,
+    0.7774541f, 0.7772392f, 0.7765960f, 0.7755276f, 0.7740401f, 0.7721403f, 0.7698384f, 0.7671453f, 0.7640749f, 0.7606512f, 0.7568921f, 0.7528018f, 0.7484157f, 0.7437455f, 0.7388251f, 0.7336720f, 0.7283121f, 0.7227741f, 0.7170846f, 0.7112702f, 0.7053601f, 0.6993823f, 0.6933653f, 0.6873375f, 0.6813282f, 0.6753641f, 0.6694741f, 0.6636839f, 0.6580199f, 0.6525065f, 0.6471677f, 0.6420254f, 0.6370996f, 0.6324096f, 0.6279716f, 0.6238004f, 0.6199089f, 0.6163077f, 0.6130061f, 0.6100094f, 0.6073230f, 0.6049492f, 0.6028891f, 0.6011395f, 0.5997012f, 0.5985667f, 0.5977320f, 0.5971897f, 0.5969331f,
+    0.7643063f, 0.7640870f, 0.7634307f, 0.7623406f, 0.7608223f, 0.7588841f, 0.7565350f, 0.7537874f, 0.7506544f, 0.7471579f, 0.7433214f, 0.7391478f, 0.7346653f, 0.7298977f, 0.7248680f, 0.7195971f, 0.7141121f, 0.7084387f, 0.7026011f, 0.6966308f, 0.6905491f, 0.6843859f, 0.6781677f, 0.6719210f, 0.6656719f, 0.6594471f, 0.6532719f, 0.6471713f, 0.6411691f, 0.6352884f, 0.6295518f, 0.6239796f, 0.6185908f, 0.6134038f, 0.6084354f, 0.6037000f, 0.5992110f, 0.5949797f, 0.5910157f, 0.5873278f, 0.5839216f, 0.5808018f, 0.5779716f, 0.5754324f, 0.5731839f, 0.5712249f, 0.5695529f, 0.5681638f, 0.5670525f,
+    0.7507055f, 0.7504815f, 0.7498115f, 0.7486984f, 0.7471476f, 0.7451686f, 0.7427703f, 0.7399649f, 0.7367664f, 0.7331928f, 0.7292743f, 0.7250119f, 0.7204283f, 0.7155575f, 0.7104118f, 0.7050168f, 0.6994007f, 0.6935881f, 0.6876030f, 0.6814688f, 0.6752164f, 0.6688678f, 0.6624497f, 0.6559875f, 0.6495056f, 0.6430306f, 0.6365831f, 0.6301887f, 0.6238694f, 0.6176461f, 0.6115399f, 0.6055699f, 0.5997537f, 0.5941101f, 0.5886526f, 0.5833978f, 0.5783571f, 0.5735435f, 0.5689659f, 0.5646342f, 0.5605549f, 0.5567345f, 0.5531769f, 0.5498859f, 0.5468629f, 0.5441090f, 0.5416238f, 0.5394055f, 0.5374492f,
+    0.7366829f, 0.7364542f, 0.7357698f, 0.7346330f, 0.7330492f, 0.7310277f, 0.7285784f, 0.7257129f, 0.7224460f, 0.7187943f, 0.7147885f, 0.7104332f, 0.7057477f, 0.7007670f, 0.6955008f, 0.6899824f, 0.6842323f, 0.6782747f, 0.6721349f, 0.6658405f, 0.6594132f, 0.6528805f, 0.6462654f, 0.6395927f, 0.6328858f, 0.6261687f, 0.6194632f, 0.6127918f, 0.6061743f, 0.5996315f, 0.5931824f, 0.5868448f, 0.5806367f, 0.5745731f, 0.5686695f, 0.5629390f, 0.5573949f, 0.5520484f, 0.5469089f, 0.5419859f, 0.5372872f, 0.5328192f, 0.5285872f, 0.5245953f, 0.5208471f, 0.5173442f, 0.5140880f, 0.5110789f, 0.5083174f,
+    0.7222723f, 0.7220387f, 0.7213397f, 0.7201785f, 0.7185613f, 0.7164965f, 0.7139939f, 0.7110670f, 0.7077302f, 0.7039998f, 0.6999041f, 0.6954538f, 0.6906650f, 0.6855701f, 0.6801844f, 0.6745379f, 0.6686504f, 0.6625477f, 0.6562550f, 0.6497964f, 0.6431968f, 0.6364813f, 0.6296730f, 0.6227953f, 0.6158710f, 0.6089221f, 0.6019711f, 0.5950369f, 0.5881405f, 0.5813008f, 0.5745349f, 0.5678604f, 0.5612930f, 0.5548472f, 0.5485378f, 0.5423771f, 0.5363770f, 0.5305485f, 0.5249009f, 0.5194430f, 0.5141827f, 0.5091264f, 0.5042800f, 0.4996481f, 0.4952344f, 0.4910418f, 0.4870726f, 0.4833279f, 0.4798063f,
+    0.7075094f, 0.7072709f, 0.7065572f, 0.7053713f, 0.7037201f, 0.7016113f, 0.6990562f, 0.6960672f, 0.6926589f, 0.6888491f, 0.6846626f, 0.6801159f, 0.6752233f, 0.6700127f, 0.6645078f, 0.6587310f, 0.6527050f, 0.6464577f, 0.6400120f, 0.6333927f, 0.6266241f, 0.6197287f, 0.6127322f, 0.6056560f, 0.5985225f, 0.5913532f, 0.5841686f, 0.5769890f, 0.5698324f, 0.5627170f, 0.5556598f, 0.5486769f, 0.5417827f, 0.5349917f, 0.5283164f, 0.5217692f, 0.5153610f, 0.5091019f, 0.5030008f, 0.4970661f, 0.4913054f, 0.4857245f, 0.4803292f, 0.4751245f, 0.4701140f, 0.4653014f, 0.4606887f, 0.4562779f, 0.4520714f,
+    0.6924318f, 0.6921884f, 0.6914599f, 0.6902493f, 0.6885640f, 0.6864114f, 0.6838034f, 0.6807522f, 0.6772734f, 0.6733838f, 0.6691069f, 0.6644637f, 0.6594673f, 0.6541419f, 0.6485181f, 0.6426112f, 0.6364514f, 0.6300612f, 0.6234647f, 0.6166867f, 0.6097512f, 0.6026829f, 0.5955035f, 0.5882369f, 0.5809038f, 0.5735255f, 0.5661216f, 0.5587120f, 0.5513140f, 0.5439454f, 0.5366218f, 0.5293586f, 0.5221698f, 0.5150689f, 0.5080675f, 0.5011771f, 0.4944081f, 0.4877696f, 0.4812702f, 0.4749175f, 0.4687181f, 0.4626786f, 0.4568035f, 0.4510978f, 0.4455652f, 0.4402088f, 0.4350314f, 0.4300346f, 0.4252180f,
+    0.6770783f, 0.6768300f, 0.6760869f, 0.6748520f, 0.6731328f, 0.6709375f, 0.6682769f, 0.6651644f, 0.6616153f, 0.6576471f, 0.6532811f, 0.6485426f, 0.6434434f, 0.6380071f, 0.6322641f, 0.6262317f, 0.6199393f, 0.6134085f, 0.6066649f, 0.5997335f, 0.5926381f, 0.5854022f, 0.5780486f, 0.5706006f, 0.5630786f, 0.5555037f, 0.5478955f, 0.5402725f, 0.5326528f, 0.5250524f, 0.5174875f, 0.5099723f, 0.5025205f, 0.4951443f, 0.4878554f, 0.4806645f, 0.4735810f, 0.4666136f, 0.4597703f, 0.4530580f, 0.4464833f, 0.4400511f, 0.4337668f, 0.4276345f, 0.4216573f, 0.4158383f, 0.4101800f, 0.4046841f, 0.3993533f,
+    0.6614889f, 0.6612359f, 0.6604785f, 0.6592200f, 0.6574676f, 0.6552300f, 0.6525180f, 0.6493454f, 0.6457277f, 0.6416825f, 0.6372307f, 0.6323979f, 0.6271986f, 0.6216548f, 0.6157950f, 0.6096418f, 0.6032199f, 0.5965534f, 0.5896692f, 0.5825905f, 0.5753416f, 0.5679463f, 0.5604285f, 0.5528089f, 0.5451104f, 0.5373526f, 0.5295554f, 0.5217370f, 0.5139149f, 0.5061057f, 0.4983244f, 0.4905851f, 0.4829010f, 0.4752841f, 0.4677455f, 0.4602955f, 0.4529428f, 0.4456960f, 0.4385620f, 0.4315478f, 0.4246592f, 0.4179010f, 0.4112776f, 0.4047928f, 0.3984498f, 0.3922510f, 0.3861987f, 0.3802943f, 0.3745384f,
+    0.6457043f, 0.6454466f, 0.6446753f, 0.6433940f, 0.6416095f, 0.6393304f, 0.6365689f, 0.6333380f, 0.6296539f, 0.6255343f, 0.6209998f, 0.6160758f, 0.6107798f, 0.6051324f, 0.5991603f, 0.5928911f, 0.5863449f, 0.5795508f, 0.5725320f, 0.5653134f, 0.5579198f, 0.5503751f, 0.5427022f, 0.5349239f, 0.5270617f, 0.5191360f, 0.5111662f, 0.5031707f, 0.4951670f, 0.4871714f, 0.4791986f, 0.4712631f, 0.4633776f, 0.4555538f, 0.4478024f, 0.4401335f, 0.4325559f, 0.4250771f, 0.4177046f, 0.4104442f, 0.4033017f, 0.3962815f, 0.3893878f, 0.3826240f, 0.3759929f, 0.3694965f, 0.3631369f, 0.3569154f, 0.3508323f,
+    0.6297652f, 0.6295031f, 0.6287184f, 0.6274151f, 0.6255998f, 0.6232815f, 0.6204722f, 0.6171855f, 0.6134374f, 0.6092466f, 0.6046333f, 0.5996218f, 0.5942335f, 0.5884874f, 0.5824097f, 0.5760295f, 0.5693668f, 0.5624514f, 0.5553057f, 0.5479560f, 0.5404276f, 0.5327441f, 0.5249291f, 0.5170050f, 0.5089933f, 0.5009155f, 0.4927905f, 0.4846373f, 0.4764730f, 0.4683139f, 0.4601753f, 0.4520712f, 0.4440145f, 0.4360167f, 0.4280887f, 0.4202402f, 0.4124798f, 0.4048153f, 0.3972536f, 0.3898009f, 0.3824620f, 0.3752418f, 0.3681437f, 0.3611716f, 0.3543273f, 0.3476132f, 0.3410309f, 0.3345811f, 0.3282661f,
+    0.6137126f, 0.6134462f, 0.6126489f, 0.6113247f, 0.6094799f, 0.6071243f, 0.6042695f, 0.6009298f, 0.5971215f, 0.5928631f, 0.5881752f, 0.5830813f, 0.5776057f, 0.5717669f, 0.5655905f, 0.5591056f, 0.5523350f, 0.5453058f, 0.5380428f, 0.5305732f, 0.5229208f, 0.5151103f, 0.5071656f, 0.4991094f, 0.4909644f, 0.4827509f, 0.4744890f, 0.4661976f, 0.4578942f, 0.4495953f, 0.4413163f, 0.4330710f, 0.4248729f, 0.4167336f, 0.4086638f, 0.4006736f, 0.3927714f, 0.3849652f, 0.3772618f, 0.3696671f, 0.3621867f, 0.3548249f, 0.3475852f, 0.3404711f, 0.3334851f, 0.3266288f, 0.3199040f, 0.3133119f, 0.3068537f,
+};
+
+float CompensatedGgxSingleScatterAlbedo(float roughness, float NoV) {
+    float x = std::clamp(roughness, 0.0f, 1.0f) * 48.0f;
+    float y = std::sqrt(std::clamp(NoV, 0.0f, 1.0f)) * 48.0f;
+    unsigned i = std::min(static_cast<unsigned>(x), 47u);
+    unsigned j = std::min(static_cast<unsigned>(y), 47u);
+    float tx = x - float(i);
+    float ty = y - float(j);
+    unsigned k = i * 49u + j;
+    float a = kGgxSingleScatterAlbedo[k] * (1.0f - ty) + kGgxSingleScatterAlbedo[k + 1u] * ty;
+    float b = kGgxSingleScatterAlbedo[k + 49u] * (1.0f - ty) + kGgxSingleScatterAlbedo[k + 50u] * ty;
+    return a * (1.0f - tx) + b * tx;
 }
 
+// Mirrors specular_energy_compensation.
 simd::float3 SpecularEnergyCompensation(const simd::float3& f0,
                                         float roughness,
                                         float NoV) {
-    float NoVClamped = std::clamp(NoV, 0.0f, 1.0f);
-    simd::float2 dfg = DfgApprox(roughness, NoVClamped);
-    simd::float3 Fss = simd::clamp(f0 * dfg.x + dfg.y,
-                                   simd_make_float3(0.0f, 0.0f, 0.0f),
-                                   simd_make_float3(0.99f, 0.99f, 0.99f));
-    simd::float3 Favg = f0 + (simd_make_float3(1.0f, 1.0f, 1.0f) - f0) * (1.0f / 21.0f);
-    simd::float3 oneMinusFss = simd::clamp(simd_make_float3(1.0f, 1.0f, 1.0f) - Fss,
-                                           simd_make_float3(0.0f, 0.0f, 0.0f),
-                                           simd_make_float3(1.0f, 1.0f, 1.0f));
-    simd::float3 denom = simd::max(simd_make_float3(1.0f, 1.0f, 1.0f) - Favg * oneMinusFss,
-                                   simd_make_float3(1.0e-3f, 1.0e-3f, 1.0e-3f));
-    simd::float3 Fms = (Favg * oneMinusFss) / denom;
-    simd::float3 scale = (Fss + Fms) / simd::max(Fss, simd_make_float3(1.0e-4f, 1.0e-4f, 1.0e-4f));
-    return simd::clamp(scale,
-                       simd_make_float3(1.0f, 1.0f, 1.0f),
-                       simd_make_float3(2.0f, 2.0f, 2.0f));
+    float Ess = std::clamp(CompensatedGgxSingleScatterAlbedo(roughness, NoV), 1.0e-4f, 1.0f);
+    float Ems = 1.0f - Ess;
+    simd::float3 one = simd_make_float3(1.0f, 1.0f, 1.0f);
+    simd::float3 Favg = f0 + (one - f0) * (1.0f / 21.0f);
+    return simd::clamp(one / simd::max(one - Ems * Favg,
+                                     simd_make_float3(1.0e-4f, 1.0e-4f, 1.0e-4f)),
+                       one, simd_make_float3(4.0f, 4.0f, 4.0f));
 }
 
 simd::float3 FresnelConductor(float cosThetaI, const simd::float3& eta, const simd::float3& k) {
@@ -1533,9 +1491,10 @@ simd::float3 FresnelConductor(float cosThetaI, const simd::float3& eta, const si
     simd::float3 term3 = simd_make_float3(cos2, cos2, cos2) * a2plusb2 +
                          simd_make_float3(sin2 * sin2, sin2 * sin2, sin2 * sin2);
     simd::float3 term4 = term2 * simd_make_float3(sin2, sin2, sin2);
-    simd::float3 rp = (term3 - term4) / (term3 + term4);
+    // Mirrors fresnel_conductor (closures_eval.metal): rs and rp are reflectances.
+    simd::float3 rp = rs * (term3 - term4) / (term3 + term4);
 
-    return simd::clamp(0.5f * (rs * rs + rp * rp),
+    return simd::clamp(0.5f * (rs + rp),
                        simd_make_float3(0.0f, 0.0f, 0.0f),
                        simd_make_float3(1.0f, 1.0f, 1.0f));
 }
@@ -1565,7 +1524,20 @@ float GgxDistribution(float alpha, float cosThetaH) {
     return a2 / (kPi * denom * denom);
 }
 
-float GgxPdf(float alpha, const simd::float3& normal, const simd::float3& wo, const simd::float3& wi) {
+// The same D, taking sin^2(theta_h) from the half vector. In float32 the
+// cosine form cannot resolve lobes near the PBR alpha floor (1e-4):
+// cos(theta_h) rounds to 1 below theta_h = 2.4e-4 rad, and a2 - 1 rounds to
+// -1 below alpha = 1.7e-4, so D steps between a few values or is inf there.
+float GgxDistribution(float alpha, const simd::float3& normal, const simd::float3& wh) {
+    float cosThetaH = simd::dot(normal, wh);
+    float sin2ThetaH = simd::length_squared(simd::cross(normal, wh));
+    float a2 = alpha * alpha;
+    float denom = sin2ThetaH + a2 * cosThetaH * cosThetaH;
+    return (denom > 0.0f) ? a2 / (kPi * denom * denom) : 0.0f;
+}
+
+float GgxPdf(float alpha, const simd::float3& normal, const simd::float3& wo, const simd::float3& wi,
+             bool halfVectorD = false) {
     simd::float3 wh = simd::normalize(wo + wi);
     float cosThetaH = simd::dot(normal, wh);
     float cosThetaO = simd::dot(normal, wo);
@@ -1574,39 +1546,24 @@ float GgxPdf(float alpha, const simd::float3& normal, const simd::float3& wo, co
         return 0.0f;
     }
     float denom = 4.0f * std::max(dotWoWh, 1.0e-6f);
-    float d = GgxDistribution(alpha, std::max(cosThetaH, 0.0f));
+    float d = halfVectorD ? GgxDistribution(alpha, normal, wh)
+                          : GgxDistribution(alpha, std::max(cosThetaH, 0.0f));
     float g1 = GgxG1(alpha, cosThetaO);
     return d * g1 * std::max(cosThetaH, 0.0f) / denom;
 }
 
-float GgxVndfPdf(float alpha, const simd::float3& normal, const simd::float3& wo, const simd::float3& wh) {
+float GgxVndfPdf(float alpha, const simd::float3& normal, const simd::float3& wo, const simd::float3& wh,
+                 bool halfVectorD = false) {
     float cosThetaO = simd::dot(normal, wo);
     float cosThetaH = simd::dot(normal, wh);
-    if (cosThetaO <= 0.0f || cosThetaH <= 0.0f) {
+    float woDotWh = simd::dot(wo, wh);
+    if (cosThetaO <= 0.0f || cosThetaH <= 0.0f || woDotWh <= 0.0f) {
         return 0.0f;
     }
-    float denom = std::max(simd::dot(wo, wh), 1.0e-6f);
-    float d = GgxDistribution(alpha, cosThetaH);
+    // Density of the visible-normal half vector: D * G1(wo) * (wo.wh) / cos(theta_o).
+    float d = halfVectorD ? GgxDistribution(alpha, normal, wh) : GgxDistribution(alpha, cosThetaH);
     float g1 = GgxG1(alpha, cosThetaO);
-    return d * g1 * cosThetaH / denom;
-}
-
-float GgxNdfPdf(float alpha, const simd::float3& normal, const simd::float3& wh) {
-    float cosThetaH = std::max(simd::dot(normal, wh), 0.0f);
-    return GgxDistribution(alpha, cosThetaH) * cosThetaH;
-}
-
-simd::float3 SampleGgxHalfVector(Rng& rng, float alpha, const simd::float3& n) {
-    float u1 = rng.nextFloat();
-    float u2 = rng.nextFloat();
-    float phi = 2.0f * kPi * u1;
-    float denom = 1.0f + (alpha * alpha - 1.0f) * u2;
-    float cosTheta = std::sqrt(std::max((1.0f - u2) / std::max(denom, 1.0e-6f), 0.0f));
-    float sinTheta = std::sqrt(std::max(0.0f, 1.0f - cosTheta * cosTheta));
-    simd::float3 local = {std::cos(phi) * sinTheta, std::sin(phi) * sinTheta, cosTheta};
-    Onb onb = BuildOnb(n);
-    simd::float3 h = local.x * onb.tangent + local.y * onb.bitangent + local.z * onb.normal;
-    return simd::normalize(h);
+    return d * g1 * woDotWh / cosThetaO;
 }
 
 simd::float3 ToLocal(const simd::float3& v, const Onb& onb) {
@@ -1617,6 +1574,20 @@ simd::float3 ToLocal(const simd::float3& v, const Onb& onb) {
 
 simd::float3 ToWorld(const simd::float3& v, const Onb& onb) {
     return v.x * onb.tangent + v.y * onb.bitangent + v.z * onb.normal;
+}
+
+// A uniform direction in a finite sun's cone, as Metal's sample_directional_cone.
+// A delta sun keeps its direction and does not consume random numbers.
+simd::float3 SampleDirectionalCone(const simd::float3& axis, float cosDelta, Rng& rng) {
+    if (!(cosDelta > 0.0f)) {
+        return axis;
+    }
+    const float delta = rng.nextFloat() * cosDelta;
+    const float cosine = 1.0f - delta;
+    const float sine = std::sqrt(std::max(delta * (2.0f - delta), 0.0f));
+    const float phi = 2.0f * kPi * rng.nextFloat();
+    return simd::normalize(ToWorld(simd_make_float3(sine * std::cos(phi), sine * std::sin(phi), cosine),
+                                   BuildOnb(axis)));
 }
 
 simd::float3 SampleGgxVndf(Rng& rng, float roughness, const simd::float3& normal, const simd::float3& wo) {
@@ -1655,10 +1626,6 @@ bool IsFinite(const simd::float3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
 
-bool IsFinite2(const simd::float2& value) {
-    return std::isfinite(value.x) && std::isfinite(value.y);
-}
-
 bool IsFinite4(const simd::float4& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) &&
            std::isfinite(value.z) && std::isfinite(value.w);
@@ -1692,18 +1659,28 @@ PathTracerShaderTypes::MaterialData ShadeMaterialForHit(const EmbreeSceneData& s
                                                         const PathTracerShaderTypes::MaterialData& material,
                                                         const HitInfo& hit,
                                                         float debugNormalStrengthScale,
-                                                        float surfaceFootprintWorld);
+                                                        float surfaceFootprintWorld,
+                                                        bool normalVarianceRoughness = true,
+                                                        float textureLodBias = 0.0f,
+                                                        bool disableOrmTexture = false,
+                                                        float* debugMetallic = nullptr,
+                                                        float* debugRoughness = nullptr,
+                                                        float* debugAO = nullptr);
 simd::float3 ApplyNormalMapForHit(const EmbreeSceneData& sceneData,
                                   const PathTracerShaderTypes::MaterialData& material,
                                   const HitInfo& hit,
                                   const simd::float3& shadingNormal,
+                                  const simd::float3& incidentDir,
                                   float debugNormalStrengthScale,
-                                  float surfaceFootprintWorld);
+                                  float surfaceFootprintWorld,
+                                  float textureLodBias = 0.0f,
+                                  bool flipNormalGreen = false);
 float ApplyNormalVarianceToRoughness(const EmbreeSceneData& sceneData,
                                      const PathTracerShaderTypes::MaterialData& material,
                                      const HitInfo& hit,
                                      float debugNormalStrengthScale,
-                                     float surfaceFootprintWorld);
+                                     float surfaceFootprintWorld,
+                                     float textureLodBias = 0.0f);
 simd::float3 PlasticDiffuseTransmission(const PathTracerShaderTypes::MaterialData& material,
                                         float cosThetaI,
                                         float cosThetaO);
@@ -1713,29 +1690,26 @@ float MaterialRoughness(const PathTracerShaderTypes::MaterialData& material) {
     return std::max(roughness, 1.0e-3f);
 }
 
-float EnvironmentLightingRoughness(const PathTracerShaderTypes::MaterialData& material) {
-    const uint32_t type = static_cast<uint32_t>(material.typeEta.x);
-    switch (static_cast<PathTracerShaderTypes::MaterialType>(type)) {
-        case PathTracerShaderTypes::MaterialType::Metal:
-        case PathTracerShaderTypes::MaterialType::PbrMetallicRoughness:
-            return std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f);
-        case PathTracerShaderTypes::MaterialType::Plastic:
-            return std::clamp(std::max(material.coatParams.x, 1.0e-3f), 0.0f, 1.0f);
-        case PathTracerShaderTypes::MaterialType::CarPaint:
-            return std::clamp(material.pbrParams.y, 0.0f, 1.0f);
-        default:
-            return 1.0f;
-    }
-}
-
 float DielectricF0(float ior) {
     float eta = std::max(ior, 1.0f);
     float r = (eta - 1.0f) / (eta + 1.0f);
     return r * r;
 }
 
-bool IsThinDielectric(const PathTracerShaderTypes::MaterialData& material) {
-    return material.typeEta.w > 0.5f;
+// Matches Metal pbr_thin_walled_transmission: glTF transmission without a volume
+// is a thin sheet (no refraction, outside IOR on both faces). Tagged reference
+// materials keep their refracting convention.
+bool ThinWalledPbrTransmission(const PathTracerShaderTypes::MaterialData& material) {
+    return static_cast<uint32_t>(material.typeEta.x) == 7u &&
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagThinWalledTransmission) != 0u &&
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) == 0u;
+}
+
+// Matches Metal pbr_thin_walled_transmission_nee_supported: light sampling may
+// connect through the rough (non-delta) thin-walled BTDF.
+bool ThinWalledPbrTransmissionNee(const PathTracerShaderTypes::MaterialData& material) {
+    return ThinWalledPbrTransmission(material) && material.pbrExtras.z > 0.0f &&
+        material.pbrParams.x < 1.0f && material.baseColorRoughness.w > 1.0e-3f;
 }
 
 simd::float3 DielectricSigmaA(const PathTracerShaderTypes::MaterialData& material) {
@@ -1745,17 +1719,18 @@ simd::float3 DielectricSigmaA(const PathTracerShaderTypes::MaterialData& materia
                      simd_make_float3(0.0f, 0.0f, 0.0f));
 }
 
+// Matches Metal transmission_tint: the type-7 BTDF is tinted by the resolved
+// base color per crossing, times KHR_materials_volume absorption over its thickness.
 simd::float3 DielectricTransmissionTint(const PathTracerShaderTypes::MaterialData& material,
                                         float cosTheta) {
-    if (!IsThinDielectric(material)) {
-        return simd_make_float3(1.0f, 1.0f, 1.0f);
-    }
+    const simd::float3 surfaceTint = MaterialBaseColor(material);
+    const float thickness = std::max(material.typeEta.w, 0.0f);
     simd::float3 sigmaA = DielectricSigmaA(material);
-    if (sigmaA.x <= 1.0e-6f && sigmaA.y <= 1.0e-6f && sigmaA.z <= 1.0e-6f) {
-        return simd_make_float3(1.0f, 1.0f, 1.0f);
+    if (thickness <= 0.0f || (sigmaA.x <= 0.0f && sigmaA.y <= 0.0f && sigmaA.z <= 0.0f)) {
+        return surfaceTint;
     }
-    float distance = 1.0f / std::max(std::fabs(cosTheta), 1.0e-3f);
-    return Clamp01(Exp3(-sigmaA * distance));
+    float distance = thickness / std::max(std::fabs(cosTheta), 1.0e-3f);
+    return surfaceTint * Clamp01(Exp3(-sigmaA * distance));
 }
 
 float PlasticCoatIor(const PathTracerShaderTypes::MaterialData& material) {
@@ -1769,10 +1744,6 @@ float PlasticCoatRoughness(const PathTracerShaderTypes::MaterialData& material) 
 
 float PlasticCoatThickness(const PathTracerShaderTypes::MaterialData& material) {
     return std::max(material.coatParams.y, 0.0f);
-}
-
-float PlasticCoatSampleWeight(const PathTracerShaderTypes::MaterialData& material) {
-    return std::clamp(material.coatParams.z, 0.0f, 1.0f);
 }
 
 float PlasticCoatFresnelAverage(const PathTracerShaderTypes::MaterialData& material) {
@@ -1789,46 +1760,6 @@ float SssMeanFreePath(const PathTracerShaderTypes::MaterialData& material) {
 
 bool SssHasSigmaOverride(const PathTracerShaderTypes::MaterialData& material) {
     return material.sssSigmaA.w > 0.5f;
-}
-
-simd::float3 SssSigmaA(const PathTracerShaderTypes::MaterialData& material) {
-    simd::float3 baseColor = MaterialBaseColor(material);
-    float meanFreePath = SssMeanFreePath(material);
-    float anisotropy = SssAnisotropy(material);
-    if (SssHasSigmaOverride(material)) {
-        return simd::max(simd_make_float3(material.sssSigmaA.x,
-                                          material.sssSigmaA.y,
-                                          material.sssSigmaA.z),
-                         simd_make_float3(1.0e-6f, 1.0e-6f, 1.0e-6f));
-    }
-    float sigmaT = 1.0f / meanFreePath;
-    simd::float3 sigmaS = Clamp01(baseColor) * sigmaT;
-    sigmaS *= std::max(1.0f - anisotropy, 0.01f);
-    return simd::max(simd_make_float3(sigmaT, sigmaT, sigmaT) - sigmaS,
-                     simd_make_float3(1.0e-6f, 1.0e-6f, 1.0e-6f));
-}
-
-simd::float3 SssDiffuseColor(const PathTracerShaderTypes::MaterialData& material,
-                             float cosThetaI,
-                             float cosThetaO) {
-    simd::float3 baseColor = MaterialBaseColor(material);
-    float meanFreePath = SssMeanFreePath(material);
-    simd::float3 sigmaA = SssSigmaA(material);
-    const float travelScale = LoadEmbreeSssTravelScale();
-
-    // Embree remains an oracle approximation here: use absorption over a
-    // representative travel distance to keep SSS materials darker and more
-    // saturated than a pure Lambert fallback.
-    const float travel = std::max(meanFreePath * travelScale, 1.0e-4f);
-    simd::float3 transmission = Exp3(-sigmaA * travel);
-    simd::float3 diffuse = baseColor * transmission;
-
-    if (material.sssParams.z > 0.5f) {
-        diffuse *= PlasticDiffuseTransmission(material, cosThetaI, cosThetaO);
-        diffuse *= std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f);
-    }
-
-    return Clamp01(diffuse);
 }
 
 simd::float3 PlasticCoatTint(const PathTracerShaderTypes::MaterialData& material) {
@@ -1874,6 +1805,39 @@ simd::float3 PlasticDiffuseTransmission(const PathTracerShaderTypes::MaterialDat
     return Clamp01(tint * attenI * attenO);
 }
 
+// A vector with every component v. (simd_make_float3 with one scalar argument zero-extends it: (v, 0, 0).)
+simd::float3 Splat3(float v) {
+    return simd_make_float3(v, v, v);
+}
+
+// Metal's plastic_coat_crossing: one pass through the coat's absorbing layer at angle cosTheta.
+simd::float3 PlasticCoatCrossing(const PathTracerShaderTypes::MaterialData& material, float cosTheta) {
+    const float thickness = PlasticCoatThickness(material);
+    if (thickness <= 0.0f) {
+        return Splat3(1.0f);
+    }
+    return Exp3(-PlasticCoatAbsorption(material) * (thickness / std::max(cosTheta, 1.0e-3f)));
+}
+
+// Metal's subsurface_has_coat.
+bool SubsurfaceHasCoat(const PathTracerShaderTypes::MaterialData& material) {
+    return material.sssParams.z > 0.5f;
+}
+
+// Metal's subsurface_dense_limit_material: what a subsurface surface is as its mean free path vanishes, a diffuse
+// surface of its base colour, under its coat when it has one (the plastic closure, with the scene's coatIOR, which
+// the loader keeps in typeEta.z; typeEta.y is the material ior, which the walk does not use).
+PathTracerShaderTypes::MaterialData SubsurfaceDenseLimitMaterial(const PathTracerShaderTypes::MaterialData& material) {
+    PathTracerShaderTypes::MaterialData dense = material;
+    if (SubsurfaceHasCoat(material)) {
+        dense.typeEta.x = static_cast<float>(PathTracerShaderTypes::MaterialType::Plastic);
+        dense.typeEta.y = std::max(material.typeEta.z, 1.0f);
+    } else {
+        dense.typeEta.x = static_cast<float>(PathTracerShaderTypes::MaterialType::Lambertian);
+    }
+    return dense;
+}
+
 float CarpaintBaseMetallic(const PathTracerShaderTypes::MaterialData& material) {
     return std::clamp(material.carpaintBaseParams.x, 0.0f, 1.0f);
 }
@@ -1886,8 +1850,9 @@ float CarpaintFlakeScale(const PathTracerShaderTypes::MaterialData& material) {
     return std::max(material.carpaintBaseParams.z, 1.0e-4f);
 }
 
-float CarpaintFlakeSampleWeight(const PathTracerShaderTypes::MaterialData& material) {
-    return std::clamp(material.carpaintFlakeParams.x, 0.0f, 0.95f);
+// Effective flake coverage of the CarPaint under-layer (see CarpaintClosureEval).
+float CarpaintFlakeCoverage(const PathTracerShaderTypes::MaterialData& material) {
+    return std::clamp(material.carpaintFlakeParams.x, 0.0f, 1.0f);
 }
 
 float CarpaintFlakeRoughness(const PathTracerShaderTypes::MaterialData& material) {
@@ -1900,10 +1865,6 @@ float CarpaintFlakeAnisotropy(const PathTracerShaderTypes::MaterialData& materia
 
 float CarpaintFlakeNormalStrength(const PathTracerShaderTypes::MaterialData& material) {
     return std::clamp(material.carpaintFlakeParams.w, 0.0f, 1.0f);
-}
-
-float CarpaintCoatSampleWeight(const PathTracerShaderTypes::MaterialData& material) {
-    return std::clamp(material.coatParams.z, 0.0f, 0.95f);
 }
 
 bool CarpaintHasBaseConductor(const PathTracerShaderTypes::MaterialData& material) {
@@ -1986,10 +1947,55 @@ simd::float3 ConductorF0(const PathTracerShaderTypes::MaterialData& material) {
     return MaterialBaseColor(material);
 }
 
+// Path regularization for dielectrics flagged kMaterialFlagRegularizedDielectric
+// (as Metal): once a path has scattered off a rough surface, the smooth interface
+// is treated as rough GGX with the path's maximum roughness, so the sun and small
+// lights become reachable through it (a pool floor lit through the water surface).
+// The integrator applies this to its material copy: baseColorRoughness.w holds the
+// regularized roughness and typeEta.y the relative IOR across the interface (far
+// side over incident side).
+bool MaterialIsRegularizedDielectric(const PathTracerShaderTypes::MaterialData& material) {
+    return static_cast<uint32_t>(material.typeEta.x) ==
+               static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric) &&
+           (material.materialFlags & PathTracerShaderTypes::kMaterialFlagRegularizedDielectric) != 0u &&
+           material.baseColorRoughness.w > 0.0f;
+}
+
+void RegularizeDielectricMaterial(PathTracerShaderTypes::MaterialData& material,
+                                  bool frontFace,
+                                  float pathRoughness) {
+    if (pt_shared::source_model(material) == 3.0f) {
+        pt_shared::source_regularize_dielectric(material, frontFace);  // as Metal's regularize_dielectric_material
+        return;
+    }
+    if (static_cast<uint32_t>(material.typeEta.x) !=
+            static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric) ||
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagRegularizedDielectric) == 0u ||
+        material.typeEta.w > 0.5f ||
+        !(pathRoughness > 0.0f)) {
+        return;
+    }
+    const float ior = std::max(material.typeEta.y, 1.0f);
+    material.typeEta.y = frontFace ? ior : 1.0f / ior;
+    material.baseColorRoughness.w = std::min(pathRoughness, 1.0f);
+}
+
+// Roughness a non-delta scattering event contributes to path regularization.
+float PathRegularizationRoughness(const PathTracerShaderTypes::MaterialData& material) {
+    return static_cast<uint32_t>(material.typeEta.x) ==
+               static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Lambertian)
+        ? 1.0f
+        : std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f);
+}
+
 bool MaterialIsDelta(const PathTracerShaderTypes::MaterialData& material) {
+    if (pt_shared::source_model(material) > 0.0f) {
+        // Metal's material_is_delta for a source closure (closures_eval.metal).
+        return !pt_shared::source_never_delta(material) && pt_shared::source_has_delta_lobe(material);
+    }
     const uint32_t type = static_cast<uint32_t>(material.typeEta.x);
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric)) {
-        return true;
+        return !MaterialIsRegularizedDielectric(material);
     }
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Metal)) {
         return MaterialRoughness(material) <= 1.0e-3f;
@@ -2006,16 +2012,55 @@ bool MaterialUsesGeometricNormal(const PathTracerShaderTypes::MaterialData& mate
     return type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric);
 }
 
-bool MaterialAlphaMaskDiscards(const PathTracerShaderTypes::MaterialData& material) {
+// Metal's path-ray alpha test (path_integrators.metal): MASK compares alpha with its cutoff. BLEND is stochastic
+// coverage: alpha, read at mip 0 as the shadow test reads it, is the probability that the ray stops.
+bool PathRayAlphaDiscards(const PathTracerShaderTypes::MaterialData& material, Rng& rng) {
     const float alphaMode = material.pbrExtras.w;
     if (!(alphaMode > 0.5f)) {
         return false;
     }
     const float alpha = std::clamp(material.pbrExtras.x, 0.0f, 1.0f);
-    const float cutoff = (alphaMode < 1.5f)
-        ? std::clamp(material.pbrExtras.y, 0.0f, 1.0f)
-        : 0.5f;
-    return alpha < cutoff;
+    if (alphaMode < 1.5f) {
+        return alpha < std::clamp(material.pbrExtras.y, 0.0f, 1.0f);
+    }
+    return rng.nextFloat() > alpha;
+}
+
+// Metal's shadow_blend_alpha_sample: a hash of the hit, so a shadow ray passes a BLEND texel with probability
+// 1 - alpha, as a path ray does, without drawing from the path's RNG stream. Embree has no frame index here; the hit's
+// barycentrics and distance change with every jittered sample.
+float ShadowBlendAlphaSample(const HitInfo& hit) {
+    uint32_t h = pt_shared::pcg_hash(hit.primitiveIndex);
+    h = pt_shared::pcg_hash(h ^ hit.meshIndex);
+    h = pt_shared::pcg_hash(h ^ std::bit_cast<uint32_t>(hit.position.x));
+    h = pt_shared::pcg_hash(h ^ std::bit_cast<uint32_t>(hit.position.y));
+    h = pt_shared::pcg_hash(h ^ std::bit_cast<uint32_t>(hit.position.z));
+    return static_cast<float>(h >> 8u) * (1.0f / 16777216.0f);
+}
+
+// Metal's shadow-ray alpha test (shadow_hit_alpha_cutout_discarded): MASK compares alpha with its cutoff, which
+// referencePunctualShadow raises to 1 for SingleScatterSpecular blockers of point and sun rays. BLEND lets light
+// through a fully transparent texel always, and through a partly transparent one with probability 1 - alpha
+// (blendSample is uniform in [0, 1)).
+bool ShadowRayAlphaDiscards(const PathTracerShaderTypes::MaterialData& material, const bool referencePunctualShadow,
+                            const float blendSample) {
+    const float alphaMode = material.pbrExtras.w;
+    if (!(alphaMode > 0.5f)) {
+        return false;
+    }
+    const float alpha = std::clamp(material.pbrExtras.x, 0.0f, 1.0f);
+    if (alphaMode < 1.5f) {
+        const bool sourceMask = referencePunctualShadow &&
+            (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u;
+        return alpha < (sourceMask ? 1.0f : std::clamp(material.pbrExtras.y, 0.0f, 1.0f));
+    }
+    return alpha <= 0.0f || (alpha < 1.0f && blendSample >= alpha);
+}
+
+bool PavilionPunctualShadowEnabled(const PathTracerShaderTypes::MaterialData& receiver,
+                                   const bool punctual) {
+    return punctual &&
+        (receiver.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u;
 }
 
 float PbrSpecularWeight(const simd::float3& f0) {
@@ -2027,13 +2072,6 @@ float LambertPdf(const simd::float3& normal, const simd::float3& direction) {
     simd::float3 unit = simd::normalize(direction);
     float cosTheta = std::max(simd::dot(normal, unit), 0.0f);
     return cosTheta > 0.0f ? (cosTheta / kPi) : 0.0f;
-}
-
-float PowerHeuristic(float pdfA, float pdfB) {
-    float pdfA2 = pdfA * pdfA;
-    float pdfB2 = pdfB * pdfB;
-    float denom = pdfA2 + pdfB2;
-    return denom > 0.0f ? (pdfA2 / denom) : 0.0f;
 }
 
 float EnvironmentPdf(const EnvironmentMap& env, float rotation, const simd::float3& direction) {
@@ -2066,7 +2104,30 @@ float EnvironmentPdf(const EnvironmentMap& env, float rotation, const simd::floa
     return (std::isfinite(value) && value > 0.0f) ? value : 0.0f;
 }
 
-simd::float3 OffsetRayOrigin(const HitInfo& hit, const simd::float3& direction) {
+// EP8d: source transport (renderer sourceTransport=1; the Bitterli presets). Metal's wavefront spawns every bounce
+// and shadow ray at offset_interface_origin with tMin = source_ray_epsilon (sourceRayEpsilon, or 1e-6), excludes only
+// the spawning triangle, and stops a shadow ray 1e-6 short of a light (tracing/visibility.metal,
+// wavefront/kernels.metal). Set once per render from the settings; read by the spawn and shadow helpers.
+struct SourceTransportPolicy {
+    bool enabled = false;
+    float epsilon = 1.0e-6f;
+};
+SourceTransportPolicy gSourceTransport;
+
+// Metal's offset_interface_origin: four float ULPs of the point (at least 0.1 micrometre) along the geometric normal,
+// on the side the ray leaves, plus 1e-7 along the ray. The side times the normal does not depend on the normal's
+// facing, so Embree's unfaced geometric normal gives the same point.
+simd::float3 InterfaceOrigin(const HitInfo& hit, const simd::float3& direction) {
+    const simd::float3 n = hit.normal;
+    const float side = simd::dot(direction, n) >= 0.0f ? 1.0f : -1.0f;
+    const simd::float3 step = simd::max(simd::fabs(hit.position) * (4.0f * 1.1920928955078125e-7f),
+                                        simd_make_float3(1.0e-7f, 1.0e-7f, 1.0e-7f));
+    return hit.position + side * step * n + direction * 1.0e-7f;
+}
+
+// Metal's offset_ray_origin: the spawn of every ray when source transport is off, and of the PBR alpha pass-through
+// ray under it too (kernels.metal keeps it with kEpsilon there).
+simd::float3 LegacyOffsetRayOrigin(const HitInfo& hit, const simd::float3& direction) {
     simd::float3 normal = hit.shadingNormal;
     if (simd::dot(normal, normal) <= 0.0f) {
         normal = hit.normal;
@@ -2082,6 +2143,10 @@ simd::float3 OffsetRayOrigin(const HitInfo& hit, const simd::float3& direction) 
     return origin;
 }
 
+simd::float3 OffsetRayOrigin(const HitInfo& hit, const simd::float3& direction) {
+    return gSourceTransport.enabled ? InterfaceOrigin(hit, direction) : LegacyOffsetRayOrigin(hit, direction);
+}
+
 struct RectLightSample {
     simd::float3 direction{0.0f, 0.0f, 0.0f};
     float distance = 0.0f;
@@ -2091,6 +2156,7 @@ struct RectLightSample {
     uint32_t lightIndex = 0;
     float area = 0.0f;
     float cosLight = 0.0f;
+    bool isReferencePoint = false;
 };
 
 struct RectLightHit {
@@ -2098,9 +2164,22 @@ struct RectLightHit {
     float pdf = 0.0f;
 };
 
-struct CarpaintLobeResult {
+struct CarpaintLobeProbabilities {
+    float coat = 0.0f;
+    float flake = 0.0f;
+    float diffuse = 0.0f;
+    float metal = 0.0f;
+};
+
+// A closure (or one of its lobes) evaluated for a direction pair: its value f and the pdf its sampler draws wi with.
+struct ClosureValuePdf {
     simd::float3 value{0.0f, 0.0f, 0.0f};
     float pdf = 0.0f;
+};
+
+struct PlasticLobeProbabilities {
+    float coat = 0.0f;
+    float diffuse = 0.0f;
 };
 
 struct DirectDebugConfig {
@@ -2146,6 +2225,47 @@ DirectDebugConfig LoadDirectDebugConfig(const PathTracer::RenderSettings& settin
     return cfg;
 }
 
+bool ExactReferencePointLight(const RectLightInfo& light) {
+    return light.isReferencePoint && light.jitterRadius == 0.0f;
+}
+
+uint32_t CountAnalyticLights(const std::vector<RectLightInfo>& lights, bool excludeExactPoints = false) {
+    if (!excludeExactPoints) {
+        return static_cast<uint32_t>(lights.size());
+    }
+    return static_cast<uint32_t>(std::count_if(lights.begin(), lights.end(), [](const RectLightInfo& light) {
+        return !ExactReferencePointLight(light);
+    }));
+}
+
+bool SampleReferencePointLight(const RectLightInfo& light, const HitInfo& hit,
+                               uint32_t lightCount, simd::float3 diskOffset,
+                               RectLightSample& outSample) {
+    const simd::float3 centerDirection = light.corner - hit.position;
+    if (!(simd::dot(centerDirection, centerDirection) > 1.0e-12f)) {
+        return false;
+    }
+    const Onb frame = BuildOnb(centerDirection);
+    const simd::float3 point = light.corner + light.jitterRadius *
+        (diskOffset.x * frame.tangent + diskOffset.y * frame.bitangent);
+    const simd::float3 toLight = point - hit.position;
+    const float distanceSq = simd::dot(toLight, toLight);
+    if (!(distanceSq > 0.0f)) {
+        return false;
+    }
+    outSample.distance = std::sqrt(distanceSq);
+    outSample.direction = toLight / outSample.distance;
+    outSample.pdf = 1.0f / static_cast<float>(std::max(lightCount, 1u));
+    const float legacyCap = light.legacyMinimumDistanceSq > 0.0f
+        ? 1.0f / light.legacyMinimumDistanceSq : 1.0f;
+    const float attenuation = light.inverseSquareFalloff
+        ? 1.0f / distanceSq : std::min(1.0f / distanceSq, legacyCap);
+    outSample.emission = light.baseEmission * attenuation;
+    outSample.rectIndex = light.rectIndex;
+    outSample.isReferencePoint = true;
+    return IsFinite(outSample.emission) && simd::dot(outSample.emission, outSample.emission) > 0.0f;
+}
+
 bool DeterministicRectLightAuditSample(const RectLightInfo& light,
                                        uint32_t lightCount,
                                        const EnvironmentMap* env,
@@ -2153,6 +2273,9 @@ bool DeterministicRectLightAuditSample(const RectLightInfo& light,
                                        const HitInfo& hit,
                                        RectLightSample& outSample) {
     outSample = RectLightSample{};
+    if (light.isReferencePoint) {
+        return SampleReferencePointLight(light, hit, lightCount, simd_make_float3(0.0f), outSample);
+    }
     simd::float3 samplePoint = light.corner;
     if (!light.isDisk) {
         samplePoint += 0.5f * light.edgeU + 0.5f * light.edgeV;
@@ -2203,16 +2326,26 @@ bool SampleRectLight(const std::vector<RectLightInfo>& rectLights,
                      const PathTracer::RenderSettings& settings,
                      const HitInfo& hit,
                      Rng& rng,
-                     RectLightSample& outSample) {
+                     RectLightSample& outSample,
+                     bool excludeExactPoints = false) {
     outSample = RectLightSample{};
-    if (rectLights.empty()) {
+    const uint32_t lightCount = CountAnalyticLights(rectLights, excludeExactPoints);
+    if (lightCount == 0u) {
         return false;
     }
 
-    uint32_t selected = std::min(static_cast<uint32_t>(rng.nextFloat() * rectLights.size()),
-                                 static_cast<uint32_t>(rectLights.size() - 1u));
+    const uint32_t ordinal = std::min(static_cast<uint32_t>(rng.nextFloat() * static_cast<float>(lightCount)), lightCount - 1u);
+    uint32_t selected = 0u, current = 0u;
+    for (; selected < rectLights.size(); ++selected) {
+        if ((!excludeExactPoints || !ExactReferencePointLight(rectLights[selected])) && current++ == ordinal) {
+            break;
+        }
+    }
     const RectLightInfo& light = rectLights[selected];
     outSample.lightIndex = selected;
+    if (light.isReferencePoint) {
+        return SampleReferencePointLight(light, hit, lightCount, SampleInUnitDisk(rng), outSample);
+    }
 
     simd::float3 samplePoint = light.corner;
     if (light.isDisk) {
@@ -2247,7 +2380,7 @@ bool SampleRectLight(const std::vector<RectLightInfo>& rectLights,
 
     float pdfArea = 1.0f / light.area;
     float pdfDir = pdfArea * distSq / std::max(cosLight, 1.0e-6f);
-    float selectionPdf = 1.0f / static_cast<float>(rectLights.size());
+    float selectionPdf = 1.0f / static_cast<float>(lightCount);
     float pdf = pdfDir * selectionPdf;
     if (!(pdf > 0.0f) || !std::isfinite(pdf)) {
         return false;
@@ -2274,6 +2407,18 @@ bool SampleRectLight(const std::vector<RectLightInfo>& rectLights,
     return true;
 }
 
+bool SampleRectLightNeeDraw(const std::vector<RectLightInfo>& lights, const EnvironmentMap* env,
+                           const PathTracer::RenderSettings& settings, const HitInfo& hit,
+                           Rng& rng, RectLightSample& sample, uint32_t draw, bool exactActive) {
+    if (!exactActive) return SampleRectLight(lights, env, settings, hit, rng, sample);
+    if (draw == 0u) return SampleRectLight(lights, env, settings, hit, rng, sample, true);
+    const uint32_t index = draw - 1u;
+    if (index >= lights.size() || !ExactReferencePointLight(lights[index])) return false;
+    sample = RectLightSample{};
+    sample.lightIndex = index;
+    return SampleReferencePointLight(lights[index], hit, 1u, simd_make_float3(0.0f), sample);
+}
+
 float RectLightPdfForHit(const std::vector<int32_t>& rectLightIndexByRect,
                          const PathTracerShaderTypes::RectData* rectangles,
                          uint32_t rectangleCount,
@@ -2297,8 +2442,9 @@ float RectLightPdfForHit(const std::vector<int32_t>& rectLightIndexByRect,
     }
 
     const auto& rect = rectangles[rectIndex];
-    simd::float3 edgeU = simd_make_float3(rect.edgeU.x, rect.edgeU.y, rect.edgeU.z);
-    simd::float3 edgeV = simd_make_float3(rect.edgeV.x, rect.edgeV.y, rect.edgeV.z);
+    if (AreaPrimitiveIsReferencePoint(rect)) {
+        return 0.0f;
+    }
     float area = AreaPrimitiveArea(rect);
     if (area <= 0.0f) {
         return 0.0f;
@@ -2375,7 +2521,9 @@ bool RectLightHitInfo(const std::vector<int32_t>& rectLightIndexByRect,
     float pdf = RectLightPdfForHit(rectLightIndexByRect,
                                    rectangles,
                                    rectangleCount,
-                                   static_cast<uint32_t>(rectLights.size()),
+                                   settings.referencePointExactNee
+                                       ? CountAnalyticLights(rectLights, true)
+                                       : static_cast<uint32_t>(rectLights.size()),
                                    hit,
                                    origin);
     if (!(pdf > 0.0f) || !std::isfinite(pdf)) {
@@ -2387,148 +2535,350 @@ bool RectLightHitInfo(const std::vector<int32_t>& rectLightIndexByRect,
     return true;
 }
 
-CarpaintLobeResult CarpaintEvalCoat(const PathTracerShaderTypes::MaterialData& material,
+float GgxVndfAlpha(float roughness) {
+    return std::max(roughness * roughness, 1.0e-4f);  // SampleGgxVndf's alpha
+}
+
+// GGX reflection lobe around lobeNormal (mirrors ggx_reflection_lobe): value F D G2 / (4 cos_o cos_macro(wi)); pdf
+// the VNDF reflection density for any reflected direction (also below the lobe plane, where the value is zero).
+ClosureValuePdf GgxReflectionLobe(float alpha,
+                                  const simd::float3& lobeNormal,
+                                  float cosThetaMacroI,
+                                  const simd::float3& wo,
+                                  const simd::float3& wi,
+                                  const simd::float3& F,
+                                  const FireflyClampParams& clampParams) {
+    ClosureValuePdf result;
+    float cosThetaO = simd::dot(lobeNormal, wo);
+    simd::float3 wh = simd::normalize(wo + wi);
+    float cosThetaH = simd::dot(lobeNormal, wh);
+    if (cosThetaO <= 0.0f || cosThetaH <= 0.0f || simd::dot(wo, wh) <= 0.0f) {
+        return result;
+    }
+    float D = GgxDistribution(alpha, lobeNormal, wh);
+    float g1o = GgxG1(alpha, cosThetaO);
+    result.pdf = ClampSpecularPdf(D * g1o / (4.0f * cosThetaO), clampParams);
+    float cosThetaI = simd::dot(lobeNormal, wi);
+    if (cosThetaI > 0.0f && cosThetaMacroI > 0.0f) {
+        float G = g1o * GgxG1(alpha, cosThetaI);
+        result.value = SanitizeSpecularValue(F * (D * G / (4.0f * cosThetaO * cosThetaMacroI)));
+    }
+    return result;
+}
+
+// CarPaint (type 6) layered closure; mirrors carpaint_closure_eval / carpaint_lobe_probabilities and the
+// case 6u sampler in shaders/bsdf (see the comment block there):
+//   f = f_coat + (1 - Fc(cos_o)) (1 - Fc(cos_i)) * coat transmittance * [c f_flake + (1 - c)((1 - m) base/pi + m f_metal)]
+// sampled by one-sample MIS over {coat, flake, diffuse, metal}; GGX lobe pdfs are the VNDF reflection density.
+float CarpaintFlakeLobeRoughness(const PathTracerShaderTypes::MaterialData& material) {
+    return std::max(CarpaintFlakeRoughness(material), 1.0e-3f);
+}
+
+float CarpaintMetalRoughness(const PathTracerShaderTypes::MaterialData& material) {
+    return std::max(CarpaintBaseRoughness(material), 1.0e-3f);
+}
+
+float CarpaintCoatFresnel(const PathTracerShaderTypes::MaterialData& material, float cosTheta) {
+    float f0 = DielectricF0(std::max(material.typeEta.z, 1.0f));
+    return f0 + (1.0f - f0) * SchlickWeight(cosTheta);
+}
+
+simd::float3 CarpaintAverageFresnel(const simd::float3& f0) {
+    return f0 + (simd_make_float3(1.0f, 1.0f, 1.0f) - f0) * (1.0f / 21.0f);
+}
+
+CarpaintLobeProbabilities CarpaintLobeProbabilitiesFor(const PathTracerShaderTypes::MaterialData& material,
+                                                       const simd::float3& normal,
+                                                       const simd::float3& flakeNormal,
+                                                       const simd::float3& wo) {
+    CarpaintLobeProbabilities probs;
+    float cosThetaO = simd::dot(normal, wo);
+    if (cosThetaO <= 0.0f) {
+        return probs;
+    }
+    float coverage = CarpaintFlakeCoverage(material);
+    float metallic = CarpaintBaseMetallic(material);
+    float coatReflect = CarpaintCoatFresnel(material, cosThetaO);
+    float transmitted = 1.0f - coatReflect;
+    float underF = Luminance(CarpaintAverageFresnel(CarpaintBaseF0(material)));
+    probs.coat = coatReflect;
+    probs.flake = (simd::dot(flakeNormal, wo) > 0.0f) ? transmitted * coverage * underF : 0.0f;
+    probs.diffuse = transmitted * (1.0f - coverage) * (1.0f - metallic) * Luminance(MaterialBaseColor(material));
+    probs.metal = transmitted * (1.0f - coverage) * metallic * underF;
+    float sum = probs.coat + probs.flake + probs.diffuse + probs.metal;
+    if (!(sum > 0.0f)) {
+        return CarpaintLobeProbabilities{};
+    }
+    float inv = 1.0f / sum;
+    probs.coat *= inv;
+    probs.flake *= inv;
+    probs.diffuse *= inv;
+    probs.metal *= inv;
+    return probs;
+}
+
+ClosureValuePdf CarpaintClosureEval(const PathTracerShaderTypes::MaterialData& material,
                                     const simd::float3& normal,
+                                    const simd::float3& flakeNormal,
                                     const simd::float3& wo,
                                     const simd::float3& wi,
+                                    const CarpaintLobeProbabilities& probs,
                                     const FireflyClampParams& clampParams) {
-    CarpaintLobeResult result;
-    float cosThetaO = std::max(simd::dot(normal, wo), 0.0f);
-    float cosThetaI = std::max(simd::dot(normal, wi), 0.0f);
-    if (cosThetaI <= 0.0f || cosThetaO <= 0.0f) {
+    ClosureValuePdf result;
+    float cosThetaO = simd::dot(normal, wo);
+    float cosThetaI = simd::dot(normal, wi);
+    if (cosThetaO <= 0.0f || cosThetaI <= 0.0f) {
         return result;
     }
-    float roughness = PlasticCoatRoughness(material);
-    float alpha = roughness * roughness;
     simd::float3 wh = simd::normalize(wo + wi);
-    if (simd::dot(wh, normal) <= 0.0f || simd::dot(wo, wh) <= 0.0f || simd::dot(wi, wh) <= 0.0f) {
+    float coverage = CarpaintFlakeCoverage(material);
+    float metallic = CarpaintBaseMetallic(material);
+    simd::float3 baseColor = MaterialBaseColor(material);
+    float coatF = CarpaintCoatFresnel(material, simd::dot(wi, wh));
+
+    ClosureValuePdf coat = GgxReflectionLobe(GgxVndfAlpha(PlasticCoatRoughness(material)), normal, cosThetaI,
+                                             wo, wi, simd_make_float3(coatF, coatF, coatF), clampParams);
+    ClosureValuePdf flake = GgxReflectionLobe(GgxVndfAlpha(CarpaintFlakeLobeRoughness(material)), flakeNormal,
+                                              cosThetaI, wo, wi,
+                                              SchlickFresnel(CarpaintBaseF0(material), simd::dot(wi, wh)),
+                                              clampParams);
+    simd::float3 metalF = CarpaintHasBaseConductor(material)
+        ? FresnelConductor(simd::dot(wi, wh), CarpaintBaseEta(material), CarpaintBaseK(material))
+        : SchlickFresnel(baseColor, simd::dot(wi, wh));
+    ClosureValuePdf metal = GgxReflectionLobe(GgxVndfAlpha(CarpaintMetalRoughness(material)), normal, cosThetaI,
+                                              wo, wi, metalF, clampParams);
+    simd::float3 diffuse = baseColor * (1.0f / kPi);
+
+    simd::float3 coatTransmission = (1.0f - CarpaintCoatFresnel(material, cosThetaO)) *
+                                    (1.0f - CarpaintCoatFresnel(material, cosThetaI)) *
+                                    PlasticDiffuseTransmission(material, cosThetaI, cosThetaO);
+    simd::float3 under = coverage * flake.value +
+                         (1.0f - coverage) * ((1.0f - metallic) * diffuse + metallic * metal.value);
+    result.value = simd::max(coat.value + coatTransmission * under, simd_make_float3(0.0f, 0.0f, 0.0f));
+    result.pdf = probs.coat * coat.pdf + probs.flake * flake.pdf +
+                 probs.diffuse * LambertPdf(normal, wi) + probs.metal * metal.pdf;
+    return result;
+}
+
+// Plastic (type 4) closure; mirrors plastic_closure_eval / plastic_lobe_probabilities and the case 4u sampler in
+// shaders/bsdf (see the comment block there):
+//   f = f_coat + (1 - F(cos_i)) (1 - F(cos_o)) (1 - Favg) * coat transmittance * base/pi
+// sampled by one-sample MIS over {coat, diffuse}; the coat pdf is the VNDF reflection density.
+PlasticLobeProbabilities PlasticLobeProbabilitiesFor(const PathTracerShaderTypes::MaterialData& material,
+                                                     const simd::float3& normal,
+                                                     const simd::float3& wo) {
+    PlasticLobeProbabilities probs;
+    float cosThetaO = simd::dot(normal, wo);
+    if (cosThetaO <= 0.0f) {
+        return probs;
+    }
+    if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagSubsurfaceExit) != 0u) {
+        probs.diffuse = 1.0f;  // a coated walk's exit point: the diffuse base only (Metal, plastic_lobe_probabilities)
+        return probs;
+    }
+    float f0 = DielectricF0(PlasticCoatIor(material));
+    float coatReflect = f0 + (1.0f - f0) * SchlickWeight(cosThetaO);
+    probs.coat = coatReflect * Luminance(PlasticSpecularTint(material));
+    // (1 - F(cos_i)) averages to 1 - (f0 + (1 - f0) / 21) over the cosine-weighted hemisphere; T at cos_i = 1.
+    float entering = (1.0f - f0) * (20.0f / 21.0f);
+    probs.diffuse = (1.0f - coatReflect) * entering * std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f) *
+                    Luminance(MaterialBaseColor(material) * PlasticDiffuseTransmission(material, 1.0f, cosThetaO));
+    float sum = probs.coat + probs.diffuse;
+    if (!(sum > 0.0f)) {
+        return PlasticLobeProbabilities{};
+    }
+    probs.coat /= sum;
+    probs.diffuse /= sum;
+    return probs;
+}
+
+ClosureValuePdf PlasticClosureEval(const PathTracerShaderTypes::MaterialData& material,
+                                   const simd::float3& normal,
+                                   const simd::float3& wo,
+                                   const simd::float3& wi,
+                                   const PlasticLobeProbabilities& probs,
+                                   const FireflyClampParams& clampParams) {
+    ClosureValuePdf result;
+    float cosThetaO = simd::dot(normal, wo);
+    float cosThetaI = simd::dot(normal, wi);
+    if (cosThetaO <= 0.0f || cosThetaI <= 0.0f) {
         return result;
     }
-
-    float D = GgxDistribution(alpha, simd::dot(normal, wh));
-    float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
     float f0 = DielectricF0(PlasticCoatIor(material));
     simd::float3 f0Color = simd_make_float3(f0, f0, f0);
-    simd::float3 F = SchlickFresnel(f0Color, simd::dot(wi, wh));
-    float denom = 4.0f * cosThetaO * cosThetaI;
-    simd::float3 spec = F * (D * G / std::max(denom, 1.0e-6f));
-    spec = ClampSpecularTail(spec, roughness, f0Color, clampParams);
-    spec *= PlasticSpecularTint(material);
-    spec = simd::max(spec, simd_make_float3(0.0f, 0.0f, 0.0f));
-
-    float pdf = GgxPdf(alpha, normal, wo, wi);
-    if (pdf > 0.0f) {
-        result.pdf = ClampSpecularPdf(pdf, clampParams);
-        result.value = spec;
-    }
-    return result;
-}
-
-CarpaintLobeResult CarpaintEvalFlake(const PathTracerShaderTypes::MaterialData& material,
-                                     const simd::float3& position,
-                                     const simd::float3& normal,
-                                     const simd::float3& wo,
-                                     const simd::float3& wi,
-                                     const FireflyClampParams& clampParams) {
-    CarpaintLobeResult result;
-    simd::float3 flakeNormal = CarpaintFlakeNormal(material, position, normal);
-    float cosThetaO = std::max(simd::dot(flakeNormal, wo), 0.0f);
-    float cosThetaI = std::max(simd::dot(flakeNormal, wi), 0.0f);
-    if (cosThetaI <= 0.0f || cosThetaO <= 0.0f) {
+    simd::float3 one = simd_make_float3(1.0f, 1.0f, 1.0f);
+    if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagSubsurfaceExit) != 0u) {
+        // Exit point of a coated subsurface walk (Metal, plastic_closure_eval): the light-side half of the base term.
+        // The coat lobe and the view-side crossing belong to the entry point.
+        result.value = MaterialBaseColor(material) * (1.0f / kPi) * PlasticCoatTint(material) *
+                       PlasticCoatCrossing(material, cosThetaI) * (one - SchlickFresnel(f0Color, cosThetaI)) *
+                       std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f);
+        result.pdf = LambertPdf(normal, wi);
         return result;
     }
-    float roughness = std::max(CarpaintFlakeRoughness(material), 1.0e-3f);
-    float alpha = roughness * roughness;
     simd::float3 wh = simd::normalize(wo + wi);
-    if (simd::dot(wh, flakeNormal) <= 0.0f ||
-        simd::dot(wo, wh) <= 0.0f ||
-        simd::dot(wi, wh) <= 0.0f) {
+    ClosureValuePdf coat = GgxReflectionLobe(GgxVndfAlpha(PlasticCoatRoughness(material)), normal, cosThetaI, wo, wi,
+                                             SchlickFresnel(f0Color, simd::dot(wi, wh)) * PlasticSpecularTint(material),
+                                             clampParams);
+    simd::float3 diffuse = MaterialBaseColor(material) * (1.0f / kPi) *
+                           PlasticDiffuseTransmission(material, cosThetaI, cosThetaO) *
+                           (one - SchlickFresnel(f0Color, cosThetaI)) * (one - SchlickFresnel(f0Color, cosThetaO)) *
+                           std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f);
+    result.value = simd::max(coat.value + diffuse, simd_make_float3(0.0f, 0.0f, 0.0f));
+    result.pdf = probs.coat * coat.pdf + probs.diffuse * LambertPdf(normal, wi);
+    return result;
+}
+
+// Frostbite's renormalized Disney diffuse, which Falcor's StandardMaterial uses
+// (kMaterialFlagFalcorStandardBsdf), as Metal.
+float FrostbiteDiffuseScale(const simd::float3& normal,
+                            const simd::float3& wo,
+                            const simd::float3& wi,
+                            float linearRoughness) {
+    const float wiDotH = std::clamp(simd::dot(wi, SafeNormalize(wo + wi, simd_make_float3(0.0f, 0.0f, 0.0f))), 0.0f, 1.0f);
+    const float fd90 = 0.5f * linearRoughness + 2.0f * wiDotH * wiDotH * linearRoughness;
+    const float wiScatter = 1.0f + (fd90 - 1.0f) * std::pow(1.0f - std::clamp(simd::dot(normal, wi), 0.0f, 1.0f), 5.0f);
+    const float woScatter = 1.0f + (fd90 - 1.0f) * std::pow(1.0f - std::clamp(simd::dot(normal, wo), 0.0f, 1.0f), 5.0f);
+    return wiScatter * woScatter * (1.0f + (1.0f / 1.51f - 1.0f) * linearRoughness);
+}
+
+// Rough GGX dielectric (PBRT-v4 DielectricBxDF, radiance transport) for a
+// regularized interface, as Metal. `normal` faces wo.
+BsdfEval EvaluateRegularizedDielectric(const PathTracerShaderTypes::MaterialData& material,
+                                       const simd::float3& normal,
+                                       const simd::float3& wo,
+                                       const simd::float3& wi,
+                                       const bool referencePunctual) {
+    BsdfEval result;
+    const float cosThetaO = simd::dot(normal, wo);
+    const float cosThetaI = simd::dot(normal, wi);
+    if (!(cosThetaO > 0.0f) || cosThetaI == 0.0f) {
+        return result;
+    }
+    const float eta = std::max(material.typeEta.y, 1.0e-3f);
+    const float roughness = std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f);
+    const float alpha = std::max(roughness * roughness, 1.0e-4f);
+    const bool reflection = cosThetaI > 0.0f;
+    simd::float3 wh = reflection ? (wo + wi) : (wo + wi * eta);
+    if (!(simd::dot(wh, wh) > 0.0f)) {
+        return result;
+    }
+    wh = simd::normalize(wh);
+    if (simd::dot(wh, normal) < 0.0f) {
+        wh = -wh;
+    }
+    const float woDotWh = simd::dot(wo, wh);
+    const float wiDotWh = simd::dot(wi, wh);
+    if (woDotWh <= 0.0f || wiDotWh * cosThetaI <= 0.0f) {
         return result;
     }
 
-    float D = GgxDistribution(alpha, simd::dot(flakeNormal, wh));
-    float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
-    simd::float3 f0 = CarpaintBaseF0(material);
-    simd::float3 F = SchlickFresnel(f0, simd::dot(wi, wh));
-    float denom = 4.0f * cosThetaO * cosThetaI;
-    simd::float3 spec = F * (D * G / std::max(denom, 1.0e-6f));
-    spec = ClampSpecularTail(spec * PlasticSpecularTint(material), roughness, f0, clampParams);
-    spec *= std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f);
-    spec = simd::max(spec, simd_make_float3(0.0f, 0.0f, 0.0f));
-
-    float pdf = GgxPdf(alpha, flakeNormal, wo, wi);
-    if (pdf > 0.0f) {
-        result.pdf = ClampSpecularPdf(pdf, clampParams);
-        result.value = spec;
+    float cosThetaT = 0.0f;
+    const float F = FresnelDielectricExact(woDotWh, 1.0f, eta, cosThetaT);
+    const float D = GgxDistribution(alpha, normal, wh);
+    // The Pavilion source limits discrete-light values on water/glass too.
+    // The actual VNDF density and ordinary continuation remain uncapped.
+    const bool referenceContinuation =
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation) != 0u;
+    const float valueD = referencePunctual && referenceContinuation ? std::min(D, 1.0f) : D;
+    const float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
+    const float pdfWh = GgxVndfPdf(alpha, normal, wo, wh, /*halfVectorD=*/true);
+    if (reflection) {
+        const float f = F * valueD * G / (4.0f * cosThetaO * cosThetaI);
+        result.value = simd_make_float3(f, f, f);
+        result.pdf = F * pdfWh / (4.0f * woDotWh);
+    } else {
+        const float denom = wiDotWh + woDotWh / eta;
+        const float denomSq = denom * denom;
+        if (!(denomSq > 1.0e-12f)) {
+            return result;
+        }
+        // Radiance crossing into the far medium scales by eta^-2.
+        const float ft = (1.0f - F) * valueD * G *
+                         std::fabs(wiDotWh * woDotWh / (cosThetaI * cosThetaO * denomSq)) /
+                         (eta * eta);
+        const simd::float3 tint =
+            (material.materialFlags & PathTracerShaderTypes::kMaterialFlagDielectricTransmissionTint) != 0u
+                ? simd::clamp(MaterialBaseColor(material),
+                              simd_make_float3(0.0f, 0.0f, 0.0f),
+                              simd_make_float3(1.0f, 1.0f, 1.0f))
+                : simd_make_float3(1.0f, 1.0f, 1.0f);
+        result.value = ft * tint;
+        result.pdf = (1.0f - F) * pdfWh * std::fabs(wiDotWh) / denomSq;
     }
     return result;
 }
 
-CarpaintLobeResult CarpaintEvalBase(const PathTracerShaderTypes::MaterialData& material,
-                                    const simd::float3& normal,
-                                    const simd::float3& wo,
-                                    const simd::float3& wi,
-                                    const FireflyClampParams& clampParams) {
-    CarpaintLobeResult result;
-    float cosThetaO = std::max(simd::dot(normal, wo), 0.0f);
-    float cosThetaI = std::max(simd::dot(normal, wi), 0.0f);
-    if (cosThetaI <= 0.0f || cosThetaO <= 0.0f) {
+BsdfSample SampleRegularizedDielectric(const PathTracerShaderTypes::MaterialData& material,
+                                       const simd::float3& normal,
+                                       const simd::float3& wo,
+                                       bool frontFace,
+                                       Rng& rng) {
+    BsdfSample result;
+    result.lobeType = 1u;
+    result.lobeRoughness = std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f);
+    if (!(simd::dot(normal, wo) > 0.0f)) {
         return result;
     }
-    float metallic = CarpaintBaseMetallic(material);
-    float diffuseWeight = std::max(1.0f - metallic, 0.0f);
-    float specWeight = std::max(metallic, 0.0f);
-    if (diffuseWeight <= 1.0e-4f && specWeight <= 1.0e-4f) {
+    const float eta = std::max(material.typeEta.y, 1.0e-3f);
+    const simd::float3 wh = SampleGgxVndf(rng, result.lobeRoughness, normal, wo);
+    const float woDotWh = simd::dot(wo, wh);
+    if (!(woDotWh > 0.0f)) {
         return result;
     }
-
-    float coatAverage = PlasticCoatFresnelAverage(material);
-    simd::float3 baseColor = MaterialBaseColor(material);
-    simd::float3 combined = simd_make_float3(0.0f, 0.0f, 0.0f);
-    float pdfDiffuse = 0.0f;
-    float pdfSpec = 0.0f;
-
-    if (diffuseWeight > 1.0e-4f) {
-        simd::float3 diffuse = baseColor / kPi;
-        simd::float3 coatTrans = PlasticDiffuseTransmission(material, cosThetaI, cosThetaO);
-        diffuse *= coatTrans * std::max(1.0f - coatAverage, 0.0f);
-        diffuse = simd::max(diffuse, simd_make_float3(0.0f, 0.0f, 0.0f));
-        combined += diffuseWeight * diffuse;
-        pdfDiffuse = LambertPdf(normal, wi);
+    float cosThetaT = 0.0f;
+    const float F = FresnelDielectricExact(woDotWh, 1.0f, eta, cosThetaT);
+    const bool reflection = rng.nextFloat() < F;
+    const simd::float3 wi = reflection
+        ? Reflect(-wo, wh)
+        : SafeNormalize(-wo / eta + (woDotWh / eta - cosThetaT) * wh, simd_make_float3(0.0f, 0.0f, 0.0f));
+    const float cosThetaI = simd::dot(normal, wi);
+    if (reflection ? !(cosThetaI > 0.0f) : !(cosThetaI < 0.0f)) {
+        return result;
     }
-
-    if (specWeight > 1.0e-4f) {
-        float roughness = std::max(CarpaintBaseRoughness(material), 1.0e-3f);
-        float alpha = roughness * roughness;
-        simd::float3 wh = simd::normalize(wo + wi);
-        if (simd::dot(wh, normal) > 0.0f &&
-            simd::dot(wo, wh) > 0.0f &&
-            simd::dot(wi, wh) > 0.0f) {
-            float D = GgxDistribution(alpha, simd::dot(normal, wh));
-            float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
-            bool hasConductor = CarpaintHasBaseConductor(material);
-            simd::float3 eta = CarpaintBaseEta(material);
-            simd::float3 k = CarpaintBaseK(material);
-            simd::float3 f0 = hasConductor ? FresnelConductor(1.0f, eta, k) : baseColor;
-            simd::float3 F = hasConductor ? FresnelConductor(simd::dot(wi, wh), eta, k)
-                                          : SchlickFresnel(baseColor, simd::dot(wi, wh));
-            float denom = 4.0f * cosThetaO * cosThetaI;
-            simd::float3 spec = F * (D * G / std::max(denom, 1.0e-6f));
-            spec = ClampSpecularTail(spec * PlasticSpecularTint(material) * std::max(1.0f - coatAverage, 0.0f),
-                                     roughness,
-                                     f0,
-                                     clampParams);
-            spec = simd::max(spec, simd_make_float3(0.0f, 0.0f, 0.0f));
-            combined += specWeight * spec;
-            float pdf = GgxPdf(alpha, normal, wo, wi);
-            if (pdf > 0.0f) {
-                pdfSpec = ClampSpecularPdf(pdf, clampParams);
-            }
-        }
+    const BsdfEval eval = EvaluateRegularizedDielectric(material, normal, wo, wi, false);
+    if (!(eval.pdf > 0.0f)) {
+        return result;
     }
+    result.direction = wi;
+    result.weight = eval.value * std::fabs(cosThetaI) / eval.pdf;
+    if (!reflection &&
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation) != 0u) {
+        result.weight *= eta * eta;
+    }
+    result.pdf = eval.pdf;
+    result.mediumEvent = reflection ? 0 : (frontFace ? 1 : -1);  // as Metal's sample_regularized_dielectric
+    return result;
+}
 
-    result.value = simd::max(combined, simd_make_float3(0.0f, 0.0f, 0.0f));
-    result.pdf = diffuseWeight * pdfDiffuse + specWeight * pdfSpec;
+// EP8b: Tungsten source closures through the shared header, dispatched first as Metal's evaluate_bsdf and
+// sample_bsdf dispatch them (closures_eval.metal, bsdf_sample.metal). Values exclude the cosine on both sides.
+BsdfEval EvaluateSourceClosure(const PathTracerShaderTypes::MaterialData& material,
+                               const simd::float3& normal,
+                               const simd::float3& wo,
+                               const simd::float3& wi) {
+    const pt_shared::BsdfEvalResult r = pt_shared::source_eval(material, normal, wo, wi, false);
+    BsdfEval result;
+    result.value = r.value;
+    result.pdf = r.pdf;
+    result.isDelta = r.isDelta;
+    return result;
+}
+
+BsdfSample SampleSourceClosure(const PathTracerShaderTypes::MaterialData& material,
+                               const simd::float3& normal,
+                               const simd::float3& wo,
+                               bool frontFace,
+                               Rng& rng) {
+    const pt_shared::BsdfSampleResult r = pt_shared::source_sample(material, normal, wo, frontFace, rng.state, false);
+    BsdfSample result;
+    result.direction = r.direction;
+    result.weight = r.weight;
+    result.pdf = r.pdf;
+    result.lobeType = r.lobeType;
+    result.lobeRoughness = r.lobeRoughness;
+    result.isDelta = r.isDelta;
+    result.mediumEvent = r.mediumEvent;
     return result;
 }
 
@@ -2537,7 +2887,12 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
                       const simd::float3& normal,
                       const simd::float3& wo,
                       const simd::float3& wi,
-                      const FireflyClampParams& clampParams) {
+                      const FireflyClampParams& clampParams,
+                      const bool referencePunctual = false,
+                      const bool pbrFrontFace = true) {
+    if (pt_shared::source_model(material) > 0.0f) {
+        return EvaluateSourceClosure(material, normal, wo, wi);
+    }
     BsdfEval result;
     const uint32_t type = static_cast<uint32_t>(material.typeEta.x);
     float signedCosThetaO = simd::dot(normal, wo);
@@ -2553,16 +2908,28 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
         simd::float3 baseColor = MaterialBaseColor(material);
         float metallic = std::clamp(material.pbrParams.x, 0.0f, 1.0f);
         float roughness = std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f);
-        float dielectricF0 = DielectricF0FromIor(material.typeEta.y);
+        // Delta lobes carry discrete mass, not a continuous value or PDF.
+        const bool hasDeltaLobes = roughness <= 1.0e-3f;
+        const bool reference = (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u;
+        const float relativeIor = std::max(material.typeEta.y, 1.0e-3f);
+        float dielectricF0 = DielectricF0FromIor(reference ? std::max(relativeIor, 1.0f / relativeIor) : material.typeEta.y);
         simd::float3 f0 = baseColor * metallic +
                           simd_make_float3(dielectricF0, dielectricF0, dielectricF0) * (1.0f - metallic);
         simd::float3 diffuseColor = baseColor * (1.0f - metallic) *
                                     std::clamp(material.pbrParams.z, 0.0f, 1.0f);
 
         float transmission = std::clamp(material.pbrExtras.z, 0.0f, 1.0f) * (1.0f - metallic);
+        const bool glassInterface = !reference && transmission > 0.0f;
+        const bool thinWalled = glassInterface && ThinWalledPbrTransmission(material);
         float reflectScale = 1.0f - transmission;
         float specWeightBase = PbrSpecularWeight(f0);
-        float wSpec = specWeightBase * reflectScale;
+        if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u) {
+            // Falcor picks lobes by albedo: Fresnel-weighted specular against diffuse, as Metal.
+            const float specAlbedo = Luminance(SchlickFresnel(f0, std::clamp(simd::dot(normal, wo), 0.0f, 1.0f)));
+            specWeightBase = std::clamp(specAlbedo / std::max(specAlbedo + Luminance(diffuseColor), 1.0e-6f), 0.05f, 0.95f);
+        }
+        const float specularScale = reference ? 1.0f : reflectScale;
+        float wSpec = specWeightBase * specularScale;
         float wDiff = (1.0f - specWeightBase) * reflectScale;
         float wTrans = transmission;
         float weightSum = wSpec + wDiff + wTrans;
@@ -2584,35 +2951,91 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
                 simd::dot(wi, wh) <= 0.0f) {
                 return result;
             }
-            float D = GgxDistribution(alpha, simd::dot(normal, wh));
+            float D = GgxDistribution(alpha, normal, wh);
             float G = GgxG1(alpha, signedCosThetaO) * GgxG1(alpha, signedCosThetaI);
-            simd::float3 F = SchlickFresnel(f0, simd::dot(wi, wh));
+            float cosThetaT = 0.0f;
+            const float referenceF = reference ? FresnelDielectricExact(simd::dot(wo, wh), 1.0f, relativeIor, cosThetaT) : 0.0f;
+            simd::float3 F = reference ? simd_make_float3(referenceF, referenceF, referenceF) * (1.0f - metallic) +
+                SchlickFresnel(baseColor, simd::dot(wi, wh)) * metallic : SchlickFresnel(f0, simd::dot(wi, wh));
             float denom = 4.0f * signedCosThetaO * signedCosThetaI;
-            simd::float3 spec = F * (D * G / std::max(denom, 1.0e-6f));
-            spec *= SpecularEnergyCompensation(f0, roughness, absCosThetaO);
-            spec = ClampSpecularTail(spec, roughness, f0, clampParams);
-            spec *= reflectScale;
+            const bool referenceLeaf = reference && material.pbrExtras.w > 0.5f && material.pbrExtras.w < 1.5f;
+            const float shadingD = (referenceLeaf || (reference && referencePunctual))
+                ? std::min(D, 1.0f) : D;
+            simd::float3 spec = hasDeltaLobes ? simd_make_float3(0.0f) : F * (shadingD * G / std::max(denom, 1.0e-6f));
+            // Falcor's StandardMaterial has no multiple-scattering compensation, and Metal applies none to materials
+            // with kMaterialFlagFalcorStandardBsdf.
+            if ((material.materialFlags & (PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular |
+                                           PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf)) == 0u) {
+                spec *= SpecularEnergyCompensation(f0, roughness, absCosThetaO);
+            }
+            spec = SanitizeSpecularValue(spec);
+            spec *= specularScale;
             simd::float3 diffuse = (diffuseColor / kPi) * reflectScale;
-            float pdfSpec = GgxPdf(alpha, normal, wo, wi);
+            if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u) {
+                diffuse *= FrostbiteDiffuseScale(normal, wo, wi, roughness);
+            }
+            if (reference) diffuse *= 1.0f - referenceF;
+            // Falcor: the VNDF density over the reflection Jacobian 4*(wo.wh), as Metal.
+            const float woDotWh = simd::dot(wo, wh);
+            float pdfSpec = hasDeltaLobes ? 0.0f : ((reference ||
+                             (material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) == 0u)
+                ? D * GgxG1(alpha, signedCosThetaO) / (4.0f * signedCosThetaO)
+                : (woDotWh > 0.0f ? GgxVndfPdf(alpha, normal, wo, wh, /*halfVectorD=*/true) / (4.0f * woDotWh) : 0.0f));
             float pdfDiffuse = LambertPdf(normal, wi);
             float pdf = pSpec * pdfSpec + pDiff * pdfDiffuse;
+            if (glassInterface && !hasDeltaLobes) {
+                // A thin-walled sheet has the outside medium on both faces.
+                const bool entering = pbrFrontFace || thinWalled;
+                const float etaI = entering ? 1.0f : std::max(material.typeEta.y, 1.0f);
+                const float etaT = entering ? std::max(material.typeEta.y, 1.0f) : 1.0f;
+                float glassCosThetaT = 0.0f;
+                const float glassF = FresnelDielectricExact(simd::dot(wo, wh), etaI, etaT, glassCosThetaT);
+                // One exact-Fresnel interface; the glass reflection is single-scattering.
+                spec += simd_make_float3(1.0f, 1.0f, 1.0f) * (transmission * glassF * D * G / std::max(denom, 1.0e-6f));
+                pdf += pTrans * glassF * D * GgxG1(alpha, signedCosThetaO) / (4.0f * signedCosThetaO);
+            }
             if (pdf > 0.0f) {
                 result.value = simd::max(spec + diffuse, simd_make_float3(0.0f, 0.0f, 0.0f));
-                result.pdf = ClampSpecularPdf(pdf, clampParams);
+                result.pdf = reference ? pdf : ClampSpecularPdf(pdf, clampParams);
             }
             return result;
         }
 
-        if (wTrans <= 0.0f) {
+        if (hasDeltaLobes || wTrans <= 0.0f) {
+            return result;
+        }
+        if (thinWalled) {
+            // Thin-walled BTDF (Metal evaluate_pbr_metallic_roughness): the GGX
+            // reflection lobe of wi mirrored through the tangent plane, times 1 - F.
+            const simd::float3 n = signedCosThetaO > 0.0f ? normal : -normal;
+            const simd::float3 wiMirror = wi - 2.0f * simd::dot(wi, n) * n;
+            const simd::float3 wh = simd::normalize(wo + wiMirror);
+            const float woDotWh = simd::dot(wo, wh);
+            if (!IsFinite(wh) || simd::dot(wh, n) <= 0.0f || woDotWh <= 0.0f || simd::dot(wiMirror, wh) <= 0.0f) {
+                return result;
+            }
+            const float D = GgxDistribution(alpha, n, wh);
+            const float G = GgxG1(alpha, absCosThetaO) * GgxG1(alpha, absCosThetaI);
+            float cosThetaT = 0.0f;
+            const float F = FresnelDielectricExact(woDotWh, 1.0f, std::max(material.typeEta.y, 1.0f), cosThetaT);
+            simd::float3 ft = simd_make_float3(1.0f, 1.0f, 1.0f) *
+                (transmission * (1.0f - F) * D * G / std::max(4.0f * absCosThetaO * absCosThetaI, 1.0e-6f));
+            ft *= DielectricTransmissionTint(material, absCosThetaI);
+            const float pdf = pTrans * (1.0f - F) * D * GgxG1(alpha, absCosThetaO) / (4.0f * absCosThetaO);
+            if (pdf > 0.0f) {
+                result.value = simd::max(ft, simd_make_float3(0.0f, 0.0f, 0.0f));
+                result.pdf = ClampSpecularPdf(pdf, clampParams);
+            }
             return result;
         }
         float etaI = 1.0f;
-        float etaT = std::max(material.typeEta.y, 1.0f);
-        if (signedCosThetaO < 0.0f) {
+        float etaT = reference ? relativeIor : std::max(material.typeEta.y, 1.0f);
+        if (!reference && (glassInterface ? !pbrFrontFace : signedCosThetaO < 0.0f)) {
             std::swap(etaI, etaT);
         }
         float eta = etaI / etaT;
-        simd::float3 wh = simd::normalize(wo + wi * eta);
+        // Transmission half vector eta*wo+wi, with dwh/dwi = |wi.h|/denom^2.
+        simd::float3 wh = simd::normalize(wo * eta + wi);
         if (!IsFinite(wh) || simd::dot(wh, wh) <= 0.0f) {
             return result;
         }
@@ -2621,31 +3044,42 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
         }
         float cosThetaOWh = simd::dot(wo, wh);
         float cosThetaIWh = simd::dot(wi, wh);
-        if (cosThetaOWh * cosThetaIWh > 0.0f) {
+        if (cosThetaOWh * cosThetaIWh > 0.0f ||
+            (reference && (cosThetaOWh <= 0.0f || cosThetaIWh >= 0.0f))) {
             return result;
         }
-        float D = GgxDistribution(alpha, std::max(simd::dot(normal, wh), 0.0f));
+        float D = GgxDistribution(alpha, normal, wh);
         float G = GgxG1(alpha, absCosThetaO) * GgxG1(alpha, absCosThetaI);
         float cosThetaT = 0.0f;
         float F = FresnelDielectricExact(cosThetaOWh, etaI, etaT, cosThetaT);
-        float denom = cosThetaOWh + eta * cosThetaIWh;
+        float denom = eta * cosThetaOWh + cosThetaIWh;
         float denomSq = denom * denom;
         if (std::fabs(denomSq) <= 1.0e-8f) {
             return result;
         }
         float factor = (eta * eta) * std::fabs(cosThetaIWh) * std::fabs(cosThetaOWh);
         factor /= std::max(absCosThetaO * absCosThetaI * denomSq, 1.0e-6f);
-        simd::float3 ft = simd_make_float3(1.0f - F, 1.0f - F, 1.0f - F) * D * G * factor;
+        const float valueD = reference && referencePunctual ? std::min(D, 1.0f) : D;
+        simd::float3 ft = simd_make_float3(1.0f - F, 1.0f - F, 1.0f - F) * valueD * G * factor;
         ft *= DielectricTransmissionTint(material, absCosThetaI);
         ft *= transmission;
-        float pdfWh = GgxVndfPdf(alpha, normal, wo, wh);
-        float dwhDwi = std::fabs((eta * eta * cosThetaIWh) / std::max(denomSq, 1.0e-8f));
+        float pdfWh = reference ? D * GgxG1(alpha, absCosThetaO) * std::fabs(cosThetaOWh) / absCosThetaO
+                                   : GgxVndfPdf(alpha, normal, wo, wh, /*halfVectorD=*/true);
+        float dwhDwi = std::fabs(cosThetaIWh) / std::max(denomSq, 1.0e-8f);
         float pdf = pTrans * pdfWh * dwhDwi;
+        if (glassInterface) {
+            pdf *= 1.0f - F;
+        }
         if (pdf > 0.0f) {
             result.value = simd::max(ft, simd_make_float3(0.0f, 0.0f, 0.0f));
-            result.pdf = ClampSpecularPdf(pdf, clampParams);
+            result.pdf = reference ? pdf : ClampSpecularPdf(pdf, clampParams);
         }
         return result;
+    }
+
+    // A regularized interface also transmits: evaluate it before the reflection-only guard.
+    if (MaterialIsRegularizedDielectric(material)) {
+        return EvaluateRegularizedDielectric(material, normal, wo, wi, referencePunctual);
     }
 
     float cosThetaO = std::max(signedCosThetaO, 0.0f);
@@ -2654,62 +3088,23 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
         return result;
     }
 
-    if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Lambertian) ||
-        type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Subsurface)) {
-        simd::float3 albedo = (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Subsurface))
-            ? SssDiffuseColor(material, cosThetaI, cosThetaO)
-            : MaterialBaseColor(material);
-        result.value = albedo / kPi;
+    // Metal evaluates subsurface as a BSSRDF with no direct-light value (closures_eval.metal, case 5u): light reaches
+    // it only through the random walk or the closure sample.
+    if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Subsurface)) {
+        return result;
+    }
+
+    if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Lambertian)) {
+        result.value = MaterialBaseColor(material) / kPi;
         result.pdf = LambertPdf(normal, wi);
         return result;
     }
 
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Plastic)) {
-        simd::float3 albedo = MaterialBaseColor(material);
-        float coatRoughness = PlasticCoatRoughness(material);
-        float alpha = coatRoughness * coatRoughness;
-        float ior = PlasticCoatIor(material);
-        float f0 = DielectricF0(ior);
-        simd::float3 f0Color = simd_make_float3(f0, f0, f0);
-        simd::float3 specularTint = PlasticSpecularTint(material);
-
-        simd::float3 specular{0.0f, 0.0f, 0.0f};
-        float specularPdf = 0.0f;
-        simd::float3 wh = simd::normalize(wo + wi);
-        if (simd::dot(wh, normal) > 0.0f &&
-            simd::dot(wo, wh) > 0.0f &&
-            simd::dot(wi, wh) > 0.0f) {
-            float D = GgxDistribution(alpha, simd::dot(normal, wh));
-            float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
-            simd::float3 F = SchlickFresnel(f0Color, simd::dot(wi, wh));
-            float denom = 4.0f * cosThetaO * cosThetaI;
-            specular = F * (D * G / std::max(denom, 1.0e-6f));
-            specular = ClampSpecularTail(specular, coatRoughness, f0Color, clampParams);
-            specular *= specularTint;
-            float pdf = GgxPdf(alpha, normal, wo, wi);
-            if (pdf > 0.0f) {
-                specularPdf = ClampSpecularPdf(pdf, clampParams);
-            }
-            specular = simd::max(specular, simd_make_float3(0.0f, 0.0f, 0.0f));
-        }
-
-        simd::float3 diffuse = albedo / kPi;
-        simd::float3 tint = PlasticDiffuseTransmission(material, cosThetaI, cosThetaO);
-        simd::float3 F_i = SchlickFresnel(f0Color, cosThetaI);
-        simd::float3 F_o = SchlickFresnel(f0Color, cosThetaO);
-        diffuse *= tint;
-        diffuse *= (simd_make_float3(1.0f, 1.0f, 1.0f) - F_i) *
-                   (simd_make_float3(1.0f, 1.0f, 1.0f) - F_o);
-        diffuse *= std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f);
-        diffuse = simd::max(diffuse, simd_make_float3(0.0f, 0.0f, 0.0f));
-
-        float pdfDiffuse = LambertPdf(normal, wi);
-        float pCoat = PlasticCoatSampleWeight(material);
-        float pdf = pCoat * specularPdf + (1.0f - pCoat) * pdfDiffuse;
-        if (pdf > 0.0f) {
-            result.value = specular + diffuse;
-            result.pdf = pdf;
-        }
+        ClosureValuePdf closure =
+            PlasticClosureEval(material, normal, wo, wi, PlasticLobeProbabilitiesFor(material, normal, wo), clampParams);
+        result.value = closure.value;
+        result.pdf = closure.pdf;
         return result;
     }
 
@@ -2719,13 +3114,13 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
             result.isDelta = true;
             return result;
         }
-        float alpha = roughness * roughness;
+        float alpha = std::max(roughness * roughness, 1.0e-4f);
         simd::float3 wh = simd::normalize(wo + wi);
         if (simd::dot(wh, normal) <= 0.0f || simd::dot(wo, wh) <= 0.0f || simd::dot(wi, wh) <= 0.0f) {
             return result;
         }
 
-        float D = GgxDistribution(alpha, simd::dot(normal, wh));
+        float D = GgxDistribution(alpha, normal, wh);
         float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
         simd::float3 f0 = ConductorF0(material);
         simd::float3 F = MaterialHasConductorIor(material)
@@ -2739,8 +3134,9 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
                              : SchlickFresnel(f0, simd::dot(wi, wh));
         float denom = 4.0f * cosThetaO * cosThetaI;
         simd::float3 spec = F * (D * G / std::max(denom, 1.0e-6f));
-        spec = ClampSpecularTail(spec, roughness, f0, clampParams);
-        float pdf = GgxPdf(alpha, normal, wo, wi);
+        spec *= SpecularEnergyCompensation(f0, roughness, cosThetaO);
+        spec = SanitizeSpecularValue(spec);
+        float pdf = D * GgxG1(alpha, cosThetaO) / (4.0f * cosThetaO);
         if (pdf > 0.0f) {
             result.value = simd::max(spec, simd_make_float3(0.0f, 0.0f, 0.0f));
             result.pdf = ClampSpecularPdf(pdf, clampParams);
@@ -2749,26 +3145,12 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
     }
 
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::CarPaint)) {
-        float pCoat = CarpaintCoatSampleWeight(material);
-        float pFlake = CarpaintFlakeSampleWeight(material);
-        float pBase = std::max(1.0f - (pCoat + pFlake), 0.0f);
-        float norm = pCoat + pFlake + pBase;
-        if (norm <= 1.0e-6f) {
-            pBase = 1.0f;
-            pCoat = 0.0f;
-            pFlake = 0.0f;
-            norm = 1.0f;
-        }
-        pCoat /= norm;
-        pFlake /= norm;
-        pBase /= norm;
-
-        CarpaintLobeResult coatRes = CarpaintEvalCoat(material, normal, wo, wi, clampParams);
-        CarpaintLobeResult flakeRes = CarpaintEvalFlake(material, position, normal, wo, wi, clampParams);
-        CarpaintLobeResult baseRes = CarpaintEvalBase(material, normal, wo, wi, clampParams);
-
-        result.value = pBase * baseRes.value + pFlake * flakeRes.value + pCoat * coatRes.value;
-        result.pdf = pBase * baseRes.pdf + pFlake * flakeRes.pdf + pCoat * coatRes.pdf;
+        simd::float3 flakeNormal = CarpaintFlakeNormal(material, position, normal);
+        ClosureValuePdf closure =
+            CarpaintClosureEval(material, normal, flakeNormal, wo, wi,
+                                CarpaintLobeProbabilitiesFor(material, normal, flakeNormal, wo), clampParams);
+        result.value = closure.value;
+        result.pdf = closure.pdf;
         return result;
     }
 
@@ -2785,28 +3167,6 @@ BsdfEval EvaluateBsdf(const PathTracerShaderTypes::MaterialData& material,
 
 CpuReservoir MakeEmptyCpuReservoir() {
     return CpuReservoir{};
-}
-
-CpuRestirDiReservoirState MakeEmptyCpuRestirDiReservoir(uint32_t frameTag) {
-    CpuRestirDiReservoirState reservoir;
-    reservoir.frameTag = frameTag;
-    return reservoir;
-}
-
-CpuRestirDiVisibilityState MakeEmptyCpuRestirDiVisibility(uint32_t frameTag) {
-    CpuRestirDiVisibilityState visibility;
-    visibility.frameTag = frameTag;
-    return visibility;
-}
-
-bool CpuRestirDiReservoirValid(const CpuRestirDiReservoirState& reservoir) {
-    return (reservoir.stateFlags & 1u) != 0u &&
-           reservoir.candidateCount > 0u &&
-           reservoir.weight > 0.0f &&
-           reservoir.pdf > 0.0f &&
-           IsFinite(reservoir.position) &&
-           IsFinite(reservoir.normal) &&
-           IsFinite(reservoir.emission);
 }
 
 bool CpuUpdateReservoir(CpuReservoir& reservoir,
@@ -2841,10 +3201,6 @@ bool CpuRisPayloadIsDirectional(const CpuRisSamplePayload& payload) {
     return (payload.flags & PathTracerShaderTypes::kLightPrimitiveFlagDirectional) != 0u;
 }
 
-bool CpuRisPayloadIsAnalyticRect(const CpuRisSamplePayload& payload) {
-    return (payload.flags & kCpuRisPayloadAnalyticRectFlag) != 0u;
-}
-
 simd::float3 CpuRisPayloadOmegaL(const HitInfo& hit, const CpuRisSamplePayload& payload) {
     return CpuRisPayloadIsDirectional(payload)
         ? simd::normalize(payload.position)
@@ -2862,10 +3218,6 @@ float CpuRisPayloadDistanceSq(const HitInfo& hit, const CpuRisSamplePayload& pay
 bool CpuShadowHitIsSelectedLight(const HitInfo& shadowHit, const CpuRisSamplePayload& payload) {
     if (CpuRisPayloadIsDirectional(payload)) {
         return false;
-    }
-    if (CpuRisPayloadIsAnalyticRect(payload)) {
-        return shadowHit.primitiveType == GeometryType::Rectangles &&
-               shadowHit.primitiveIndex == payload.primitiveIndex;
     }
     return shadowHit.primitiveType == GeometryType::Mesh &&
            shadowHit.primitiveIndex == payload.primitiveIndex;
@@ -2892,19 +3244,36 @@ bool CpuSampleDirectionalLight(const std::vector<DirectionalLightInfo>& directio
     if (directionalLights.empty()) {
         return false;
     }
-    uint32_t selected = std::min(static_cast<uint32_t>(rng.nextFloat() * directionalLights.size()),
+    uint32_t selected = std::min(static_cast<uint32_t>(rng.nextFloat() * static_cast<float>(directionalLights.size())),
                                  static_cast<uint32_t>(directionalLights.size() - 1u));
     const DirectionalLightInfo& light = directionalLights[selected];
+    const simd::float3 direction = SampleDirectionalCone(light.direction, light.cosDelta, rng);
     outSample.primitiveIndex = selected;
     outSample.flags = PathTracerShaderTypes::kLightPrimitiveFlagDirectional;
-    outSample.position = light.direction;
-    outSample.normal = -light.direction;
+    outSample.position = direction;
+    outSample.normal = -direction;
     outSample.emission = light.emission;
     outSample.pdf = providerPdf / static_cast<float>(directionalLights.size());
     return outSample.pdf > 0.0f && std::isfinite(outSample.pdf) && IsFinite(outSample.emission);
 }
 
-bool CpuSampleMeshLight(const std::vector<MeshLightInfo>& meshLights,
+bool CpuResolveTexturedMeshEmission(const EmbreeSceneData& sceneData,
+                                    const MeshLightInfo& light,
+                                    float b1,
+                                    float b2,
+                                    simd::float3& emission);
+
+// Metal's tagged_emissive_selection_pdf: the power share of a plain emitter, the cumulative-power step of a two-sided
+// or textured one.
+float MeshLightSelectionPdf(const std::vector<MeshLightInfo>& meshLights, size_t index) {
+    const MeshLightInfo& light = meshLights[index];
+    return (light.twoSided || light.texturedEmission)
+        ? light.cumulativePower - (index > 0u ? meshLights[index - 1u].cumulativePower : 0.0f)
+        : light.selectionPdf;
+}
+
+bool CpuSampleMeshLight(const EmbreeSceneData& sceneData,
+                        const std::vector<MeshLightInfo>& meshLights,
                         const HitInfo& hit,
                         float providerPdf,
                         Rng& rng,
@@ -2955,7 +3324,8 @@ bool CpuSampleMeshLight(const std::vector<MeshLightInfo>& meshLights,
         return false;
     }
     const simd::float3 direction = toLight / distance;
-    const float cosLight = simd::dot(-direction, normal);
+    const float signedCosLight = simd::dot(-direction, normal);
+    const float cosLight = light.twoSided ? std::fabs(signedCosLight) : signedCosLight;
     if (!(cosLight > 0.0f) || !std::isfinite(cosLight)) {
         return false;
     }
@@ -2963,37 +3333,158 @@ bool CpuSampleMeshLight(const std::vector<MeshLightInfo>& meshLights,
     const float pdfArea = 1.0f / light.area;
     const float pdfDir = pdfArea * distSq / std::max(cosLight, 1.0e-6f);
     outSample.primitiveIndex = light.primitiveIndex;
-    outSample.flags = 0u;
+    outSample.flags = light.twoSided ? PathTracerShaderTypes::kLightPrimitiveFlagTwoSided : 0u;
+    if (light.texturedEmission) {
+        outSample.flags |= PathTracerShaderTypes::kLightPrimitiveFlagTexturedEmission;
+    }
     outSample.position = samplePoint;
     outSample.normal = normal;
     outSample.emission = light.emission;
-    outSample.pdf = pdfDir * light.selectionPdf * providerPdf;
+    if (light.texturedEmission &&
+        !CpuResolveTexturedMeshEmission(sceneData, light, b1, b2, outSample.emission)) {
+        return false;
+    }
+    const size_t index = static_cast<size_t>(selectedIt - meshLights.begin());
+    outSample.pdf = pdfDir * MeshLightSelectionPdf(meshLights, index) * providerPdf;
     return outSample.pdf > 0.0f && std::isfinite(outSample.pdf);
 }
 
-bool CpuSampleAnalyticRectLight(const std::vector<RectLightInfo>& rectLights,
-                                const EnvironmentMap* env,
-                                const PathTracer::RenderSettings& settings,
-                                const HitInfo& hit,
-                                float providerPdf,
-                                Rng& rng,
-                                CpuRisSamplePayload& outSample) {
-    outSample = CpuRisSamplePayload{};
-    RectLightSample rectSample;
-    if (!SampleRectLight(rectLights, env, settings, hit, rng, rectSample)) {
+// Metal's mesh_emitter_light_pdf_for_hit for one baseline draw: the solid-angle density with which CpuSampleMeshLight
+// reaches this hit of a mesh emitter from `origin`. 0 for a triangle outside the emitter list (Metal's inventory, in
+// ascending triangle order) or seen from a side it does not emit to.
+float MeshLightPdfForHit(const std::vector<MeshLightInfo>& lights, const HitInfo& hit, const simd::float3& origin) {
+    if (hit.primitiveType != GeometryType::Mesh) return 0.0f;
+    const simd::float3 delta = hit.position - origin;
+    const float distanceSq = simd::dot(delta, delta);
+    if (!(distanceSq > 0.0f)) return 0.0f;
+    auto found = std::lower_bound(lights.begin(), lights.end(), hit.primitiveIndex,
+        [](const MeshLightInfo& light, uint32_t triangle) { return light.primitiveIndex < triangle; });
+    if (found == lights.end() || found->primitiveIndex != hit.primitiveIndex || !(found->area > 0.0f)) return 0.0f;
+    const float signedCosine = simd::dot(found->normal, -delta / std::sqrt(distanceSq));
+    const float cosine = found->twoSided ? std::fabs(signedCosine) : signedCosine;
+    const float selectionPdf = MeshLightSelectionPdf(lights, static_cast<size_t>(found - lights.begin()));
+    return cosine > 0.0f ? std::max(selectionPdf, 0.0f) * distanceSq / (found->area * cosine) : 0.0f;
+}
+
+// Whether a mesh-light triangle faces `origin`, i.e. whether the ReSTIR DI reservoir can sample it from there: its
+// target takes the light's emissive cosine (Metal's emissive_light_cosine), the front one, or either side of a
+// two-sided emitter.
+bool MeshLightFacesOrigin(const std::vector<MeshLightInfo>& lights, const HitInfo& hit,
+                          const simd::float3& origin) {
+    if (hit.primitiveType != GeometryType::Mesh) return false;
+    auto found = std::lower_bound(lights.begin(), lights.end(), hit.primitiveIndex,
+        [](const MeshLightInfo& light, uint32_t triangle) { return light.primitiveIndex < triangle; });
+    if (found == lights.end() || found->primitiveIndex != hit.primitiveIndex || !(found->area > 0.0f)) return false;
+    const float facing = simd::dot(found->normal, origin - hit.position);
+    return found->twoSided ? facing != 0.0f : facing > 0.0f;
+}
+
+bool ReferencePbrTransmissionNee(const PathTracerShaderTypes::MaterialData& material) {
+    return static_cast<uint32_t>(material.typeEta.x) == 7u &&
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u &&
+        material.pbrExtras.z > 0.0f && material.pbrParams.x < 1.0f;
+}
+
+simd::float3 ReferenceContinuationNeeValue(const PathTracerShaderTypes::MaterialData& material,
+                                           simd::float3 normal, simd::float3 wo, simd::float3 wi,
+                                           simd::float3 value) {
+    const bool reference = (material.materialFlags & PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation) != 0u ||
+        (static_cast<uint32_t>(material.typeEta.x) == 7u &&
+         (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u);
+    if (reference && simd::dot(normal, wo) * simd::dot(normal, wi) < 0.0f) {
+        const float relativeIor = std::max(material.typeEta.y, 1.0e-3f);
+        value *= relativeIor * relativeIor;
+    }
+    return value;
+}
+
+// Falcor neither excludes the shaded triangle from the next ray nor starts it
+// below the face, so light arriving from behind the geometric face (reachable
+// through a tilted shading normal) is blocked by the surface itself, as Metal.
+bool FalcorFaceVisible(const PathTracerShaderTypes::MaterialData& material,
+                       const HitInfo& hit,
+                       simd::float3 wi) {
+    if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) == 0u) {
+        return true;
+    }
+    const simd::float3 faceNormal = hit.frontFace ? hit.normal : -hit.normal;
+    return simd::dot(faceNormal, wi) > 0.0f;
+}
+
+// Metal's two_sided_alpha_cutout_direct_cos: the surface cosine of a direct-light sample. Plain NEE and, since Metal
+// PR #80, the RIS and ReSTIR DI targets (direct_light_target_cos) use it.
+float ReferenceDirectCos(const PathTracerShaderTypes::MaterialData& material,
+                          const HitInfo& hit,
+                          simd::float3 normal, simd::float3 wi) {
+    const float c = simd::dot(pt_shared::source_light_cos_normal(material, normal), wi);
+    if ((hit.twoSidedAlphaCutout &&
+         (material.materialFlags & PathTracerShaderTypes::kMaterialFlagAlphaCutoutContinuation) == 0u) ||
+        MaterialIsRegularizedDielectric(material) || pt_shared::source_rough_transmission(material) ||
+        ReferencePbrTransmissionNee(material) || ThinWalledPbrTransmissionNee(material)) {
+        return std::fabs(c);
+    }
+    return FalcorFaceVisible(material, hit, wi) ? std::max(c, 0.0f) : 0.0f;
+}
+
+// Metal's apply_two_sided_alpha_cutout_diffuse_fallback: direct light from behind a two-sided cutout, which its PBR
+// lobes do not reflect, shades it as Lambertian diffuse. Returns true whenever it supplied that value, a term no BSDF
+// strategy produces (a transmission lobe included; see Metal's comment): the pdf it sets only keeps the callers'
+// pdf > 0 tests, and NEE's MIS weight must use a BSDF pdf of 0 there (Metal's nee_mis_bsdf_pdf, EP19).
+bool ApplyTwoSidedAlphaCutoutDiffuseFallback(const PathTracerShaderTypes::MaterialData& material,
+                                             const HitInfo& hit,
+                                             simd::float3 normal,
+                                             simd::float3 wi,
+                                             BsdfEval& eval) {
+    if ((material.materialFlags & (PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular |
+                                   PathTracerShaderTypes::kMaterialFlagAlphaCutoutContinuation)) != 0u ||
+        !hit.twoSidedAlphaCutout || simd::dot(normal, wi) >= 0.0f ||
+        eval.value.x > 0.0f || eval.value.y > 0.0f || eval.value.z > 0.0f) {
         return false;
     }
-    outSample.primitiveIndex = rectSample.rectIndex;
-    outSample.flags = kCpuRisPayloadAnalyticRectFlag;
-    outSample.position = hit.position + rectSample.direction * rectSample.distance;
-    if (rectSample.lightIndex < rectLights.size()) {
-        outSample.normal = rectLights[rectSample.lightIndex].normal;
-    } else {
-        outSample.normal = -rectSample.direction;
+    // Metal's weight: the PBR diffuse lobe's (1 - metallic) and (1 - transmission), so a fully transmissive cutout
+    // gets no fallback.
+    const float metallic = std::clamp(material.pbrParams.x, 0.0f, 1.0f);
+    const float transmission = std::clamp(material.pbrExtras.z, 0.0f, 1.0f) * (1.0f - metallic);
+    const simd::float3 diffuseColor = MaterialBaseColor(material) * (1.0f - metallic) * (1.0f - transmission) *
+        std::clamp(material.pbrParams.z, 0.0f, 1.0f);
+    eval.value = diffuseColor / kPi;
+    eval.pdf = std::max(std::fabs(simd::dot(normal, wi)) / kPi, 1.0e-6f);
+    eval.isDelta = false;
+    return true;
+}
+
+// Metal's nee_mis_bsdf_pdf: the BSDF pdf NEE's MIS weight uses.
+float NeeMisBsdfPdf(const BsdfEval& eval, bool cutoutBackLightUnsampled) {
+    return cutoutBackLightUnsampled ? 0.0f : eval.pdf;
+}
+
+// Metal's direct_light_target_bsdf (direct_light_target.metal): the material term of the RIS and ReSTIR DI targets and
+// of the winner's shading is plain NEE's, with its Lambertian fallback for a two-sided cutout lit from behind and its
+// eta-free continuation value on area samples.
+BsdfEval DirectLightTargetBsdf(const PathTracerShaderTypes::MaterialData& material,
+                               const HitInfo& hit,
+                               simd::float3 normal,
+                               simd::float3 wo,
+                               simd::float3 wi,
+                               const FireflyClampParams& clampParams,
+                               bool directional) {
+    BsdfEval eval = EvaluateBsdf(material, hit.position, normal, wo, wi, clampParams, directional);
+    ApplyTwoSidedAlphaCutoutDiffuseFallback(material, hit, normal, wi, eval);
+    if (!directional) {
+        eval.value = ReferenceContinuationNeeValue(material, normal, wo, wi, eval.value);
     }
-    outSample.emission = rectSample.emission;
-    outSample.pdf = rectSample.pdf * providerPdf;
-    return outSample.pdf > 0.0f && std::isfinite(outSample.pdf);
+    return eval;
+}
+
+// Metal's emissive_light_cosine, clamped as the RIS and ReSTIR DI targets clamp it: a two-sided emitter lights both
+// of its sides.
+float CpuRisPayloadLightCosine(const CpuRisSamplePayload& sample, simd::float3 omegaL) {
+    if (CpuRisPayloadIsDirectional(sample)) {
+        return 1.0f;
+    }
+    const float c = simd::dot(sample.normal, -omegaL);
+    return std::clamp((sample.flags & PathTracerShaderTypes::kLightPrimitiveFlagTwoSided) != 0u ? std::fabs(c) : c,
+                      0.0f, 1.0f);
 }
 
 float CpuReservoirWinnerPHatForHit(const HitInfo& hit,
@@ -3007,11 +3498,10 @@ float CpuReservoirWinnerPHatForHit(const HitInfo& hit,
         return 0.0f;
     }
     simd::float3 omegaL = CpuRisPayloadOmegaL(hit, winner);
-    float cosThetaSurface = std::clamp(simd::dot(shadingNormal, omegaL), 0.0f, 1.0f);
-    float cosThetaLight = CpuRisPayloadIsDirectional(winner)
-        ? 1.0f
-        : std::clamp(simd::dot(winner.normal, -omegaL), 0.0f, 1.0f);
-    BsdfEval bsdfEval = EvaluateBsdf(material, hit.position, shadingNormal, wo, omegaL, clampParams);
+    float cosThetaSurface = ReferenceDirectCos(material, hit, shadingNormal, omegaL);
+    float cosThetaLight = CpuRisPayloadLightCosine(winner, omegaL);
+    BsdfEval bsdfEval = DirectLightTargetBsdf(material, hit, shadingNormal, wo, omegaL, clampParams,
+        CpuRisPayloadIsDirectional(winner));
     if (bsdfEval.isDelta) {
         return 0.0f;
     }
@@ -3019,11 +3509,9 @@ float CpuReservoirWinnerPHatForHit(const HitInfo& hit,
 }
 
 bool CpuBuildRestirDiProviderReservoirForHit(
+    const EmbreeSceneData& sceneData,
     const std::vector<DirectionalLightInfo>& directionalLights,
     const std::vector<MeshLightInfo>& meshLights,
-    const std::vector<RectLightInfo>& rectLights,
-    const EnvironmentMap* env,
-    const PathTracer::RenderSettings& settings,
     const HitInfo& hit,
     const PathTracerShaderTypes::MaterialData& material,
     const simd::float3& shadingNormal,
@@ -3035,17 +3523,14 @@ bool CpuBuildRestirDiProviderReservoirForHit(
     reservoir = MakeEmptyCpuReservoir();
     const bool hasDirectionalProvider = !directionalLights.empty();
     const bool hasMeshProvider = !meshLights.empty();
-    const bool hasAnalyticProvider = !rectLights.empty();
-    const uint32_t providerCount = (hasDirectionalProvider ? 1u : 0u) +
-                                   (hasMeshProvider ? 1u : 0u) +
-                                   (hasAnalyticProvider ? 1u : 0u);
+    const uint32_t providerCount = (hasDirectionalProvider ? 1u : 0u) + (hasMeshProvider ? 1u : 0u);
     if (providerCount == 0u) {
         return false;
     }
     const float providerPdf = 1.0f / static_cast<float>(providerCount);
     const uint32_t risTargetM = std::max(candidateCount, 1u);
     for (uint32_t i = 0; i < risTargetM; ++i) {
-        uint32_t selected = std::min(static_cast<uint32_t>(rng.nextFloat() * providerCount),
+        uint32_t selected = std::min(static_cast<uint32_t>(rng.nextFloat() * static_cast<float>(providerCount)),
                                      providerCount - 1u);
         CpuRisSamplePayload candidate;
         bool sampled = false;
@@ -3057,13 +3542,7 @@ bool CpuBuildRestirDiProviderReservoirForHit(
             ordinal += 1u;
         }
         if (!sampled && hasMeshProvider && selected == ordinal) {
-            sampled = CpuSampleMeshLight(meshLights, hit, providerPdf, rng, candidate);
-        }
-        if (hasMeshProvider) {
-            ordinal += 1u;
-        }
-        if (!sampled && hasAnalyticProvider && selected == ordinal) {
-            sampled = CpuSampleAnalyticRectLight(rectLights, env, settings, hit, providerPdf, rng, candidate);
+            sampled = CpuSampleMeshLight(sceneData, meshLights, hit, providerPdf, rng, candidate);
         }
         if (!sampled) {
             continue;
@@ -3073,11 +3552,10 @@ bool CpuBuildRestirDiProviderReservoirForHit(
             continue;
         }
         simd::float3 omegaL = CpuRisPayloadOmegaL(hit, candidate);
-        float cosThetaSurface = std::clamp(simd::dot(shadingNormal, omegaL), 0.0f, 1.0f);
-        float cosThetaLight = CpuRisPayloadIsDirectional(candidate)
-            ? 1.0f
-            : std::clamp(simd::dot(candidate.normal, -omegaL), 0.0f, 1.0f);
-        BsdfEval bsdfEval = EvaluateBsdf(material, hit.position, shadingNormal, wo, omegaL, clampParams);
+        float cosThetaSurface = ReferenceDirectCos(material, hit, shadingNormal, omegaL);
+        float cosThetaLight = CpuRisPayloadLightCosine(candidate, omegaL);
+        BsdfEval bsdfEval = DirectLightTargetBsdf(material, hit, shadingNormal, wo, omegaL, clampParams,
+            CpuRisPayloadIsDirectional(candidate));
         if (bsdfEval.isDelta) {
             continue;
         }
@@ -3089,35 +3567,12 @@ bool CpuBuildRestirDiProviderReservoirForHit(
         float u = (reservoir.M == 0u) ? 0.0f : rng.nextFloat();
         CpuUpdateReservoir(reservoir, candidate, weight, u);
     }
-    return reservoir.valid && reservoir.M > 0u && reservoir.wSum > 0.0f;
-}
-
-CpuRestirDiReservoirState CpuRestirDiStateFromReservoir(
-    const HitInfo& hit,
-    const PathTracerShaderTypes::MaterialData& material,
-    const simd::float3& shadingNormal,
-    const simd::float3& wo,
-    const FireflyClampParams& clampParams,
-    uint32_t frameTag,
-    const CpuReservoir& reservoir) {
-    CpuRestirDiReservoirState state = MakeEmptyCpuRestirDiReservoir(frameTag);
-    if (!reservoir.valid || reservoir.M == 0u || !(reservoir.wSum > 0.0f)) {
-        return state;
+    // Metal's provider builder (restir_di.metal): RIS normalizes by every candidate drawn. CpuUpdateReservoir counts
+    // only the accepted ones, which inflated W whenever a draw failed or had zero target weight.
+    if (reservoir.valid) {
+        reservoir.M = risTargetM;
     }
-    float targetPdf = CpuReservoirWinnerPHatForHit(hit, material, shadingNormal, wo, clampParams, reservoir.winner);
-    state.position = reservoir.winner.position;
-    state.pdf = reservoir.winner.pdf;
-    state.normal = reservoir.winner.normal;
-    state.targetPdf = targetPdf;
-    state.emission = reservoir.winner.emission;
-    state.weight = reservoir.wSum;
-    state.primitiveIndex = reservoir.winner.primitiveIndex;
-    state.flags = reservoir.winner.flags;
-    state.stateFlags = 1u;
-    state.frameTag = frameTag;
-    state.candidateCount = reservoir.M;
-    state.surfacePrimitiveIndex = hit.primitiveIndex;
-    return state;
+    return reservoir.valid && reservoir.M > 0u && reservoir.wSum > 0.0f;
 }
 
 bool CpuDiffuseRestirEligibleMaterial(const PathTracerShaderTypes::MaterialData& material) {
@@ -3190,6 +3645,7 @@ bool CpuBsdfDiffuseCandidateValid(const BsdfSample& sample,
     return CpuDiffuseRestirEligibleMaterial(material) &&
            sample.pdf > 0.0f &&
            !sample.isDelta &&
+           !sample.isBssrdf &&
            sample.lobeType == 0u &&
            IsFinite(sample.direction) &&
            simd::dot(sample.direction, sample.direction) > 0.0f &&
@@ -3306,8 +3762,20 @@ bool CpuRadianceCacheCanQuery(const PathTracer::RenderSettings& settings,
            CpuDiffuseRestirEligibleMaterial(material) &&
            sample.pdf > 0.0f &&
            !sample.isDelta &&
+           !sample.isBssrdf &&
            sample.lobeType == 0u &&
            IsFinite(sample.weight);
+}
+
+// Diagnostics only: the reason CpuRadianceCacheCanQuery refused, in radiance_cache.metal's codes
+// (2 = material or depth, 3 = sample), so Embree and Metal report fallbacks the same way.
+uint32_t CpuRadianceCacheCannotQueryReason(const PathTracer::RenderSettings& settings,
+                                           const PathTracerShaderTypes::MaterialData& material,
+                                           uint32_t depth) {
+    if (depth < std::max(settings.radianceCacheMinDepth, 1u) || !CpuDiffuseRestirEligibleMaterial(material)) {
+        return 2u;
+    }
+    return 3u;
 }
 
 constexpr uint32_t kCpuPathGuidingBinDim = 8u;
@@ -3415,6 +3883,7 @@ bool CpuPathGuidingCandidateValid(const BsdfSample& sample,
     return CpuPathGuidingMaterialAllowed(material, depth) &&
            sample.pdf > 0.0f &&
            !sample.isDelta &&
+           !sample.isBssrdf &&
            sample.lobeType == 0u &&
            IsFinite(sample.direction) &&
            simd::dot(sample.direction, sample.direction) > 0.0f &&
@@ -3798,6 +4267,9 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                       bool frontFace,
                       Rng& rng,
                       const FireflyClampParams& clampParams) {
+    if (pt_shared::source_model(material) > 0.0f) {
+        return SampleSourceClosure(material, normal, wo, frontFace, rng);
+    }
     BsdfSample result;
     const uint32_t type = static_cast<uint32_t>(material.typeEta.x);
 
@@ -3809,11 +4281,9 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
         if (pdf <= 0.0f || cosThetaI <= 0.0f) {
             return result;
         }
-        float cosThetaO = std::max(simd::dot(normal, wo), 0.0f);
-        simd::float3 albedo = (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Subsurface))
-            ? SssDiffuseColor(material, cosThetaI, cosThetaO)
-            : MaterialBaseColor(material);
-        simd::float3 f = albedo / kPi;
+        // Subsurface: Metal's closure sample (bsdf_sample.metal, case 5u) is this Lambert lobe with the base colour
+        // unless its separable diffusion runs (sss=separable), which Embree does not port and reports.
+        simd::float3 f = MaterialBaseColor(material) / kPi;
         simd::float3 weight = f * cosThetaI / pdf;
         if (!IsFinite(weight)) {
             return result;
@@ -3829,15 +4299,25 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
         simd::float3 baseColor = MaterialBaseColor(material);
         float metallic = std::clamp(material.pbrParams.x, 0.0f, 1.0f);
         float roughness = std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f);
-        float dielectricF0 = DielectricF0FromIor(material.typeEta.y);
+        const bool reference = (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u;
+        const float relativeIor = std::max(material.typeEta.y, 1.0e-3f);
+        float dielectricF0 = DielectricF0FromIor(reference ? std::max(relativeIor, 1.0f / relativeIor) : material.typeEta.y);
         simd::float3 f0 = baseColor * metallic +
                           simd_make_float3(dielectricF0, dielectricF0, dielectricF0) * (1.0f - metallic);
         simd::float3 diffuseColor = baseColor * (1.0f - metallic) *
                                     std::clamp(material.pbrParams.z, 0.0f, 1.0f);
         float transmission = std::clamp(material.pbrExtras.z, 0.0f, 1.0f) * (1.0f - metallic);
+        const bool glassInterface = !reference && transmission > 0.0f;
+        const bool thinWalled = glassInterface && ThinWalledPbrTransmission(material);
         float reflectScale = 1.0f - transmission;
         float specWeightBase = PbrSpecularWeight(f0);
-        float wSpec = specWeightBase * reflectScale;
+        if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u) {
+            // Falcor picks lobes by albedo: Fresnel-weighted specular against diffuse, as Metal.
+            const float specAlbedo = Luminance(SchlickFresnel(f0, std::clamp(simd::dot(normal, wo), 0.0f, 1.0f)));
+            specWeightBase = std::clamp(specAlbedo / std::max(specAlbedo + Luminance(diffuseColor), 1.0e-6f), 0.05f, 0.95f);
+        }
+        const float specularScale = reference ? 1.0f : reflectScale;
+        float wSpec = specWeightBase * specularScale;
         float wDiff = (1.0f - specWeightBase) * reflectScale;
         float wTrans = transmission;
         float weightSum = wSpec + wDiff + wTrans;
@@ -3867,11 +4347,14 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                     return result;
                 }
                 float cosThetaO = std::max(simd::dot(normal, wo), 0.0f);
-                f = SchlickFresnel(f0, cosThetaO) * reflectScale;
+                // A delta BRDF carries 1/cos(theta_i), cancelling the tail's cosine.
+                f = SchlickFresnel(f0, cosThetaO) * specularScale / cosThetaI;
                 pdfSpec = 1.0f;
                 result.isDelta = true;
             } else {
-                float alpha = roughness * roughness;
+                float alpha = (reference ||
+                               (material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u)
+                    ? roughness * roughness : std::max(roughness * roughness, 1.0e-4f);
                 simd::float3 wh = SampleGgxVndf(rng, roughness, normal, wo);
                 if (simd::dot(wh, normal) <= 0.0f) {
                     return result;
@@ -3882,15 +4365,26 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                 if (cosThetaI <= 0.0f || cosThetaO <= 0.0f) {
                     return result;
                 }
-                float D = GgxDistribution(alpha, simd::dot(normal, wh));
+                float D = GgxDistribution(alpha, normal, wh);
                 float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
                 simd::float3 F = SchlickFresnel(f0, simd::dot(wi, wh));
                 float denom = 4.0f * cosThetaO * cosThetaI;
                 f = F * (D * G / std::max(denom, 1.0e-6f));
-                f *= SpecularEnergyCompensation(f0, roughness, cosThetaO);
-                f = ClampSpecularTail(f, roughness, f0, clampParams);
-                f *= reflectScale;
-                pdfSpec = GgxPdf(alpha, normal, wo, wi);
+                // No compensation for Falcor-standard materials, as in the evaluation above and on Metal.
+                if ((material.materialFlags & (PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular |
+                                               PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf)) == 0u) {
+                    f *= SpecularEnergyCompensation(f0, roughness, cosThetaO);
+                }
+                f = SanitizeSpecularValue(f);
+                f *= specularScale;
+                // Falcor samples the VNDF, so its density is the VNDF pdf over the
+                // reflection Jacobian 4*(wo.wh), as Metal.
+                const float woDotWh = simd::dot(wo, wh);
+                pdfSpec = reference
+                    ? GgxPdf(alpha, normal, wo, wi, /*halfVectorD=*/true)
+                    : (material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u
+                        ? (woDotWh > 0.0f ? GgxVndfPdf(alpha, normal, wo, wh, /*halfVectorD=*/true) / (4.0f * woDotWh) : 0.0f)
+                        : D * GgxG1(alpha, cosThetaO) / (4.0f * cosThetaO);
             }
         } else if (choose < (pSpec + pDiff)) {
             float pdf = 0.0f;
@@ -3901,18 +4395,86 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                 return result;
             }
             f = (diffuseColor / kPi) * reflectScale;
+            if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u) {
+                f *= FrostbiteDiffuseScale(normal, wo, wi, roughness);
+            }
         } else {
             sampledLobeType = 2u;
             sampledLobeRoughness = roughness;
             float cosThetaO = simd::dot(normal, wo);
             float absCosThetaO = std::fabs(cosThetaO);
             float etaI = 1.0f;
-            float etaT = std::max(material.typeEta.y, 1.0f);
-            if (cosThetaO < 0.0f) {
+            float etaT = reference ? relativeIor : std::max(material.typeEta.y, 1.0f);
+            // `normal` always faces wo, so only the hit's face tells an exit.
+            // A thin-walled sheet is entered from outside on either face.
+            if (!frontFace && !reference && !thinWalled) {
                 std::swap(etaI, etaT);
             }
             float eta = etaI / etaT;
-            if (roughness <= 1.0e-3f) {
+            if (glassInterface) {
+                const bool deltaGlass = roughness <= 1.0e-3f;
+                const simd::float3 wh = deltaGlass ? normal : SampleGgxVndf(rng, roughness, normal, wo);
+                const float woDotWh = simd::dot(wo, wh);
+                float cosThetaT = 0.0f;
+                const float F = FresnelDielectricExact(woDotWh, etaI, etaT, cosThetaT);
+                const bool reflectGlass = F >= 1.0f || rng.nextFloat() < F;
+                if (reflectGlass) {
+                    wi = Reflect(-wo, wh);
+                } else if (thinWalled) {
+                    // Straight through (eta = 1); a rough sheet mirrors the
+                    // reflected microfacet direction through the tangent plane.
+                    const simd::float3 reflected = Reflect(-wo, wh);
+                    wi = deltaGlass ? -wo : reflected - 2.0f * simd::dot(reflected, normal) * normal;
+                } else if (!Refract(-wo, wh, eta, wi)) {
+                    return result;
+                }
+                wi = simd::normalize(wi);
+                const float signedCosI = simd::dot(normal, wi);
+                const float absCosI = std::fabs(signedCosI);
+                if (absCosI <= 0.0f || (reflectGlass ? signedCosI <= 0.0f : signedCosI >= 0.0f)) {
+                    return result;
+                }
+                sampledLobeType = reflectGlass ? 1u : 2u;
+                result.isDelta = deltaGlass;
+                if (deltaGlass) {
+                    const bool etaFree = (material.materialFlags &
+                        PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation) != 0u;
+                    const float etaScale = reflectGlass || etaFree || thinWalled ? 1.0f : eta * eta;
+                    f = simd_make_float3(1.0f, 1.0f, 1.0f) * (transmission * (reflectGlass ? F : 1.0f - F) * etaScale / absCosI);
+                    if (!reflectGlass) {
+                        f *= DielectricTransmissionTint(material, absCosI);
+                    }
+                    pdfTrans = reflectGlass ? F : 1.0f - F;
+                } else {
+                    const float alpha = std::max(roughness * roughness, 1.0e-4f);
+                    const float D = GgxDistribution(alpha, normal, wh);
+                    const float G = GgxG1(alpha, absCosThetaO) * GgxG1(alpha, absCosI);
+                    const float pdfWh = GgxVndfPdf(alpha, normal, wo, wh, /*halfVectorD=*/true);
+                    if (reflectGlass) {
+                        f = simd_make_float3(1.0f, 1.0f, 1.0f) * (transmission * F * D * G /
+                            std::max(4.0f * absCosThetaO * absCosI, 1.0e-6f));
+                        pdfTrans = F * pdfWh / (4.0f * std::max(woDotWh, 1.0e-6f));
+                    } else if (thinWalled) {
+                        // The mirrored reflection keeps the reflection Jacobian 1/(4 wo.wh).
+                        f = simd_make_float3(1.0f, 1.0f, 1.0f) * (transmission * (1.0f - F) * D * G /
+                            std::max(4.0f * absCosThetaO * absCosI, 1.0e-6f)) *
+                            DielectricTransmissionTint(material, absCosI);
+                        pdfTrans = (1.0f - F) * pdfWh / (4.0f * std::max(woDotWh, 1.0e-6f));
+                    } else {
+                        const float wiDotWh = simd::dot(wi, wh);
+                        const float denom = eta * woDotWh + wiDotWh;
+                        const float denomSq = denom * denom;
+                        if (denomSq <= 1.0e-8f) {
+                            return result;
+                        }
+                        const float factor = eta * eta * std::fabs(woDotWh * wiDotWh) /
+                            std::max(absCosThetaO * absCosI * denomSq, 1.0e-6f);
+                        f = simd_make_float3(1.0f, 1.0f, 1.0f) * (transmission * (1.0f - F) * D * G * factor) *
+                            DielectricTransmissionTint(material, absCosI);
+                        pdfTrans = (1.0f - F) * pdfWh * std::fabs(wiDotWh) / denomSq;
+                    }
+                }
+            } else if (roughness <= 1.0e-3f) {
                 if (!Refract(-wo, normal, eta, wi)) {
                     return result;
                 }
@@ -3920,11 +4482,16 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                 float cosThetaI = simd::dot(normal, wi);
                 float cosThetaT = 0.0f;
                 float Fr = FresnelDielectricExact(cosThetaO, etaI, etaT, cosThetaT);
-                float etaScale = (etaT * etaT) / std::max(etaI * etaI, 1.0e-6f);
-                float directionScale = etaScale * (std::fabs(cosThetaT) / std::max(absCosThetaO, 1.0e-6f));
-                simd::float3 ft = simd_make_float3(std::max(1.0f - Fr, 0.0f) * directionScale,
-                                                   std::max(1.0f - Fr, 0.0f) * directionScale,
-                                                   std::max(1.0f - Fr, 0.0f) * directionScale);
+                // Match Metal: physical (etaI/etaT)^2 radiance unless the material
+                // keeps the reference's eta-free continuation.
+                const bool etaFreeContinuation = reference ||
+                    (material.materialFlags &
+                     PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation) != 0u;
+                float etaScale = etaFreeContinuation ? 1.0f : eta * eta;
+                // A delta BTDF carries 1/|cos(theta_i)|, cancelling the tail's cosine.
+                float ftScale = std::max(1.0f - Fr, 0.0f) * etaScale /
+                                std::max(std::fabs(cosThetaI), 1.0e-6f);
+                simd::float3 ft = simd_make_float3(ftScale, ftScale, ftScale);
                 ft *= DielectricTransmissionTint(material, std::fabs(cosThetaI));
                 f = transmission * ft;
                 pdfTrans = 1.0f;
@@ -3942,15 +4509,16 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                 float absCosThetaI = std::fabs(cosThetaI);
                 float cosThetaOWh = simd::dot(wo, wh);
                 float cosThetaIWh = simd::dot(wi, wh);
-                if (cosThetaOWh * cosThetaIWh > 0.0f) {
+                if (cosThetaOWh * cosThetaIWh > 0.0f ||
+            (reference && (cosThetaOWh <= 0.0f || cosThetaIWh >= 0.0f))) {
                     return result;
                 }
                 float alpha = std::max(roughness * roughness, 1.0e-4f);
-                float D = GgxDistribution(alpha, std::max(simd::dot(normal, wh), 0.0f));
+                float D = GgxDistribution(alpha, normal, wh);
                 float G = GgxG1(alpha, absCosThetaO) * GgxG1(alpha, absCosThetaI);
                 float cosThetaT = 0.0f;
                 float F = FresnelDielectricExact(cosThetaOWh, etaI, etaT, cosThetaT);
-                float denom = cosThetaOWh + eta * cosThetaIWh;
+                float denom = eta * cosThetaOWh + cosThetaIWh;
                 float denomSq = denom * denom;
                 if (std::fabs(denomSq) <= 1.0e-8f) {
                     return result;
@@ -3960,13 +4528,26 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                 simd::float3 ft = simd_make_float3(1.0f - F, 1.0f - F, 1.0f - F) * D * G * factor;
                 ft *= DielectricTransmissionTint(material, absCosThetaI);
                 f = transmission * ft;
-                float pdfWh = GgxVndfPdf(alpha, normal, wo, wh);
-                float dwhDwi = std::fabs((eta * eta * cosThetaIWh) / std::max(denomSq, 1.0e-8f));
+                float pdfWh = reference ? D * GgxG1(alpha, absCosThetaO) * std::fabs(cosThetaOWh) / absCosThetaO
+                                   : GgxVndfPdf(alpha, normal, wo, wh, /*halfVectorD=*/true);
+                float dwhDwi = std::fabs(cosThetaIWh) / std::max(denomSq, 1.0e-8f);
                 pdfTrans = pdfWh * dwhDwi;
             }
         }
 
         float cosThetaI = std::fabs(simd::dot(normal, wi));
+        if (glassInterface && result.isDelta && simd::dot(normal, wi) > 0.0f) {
+            const bool entering = frontFace || thinWalled;
+            const float etaI = entering ? 1.0f : std::max(material.typeEta.y, 1.0f);
+            const float etaT = entering ? std::max(material.typeEta.y, 1.0f) : 1.0f;
+            float cosThetaT = 0.0f;
+            const float F = FresnelDielectricExact(simd::dot(normal, wo), etaI, etaT, cosThetaT);
+            // Opaque and glass mirrors share the same discrete direction.
+            f = ((1.0f - transmission) * SchlickFresnel(f0, simd::dot(normal, wo)) +
+                 simd_make_float3(1.0f, 1.0f, 1.0f) * (transmission * F)) / cosThetaI;
+            pdfSpec = 1.0f;
+            pdfTrans = F;
+        }
         float pdf = pSpec * pdfSpec + pDiff * pdfDiffuse + pTrans * pdfTrans;
         if (pdf <= 0.0f || cosThetaI <= 0.0f) {
             return result;
@@ -3980,21 +4561,51 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
         result.pdf = pdf;
         result.lobeType = sampledLobeType;
         result.lobeRoughness = sampledLobeRoughness;
+        if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u &&
+            !result.isDelta) {
+            // Falcor keeps the selected lobe's throughput, but reports the whole
+            // material's marginal direction density for light/BSDF MIS, as Metal.
+            result.pdf = EvaluateBsdf(material, position, normal, wo, wi, clampParams).pdf;
+        }
+        if (reference && !result.isDelta) {
+            const BsdfEval eval = EvaluateBsdf(material, position, normal, wo, wi, clampParams);
+            result.pdf = eval.pdf;
+            result.weight = eval.pdf > 0.0f ? eval.value * cosThetaI / eval.pdf : simd_make_float3(0.0f);
+            if (simd::dot(normal, wi) * simd::dot(normal, wo) < 0.0f) {
+                result.weight *= relativeIor * relativeIor;
+            }
+        }
+        if (!result.isDelta && roughness > 1.0e-3f && sampledLobeType < 2u &&
+            simd::dot(normal, wi) * simd::dot(normal, wo) > 0.0f &&
+            (material.materialFlags & (PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular |
+                                       PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf)) == 0u) {
+            // Export the mixture value and PDF so the BSDF-hit MIS weight uses the
+            // same density as environment NEE (Metal's sample_pbr_metallic_roughness does the same).
+            const BsdfEval eval = EvaluateBsdf(material, position, normal, wo, wi, clampParams);
+            result.pdf = eval.pdf;
+            result.weight = eval.pdf > 0.0f
+                ? simd::max(eval.value * cosThetaI / eval.pdf, simd_make_float3(0.0f))
+                : simd_make_float3(0.0f);
+        }
+        if (glassInterface && !result.isDelta && simd::dot(normal, wi) > 0.0f) {
+            // Use the actual exit eta for the sampler's overlapping reflection proposals.
+            const BsdfEval eval = EvaluateBsdf(material, position, normal, wo, wi, clampParams, false, frontFace);
+            result.pdf = eval.pdf;
+            result.weight = eval.pdf > 0.0f
+                ? simd::max(eval.value * cosThetaI / eval.pdf, simd_make_float3(0.0f))
+                : simd_make_float3(0.0f);
+        }
         return result;
     }
 
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Plastic)) {
-        simd::float3 albedo = MaterialBaseColor(material);
+        PlasticLobeProbabilities probs = PlasticLobeProbabilitiesFor(material, normal, wo);
+        if (probs.coat + probs.diffuse <= 0.0f) {
+            return result;
+        }
         float coatRoughness = PlasticCoatRoughness(material);
-        float alpha = coatRoughness * coatRoughness;
-        float ior = PlasticCoatIor(material);
-        float f0 = DielectricF0(ior);
-        simd::float3 f0Color = simd_make_float3(f0, f0, f0);
-        simd::float3 specularTint = PlasticSpecularTint(material);
-        float pCoat = PlasticCoatSampleWeight(material);
-
+        bool sampledPlasticCoat = rng.nextFloat() < probs.coat;
         simd::float3 wi;
-        bool sampledPlasticCoat = rng.nextFloat() < pCoat;
         if (sampledPlasticCoat) {
             simd::float3 wh = SampleGgxVndf(rng, coatRoughness, normal, wo);
             if (simd::dot(wh, normal) <= 0.0f) {
@@ -4002,61 +4613,26 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
             }
             wi = simd::normalize(Reflect(-wo, wh));
         } else {
-            float pdf = 0.0f;
-            wi = SampleCosineHemisphere(rng, normal, pdf);
+            float cosinePdf = 0.0f;
+            wi = SampleCosineHemisphere(rng, normal, cosinePdf);
         }
-
-        float cosThetaI = std::max(simd::dot(normal, wi), 0.0f);
-        float cosThetaO = std::max(simd::dot(normal, wo), 0.0f);
-        if (cosThetaI <= 0.0f || cosThetaO <= 0.0f) {
+        float cosThetaI = simd::dot(normal, wi);
+        if (!IsFinite(wi) || cosThetaI <= 0.0f) {
             return result;
         }
 
-        simd::float3 specular{0.0f, 0.0f, 0.0f};
-        float specularPdf = 0.0f;
-        simd::float3 wh = simd::normalize(wo + wi);
-        if (simd::dot(wh, normal) > 0.0f &&
-            simd::dot(wo, wh) > 0.0f &&
-            simd::dot(wi, wh) > 0.0f) {
-            float D = GgxDistribution(alpha, simd::dot(normal, wh));
-            float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
-            simd::float3 F = SchlickFresnel(f0Color, simd::dot(wi, wh));
-            float denom = 4.0f * cosThetaO * cosThetaI;
-            specular = F * (D * G / std::max(denom, 1.0e-6f));
-            specular = ClampSpecularTail(specular, coatRoughness, f0Color, clampParams);
-            specular *= specularTint;
-            float pdf = GgxPdf(alpha, normal, wo, wi);
-            if (pdf > 0.0f) {
-                specularPdf = ClampSpecularPdf(pdf, clampParams);
-            }
-            specular = simd::max(specular, simd_make_float3(0.0f, 0.0f, 0.0f));
-        }
-
-        simd::float3 diffuse = albedo / kPi;
-        simd::float3 tint = PlasticDiffuseTransmission(material, cosThetaI, cosThetaO);
-        simd::float3 F_i = SchlickFresnel(f0Color, cosThetaI);
-        simd::float3 F_o = SchlickFresnel(f0Color, cosThetaO);
-        diffuse *= tint;
-        diffuse *= (simd_make_float3(1.0f, 1.0f, 1.0f) - F_i) *
-                   (simd_make_float3(1.0f, 1.0f, 1.0f) - F_o);
-        diffuse *= std::max(1.0f - PlasticCoatFresnelAverage(material), 0.0f);
-        diffuse = simd::max(diffuse, simd_make_float3(0.0f, 0.0f, 0.0f));
-
-        float pdfDiffuse = LambertPdf(normal, wi);
-        float pdf = pCoat * specularPdf + (1.0f - pCoat) * pdfDiffuse;
-        if (pdf <= 0.0f) {
+        ClosureValuePdf closure = PlasticClosureEval(material, normal, wo, wi, probs, clampParams);
+        if (!(closure.pdf > 0.0f) ||
+            !(closure.value.x > 0.0f || closure.value.y > 0.0f || closure.value.z > 0.0f)) {
             return result;
         }
-
-        simd::float3 f = specular + diffuse;
-        simd::float3 weight = f * cosThetaI / pdf;
+        simd::float3 weight = closure.value * cosThetaI / closure.pdf;
         if (!IsFinite(weight)) {
             return result;
         }
-
         result.direction = wi;
         result.weight = simd::max(weight, simd_make_float3(0.0f, 0.0f, 0.0f));
-        result.pdf = pdf;
+        result.pdf = closure.pdf;
         result.lobeType = sampledPlasticCoat ? 1u : 0u;
         result.lobeRoughness = sampledPlasticCoat ? coatRoughness : 1.0f;
         return result;
@@ -4090,8 +4666,8 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
             return result;
         }
 
-        float alpha = roughness * roughness;
-        simd::float3 wh = SampleGgxHalfVector(rng, alpha, normal);
+        float alpha = std::max(roughness * roughness, 1.0e-4f);
+        simd::float3 wh = SampleGgxVndf(rng, roughness, normal, wo);
         if (simd::dot(wh, normal) <= 0.0f) {
             return result;
         }
@@ -4115,13 +4691,13 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                                                                  material.conductorK.y,
                                                                  material.conductorK.z))
                              : SchlickFresnel(f0, simd::dot(wi, wh));
-        float D = GgxDistribution(alpha, simd::dot(normal, wh));
+        float D = GgxDistribution(alpha, normal, wh);
         float G = GgxG1(alpha, cosThetaO) * GgxG1(alpha, cosThetaI);
         float denom = 4.0f * cosThetaO * cosThetaI;
         simd::float3 f = F * (D * G / std::max(denom, 1.0e-6f));
-        f = ClampSpecularTail(f, roughness, f0, clampParams);
-        float pdf = D * std::max(simd::dot(normal, wh), 0.0f) /
-                    std::max(4.0f * dotWoWh, 1.0e-6f);
+        f *= SpecularEnergyCompensation(f0, roughness, cosThetaO);
+        f = SanitizeSpecularValue(f);
+        float pdf = D * GgxG1(alpha, cosThetaO) / (4.0f * cosThetaO);
         if (pdf <= 0.0f) {
             return result;
         }
@@ -4139,125 +4715,66 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
     }
 
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::CarPaint)) {
-        float pCoat = CarpaintCoatSampleWeight(material);
-        float pFlake = CarpaintFlakeSampleWeight(material);
-        float pBase = std::max(1.0f - (pCoat + pFlake), 0.0f);
-        float norm = pCoat + pFlake + pBase;
-        if (norm <= 1.0e-6f) {
-            pBase = 1.0f;
-            pCoat = 0.0f;
-            pFlake = 0.0f;
-            norm = 1.0f;
+        if (simd::dot(normal, wo) <= 0.0f) {
+            return result;
         }
-        pCoat /= norm;
-        pFlake /= norm;
-        pBase /= norm;
-
-        float r = rng.nextFloat();
-        uint32_t lobe = 0u; // 0 = base, 1 = flake, 2 = coat
-        float thresholdCoat = pCoat;
-        float thresholdFlake = pCoat + pFlake;
-        if (pCoat > 0.0f && r < thresholdCoat) {
-            lobe = 2u;
-        } else if (pFlake > 0.0f && r < thresholdFlake) {
-            lobe = 1u;
+        simd::float3 flakeNormal = CarpaintFlakeNormal(material, position, normal);
+        CarpaintLobeProbabilities probs = CarpaintLobeProbabilitiesFor(material, normal, flakeNormal, wo);
+        if (probs.coat + probs.flake + probs.diffuse + probs.metal <= 0.0f) {
+            return result;
+        }
+        float u = rng.nextFloat();
+        simd::float3 lobeNormal = normal;
+        float lobeRoughness = 1.0f;
+        bool diffuseLobe = false;
+        if (u < probs.coat) {
+            lobeRoughness = PlasticCoatRoughness(material);
+        } else if (u < probs.coat + probs.flake) {
+            lobeNormal = flakeNormal;
+            lobeRoughness = CarpaintFlakeLobeRoughness(material);
+        } else if (u < probs.coat + probs.flake + probs.diffuse || probs.metal <= 0.0f) {
+            diffuseLobe = true;
         } else {
-            lobe = 0u;
-            if (pBase <= 1.0e-6f) {
-                if (pFlake > pCoat && pFlake > 0.0f) {
-                    lobe = 1u;
-                } else if (pCoat > 0.0f) {
-                    lobe = 2u;
-                }
-            }
+            lobeRoughness = CarpaintMetalRoughness(material);
         }
 
         simd::float3 wi;
-        if (lobe == 2u) {
-            float coatRoughness = PlasticCoatRoughness(material);
-            simd::float3 wh = SampleGgxVndf(rng, coatRoughness, normal, wo);
-            if (simd::dot(wh, normal) <= 0.0f) {
-                return result;
-            }
-            wi = simd::normalize(Reflect(-wo, wh));
-        } else if (lobe == 1u) {
-            float flakeRoughness = std::max(CarpaintFlakeRoughness(material), 1.0e-3f);
-            float alphaFlake = flakeRoughness * flakeRoughness;
-            simd::float3 flakeNormal = CarpaintFlakeNormal(material, position, normal);
-            simd::float3 wh = SampleGgxHalfVector(rng, alphaFlake, flakeNormal);
-            if (simd::dot(wh, flakeNormal) <= 0.0f) {
-                return result;
-            }
-            wi = simd::normalize(Reflect(-wo, wh));
+        if (diffuseLobe) {
+            float cosinePdf = 0.0f;
+            wi = SampleCosineHemisphere(rng, normal, cosinePdf);
         } else {
-            float metallic = CarpaintBaseMetallic(material);
-            float diffuseWeight = std::max(1.0f - metallic, 0.0f);
-            float specWeight = std::max(metallic, 0.0f);
-            float weightSum = diffuseWeight + specWeight;
-            float choose = rng.nextFloat();
-            bool sampleSpec = (specWeight > 0.0f) && (weightSum > 0.0f) &&
-                              (choose < specWeight / std::max(weightSum, 1.0e-6f));
-            if (sampleSpec) {
-                float baseRough = std::max(CarpaintBaseRoughness(material), 1.0e-3f);
-                float alphaBase = baseRough * baseRough;
-                simd::float3 wh = SampleGgxHalfVector(rng, alphaBase, normal);
-                if (simd::dot(wh, normal) <= 0.0f) {
-                    return result;
-                }
-                wi = simd::normalize(Reflect(-wo, wh));
-            } else {
-                float pdf = 0.0f;
-                wi = SampleCosineHemisphere(rng, normal, pdf);
+            simd::float3 wh = SampleGgxVndf(rng, lobeRoughness, lobeNormal, wo);
+            if (simd::dot(wh, lobeNormal) <= 0.0f) {
+                return result;
             }
+            wi = simd::normalize(Reflect(-wo, wh));
         }
-
-        if (!IsFinite(wi) || simd::dot(normal, wi) <= 0.0f) {
+        float cosThetaI = simd::dot(normal, wi);
+        if (!IsFinite(wi) || cosThetaI <= 0.0f) {
             return result;
         }
 
-        CarpaintLobeResult coatRes = CarpaintEvalCoat(material, normal, wo, wi, clampParams);
-        CarpaintLobeResult flakeRes = CarpaintEvalFlake(material, position, normal, wo, wi, clampParams);
-        CarpaintLobeResult baseRes = CarpaintEvalBase(material, normal, wo, wi, clampParams);
-
-        float combinedPdf = pBase * baseRes.pdf + pFlake * flakeRes.pdf + pCoat * coatRes.pdf;
-        if (combinedPdf <= 0.0f) {
+        ClosureValuePdf closure = CarpaintClosureEval(material, normal, flakeNormal, wo, wi, probs, clampParams);
+        if (!(closure.pdf > 0.0f) ||
+            !(closure.value.x > 0.0f || closure.value.y > 0.0f || closure.value.z > 0.0f)) {
             return result;
         }
-
-        simd::float3 selectedF = baseRes.value;
-        float selectedPdf = baseRes.pdf;
-        if (lobe == 1u) {
-            selectedF = flakeRes.value;
-            selectedPdf = flakeRes.pdf;
-        } else if (lobe == 2u) {
-            selectedF = coatRes.value;
-            selectedPdf = coatRes.pdf;
-        }
-        if (selectedPdf <= 0.0f ||
-            !(selectedF.x > 0.0f || selectedF.y > 0.0f || selectedF.z > 0.0f)) {
-            return result;
-        }
-
-        float cosThetaI = std::max(simd::dot(normal, wi), 0.0f);
-        if (cosThetaI <= 0.0f) {
-            return result;
-        }
-        simd::float3 weight = selectedF * cosThetaI / combinedPdf;
+        simd::float3 weight = closure.value * cosThetaI / closure.pdf;
         if (!IsFinite(weight)) {
             return result;
         }
-
         result.direction = wi;
         result.weight = simd::max(weight, simd_make_float3(0.0f, 0.0f, 0.0f));
-        result.pdf = combinedPdf;
-        result.lobeType = (lobe == 0u) ? 0u : 1u;
-        result.lobeRoughness = (lobe == 2u) ? PlasticCoatRoughness(material)
-                             : (lobe == 1u) ? CarpaintFlakeRoughness(material)
-                                            : CarpaintBaseRoughness(material);
+        result.pdf = closure.pdf;
+        result.lobeType = diffuseLobe ? 0u : 1u;
+        result.lobeRoughness = lobeRoughness;
         return result;
     }
 
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric)) {
+        if (MaterialIsRegularizedDielectric(material)) {
+            return SampleRegularizedDielectric(material, normal, wo, frontFace, rng);
+        }
         result.isDelta = true;
         float refIdx = std::max(material.typeEta.y, 1.0f);
         bool isThin = material.typeEta.w > 0.5f;
@@ -4271,12 +4788,25 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
         float relativeEta = etaI / etaT;
         float cosThetaT = 0.0f;
         float Fr = FresnelDielectricExact(cosThetaO, etaI, etaT, cosThetaT);
+        if (isThin && Fr < 1.0f) {
+            float Ft = 1.0f - Fr;
+            Fr += (Ft * Ft * Fr) / std::max(1.0f - Fr * Fr, 1.0e-6f);
+        }
+        simd::float3 transmissionTint =
+            (material.materialFlags & PathTracerShaderTypes::kMaterialFlagDielectricTransmissionTint) != 0u
+                ? simd::clamp(MaterialBaseColor(material),
+                              simd_make_float3(0.0f, 0.0f, 0.0f),
+                              simd_make_float3(1.0f, 1.0f, 1.0f))
+                : simd_make_float3(1.0f, 1.0f, 1.0f);
 
         simd::float3 direction;
         simd::float3 weight;
         if (rng.nextFloat() < Fr) {
             direction = Reflect(incidentDir, normal);
             weight = simd_make_float3(1.0f, 1.0f, 1.0f);
+        } else if (isThin) {
+            direction = incidentDir;
+            weight = transmissionTint;
         } else {
             simd::float3 refracted;
             if (!Refract(incidentDir, normal, relativeEta, refracted) ||
@@ -4285,12 +4815,13 @@ BsdfSample SampleBsdf(const PathTracerShaderTypes::MaterialData& material,
                 weight = simd_make_float3(1.0f, 1.0f, 1.0f);
             } else {
                 direction = simd::normalize(refracted);
-                float etaScale = (etaT * etaT) / (etaI * etaI);
-                float cosThetaI = std::fabs(cosThetaO);
-                float cosThetaTrans = std::fabs(cosThetaT);
-                float directionScale = etaScale * (cosThetaTrans / std::max(cosThetaI, 1.0e-6f));
-                float scale = std::max(directionScale, 0.0f);
-                weight = simd_make_float3(scale, scale, scale);
+                result.mediumEvent = frontFace ? 1 : -1;
+                // Match Metal, including the Pavilion-only reference convention.
+                const bool referenceContinuation =
+                    (material.materialFlags &
+                     PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation) != 0u;
+                float scale = referenceContinuation ? 1.0f : relativeEta * relativeEta;
+                weight = transmissionTint * scale;
             }
         }
 
@@ -4332,41 +4863,6 @@ bool BuildEnvironmentDistribution(EnvironmentMap& outEnv) {
         outEnv.hasDistribution = true;
     }
     return outEnv.hasDistribution;
-}
-
-void BuildEnvironmentMipChain(EnvironmentMap& env) {
-    env.mipLevels.clear();
-    if (env.width == 0u || env.height == 0u || env.rgba.empty()) {
-        return;
-    }
-    env.mipLevels.push_back(EnvironmentMap::MipLevel{env.rgba, env.width, env.height});
-    while (env.mipLevels.back().width > 1u || env.mipLevels.back().height > 1u) {
-        const EnvironmentMap::MipLevel& prev = env.mipLevels.back();
-        EnvironmentMap::MipLevel next;
-        next.width = std::max(prev.width / 2u, 1u);
-        next.height = std::max(prev.height / 2u, 1u);
-        next.rgba.assign(static_cast<size_t>(next.width) * next.height * 4u, 0.0f);
-        auto fetch = [&](uint32_t x, uint32_t y, uint32_t c) {
-            x %= prev.width;
-            y = std::min(y, prev.height - 1u);
-            return prev.rgba[(static_cast<size_t>(y) * prev.width + x) * 4ull + c];
-        };
-        for (uint32_t y = 0; y < next.height; ++y) {
-            for (uint32_t x = 0; x < next.width; ++x) {
-                const uint32_t sx = x * 2u;
-                const uint32_t sy = y * 2u;
-                for (uint32_t c = 0; c < 4u; ++c) {
-                    const float sum =
-                        fetch(sx, sy, c) +
-                        fetch(sx + 1u, sy, c) +
-                        fetch(sx, sy + 1u, c) +
-                        fetch(sx + 1u, sy + 1u, c);
-                    next.rgba[(static_cast<size_t>(y) * next.width + x) * 4ull + c] = sum * 0.25f;
-                }
-            }
-        }
-        env.mipLevels.push_back(std::move(next));
-    }
 }
 
 float RgbeToFloat(uint8_t channel, uint8_t exponent) {
@@ -4457,7 +4953,7 @@ bool LoadRadianceHdrCpu(const std::string& path, EnvironmentMap& outEnv) {
 
         std::copy(scanline.begin(),
                   scanline.end(),
-                  rgbe.begin() + static_cast<size_t>(y) * width * 4u);
+                  rgbe.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(y) * width * 4u));
     }
 
     outEnv = EnvironmentMap{};
@@ -4471,12 +4967,12 @@ bool LoadRadianceHdrCpu(const std::string& path, EnvironmentMap& outEnv) {
         outEnv.rgba[i * 4u + 2u] = RgbeToFloat(rgbe[i * 4u + 2u], exponent);
         outEnv.rgba[i * 4u + 3u] = 1.0f;
     }
-    BuildEnvironmentMipChain(outEnv);
-    BuildEnvironmentDistribution(outEnv);
     return true;
 }
 
-bool LoadEnvironmentMap(const std::string& path, EnvironmentMap& outEnv) {
+// Loads the environment texels only; LoadEnvironmentMap builds the importance
+// distribution from them.
+bool LoadEnvironmentTexels(const std::string& path, EnvironmentMap& outEnv) {
     outEnv = EnvironmentMap{};
     if (path.empty()) {
         return false;
@@ -4565,13 +5061,59 @@ bool LoadEnvironmentMap(const std::string& path, EnvironmentMap& outEnv) {
     outEnv.width = static_cast<uint32_t>(width);
     outEnv.height = static_cast<uint32_t>(height);
 
-    BuildEnvironmentMipChain(outEnv);
-    BuildEnvironmentDistribution(outEnv);
+    // MTKTextureLoader stores Radiance HDR as half float, so a sun brighter than
+    // 65504 becomes inf and drops out of lighting. Re-decode such maps exactly,
+    // as the Metal backend does (SceneResources::reloadEnvironmentIfNeeded).
+    const bool halfOverflow = std::any_of(outEnv.rgba.begin(), outEnv.rgba.end(),
+                                          [](float v) { return !std::isfinite(v); });
+    if (halfOverflow) {
+        EnvironmentMap exactEnv;
+        if (LoadRadianceHdrCpu(path, exactEnv) && exactEnv.width == outEnv.width &&
+            exactEnv.height == outEnv.height) {
+            std::cerr << "[EnvRebuild] half-float overflow; reloaded " << path << " as RGBA32Float" << std::endl;
+            outEnv = std::move(exactEnv);
+            return true;
+        }
+        std::cerr << "[EnvRebuild] WARNING: " << path << " overflows half float and could not be re-decoded; "
+                  << "texels above 65504 contribute no light" << std::endl;
+    }
 
     return true;
 }
 
-#if defined(PATH_TRACER_ENABLE_EMBREE)
+// environmentSunClamp: scales every texel whose luminance exceeds the clamp down
+// to it, before the importance distribution is built (as the Metal
+// backend does in SceneResources::reloadEnvironmentIfNeeded).
+void ApplyEnvironmentSunClamp(EnvironmentMap& env, float sunClampLuminance, const std::string& path) {
+    const float sunClamp = std::isfinite(sunClampLuminance) ? std::max(sunClampLuminance, 0.0f) : 0.0f;
+    if (sunClamp <= 0.0f) {
+        return;
+    }
+    size_t clampedTexels = 0;
+    for (size_t i = 0; i + 3 < env.rgba.size(); i += 4) {
+        const float luminance = 0.2126f * env.rgba[i] + 0.7152f * env.rgba[i + 1] + 0.0722f * env.rgba[i + 2];
+        if (luminance > sunClamp) {
+            const float scale = sunClamp / luminance;
+            env.rgba[i] *= scale;
+            env.rgba[i + 1] *= scale;
+            env.rgba[i + 2] *= scale;
+            ++clampedTexels;
+        }
+    }
+    if (clampedTexels > 0) {
+        std::cerr << "[EnvRebuild] envSunClamp=" << sunClamp << " scaled " << clampedTexels << " texels of " << path
+                  << std::endl;
+    }
+}
+
+bool LoadEnvironmentMap(const std::string& path, float sunClampLuminance, EnvironmentMap& outEnv) {
+    if (!LoadEnvironmentTexels(path, outEnv)) {
+        return false;
+    }
+    ApplyEnvironmentSunClamp(outEnv, sunClampLuminance, path);
+    BuildEnvironmentDistribution(outEnv);
+    return true;
+}
 
 void EmbreeErrorHandler(void*, RTCError code, const char* message) {
     if (code == RTC_ERROR_NONE || !message) {
@@ -4586,10 +5128,7 @@ struct EmbreeSceneData {
     std::vector<std::unique_ptr<GeometryData>> geometryData;
     std::vector<std::vector<simd::float3>> meshPositions;
     std::vector<std::vector<simd::float3>> meshNormals;
-    std::vector<std::vector<simd::float2>> meshUvs;
-    std::vector<std::vector<simd::float2>> meshUvs1;
     std::vector<std::vector<simd::float4>> meshTangents;
-    std::vector<std::vector<uint32_t>> meshIndices;
     std::vector<simd::float4> sphereData;
     std::vector<uint32_t> sphereMaterials;
     std::vector<simd::float3> rectPositions;
@@ -4602,16 +5141,97 @@ struct EmbreeSceneData {
     uint32_t rectangleCount = 0;
 };
 
+simd::float4 SampleTexturedEmitterCpuTexture(const CpuTexture& texture, simd::float2 uv) {
+    if (texture.width == 0u || texture.height == 0u || texture.mipLevels.empty()) {
+        return simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+    uv = simd_make_float2(ApplyWrapMode(uv.x, texture.samplerDesc.wrapS),
+                           ApplyWrapMode(uv.y, texture.samplerDesc.wrapT));
+    auto address = [](int coordinate, uint32_t size, int32_t wrap) {
+        const int dimension = static_cast<int>(size);
+        if (wrap != 10497) return std::clamp(coordinate, 0, dimension - 1);
+        const int index = coordinate % dimension;
+        return index < 0 ? index + dimension : index;
+    };
+    const CpuTexture::MipLevel& level0 = texture.mipLevels.front();
+    auto fetch = [&](int x, int y) {
+        const size_t index = (static_cast<size_t>(address(y, level0.height, texture.samplerDesc.wrapT)) *
+                             level0.width + static_cast<size_t>(address(x, level0.width, texture.samplerDesc.wrapS))) * 4u;
+        return CpuTextureTexel(texture, level0, index);
+    };
+    if (texture.samplerDesc.magFilter == 9728) {
+        return fetch(static_cast<int>(std::floor(uv.x * static_cast<float>(texture.width))),
+                     static_cast<int>(std::floor(uv.y * static_cast<float>(texture.height))));
+    }
+    const float x = uv.x * static_cast<float>(texture.width) - 0.5f;
+    const float y = uv.y * static_cast<float>(texture.height) - 0.5f;
+    const int x0 = static_cast<int>(std::floor(x)), y0 = static_cast<int>(std::floor(y));
+    const float tx = x - static_cast<float>(x0), ty = y - static_cast<float>(y0);
+    return (fetch(x0, y0) * (1.0f - tx) + fetch(x0 + 1, y0) * tx) * (1.0f - ty) +
+           (fetch(x0, y0 + 1) * (1.0f - tx) + fetch(x0 + 1, y0 + 1) * tx) * ty;
+}
+
+bool CpuResolveTexturedMeshEmission(const EmbreeSceneData& sceneData,
+                                    const MeshLightInfo& light,
+                                    float b1,
+                                    float b2,
+                                    simd::float3& emission) {
+    if (!light.texturedMesh || !light.texturedMaterial) return false;
+    const auto& mesh = *light.texturedMesh;
+    const auto& material = *light.texturedMaterial;
+    const size_t base = static_cast<size_t>(light.localTriangle) * 3u;
+    if (base + 2u >= mesh.indices.size()) return false;
+    const uint32_t i0 = mesh.indices[base], i1 = mesh.indices[base + 1u], i2 = mesh.indices[base + 2u];
+    if (i0 >= mesh.vertices.size() || i1 >= mesh.vertices.size() || i2 >= mesh.vertices.size()) return false;
+    const float b0 = 1.0f - b1 - b2;
+    const simd::float2 uv0 = mesh.vertices[i0].uv * b0 + mesh.vertices[i1].uv * b1 + mesh.vertices[i2].uv * b2;
+    const simd::float2 uv1 = mesh.vertices[i0].uv1 * b0 + mesh.vertices[i1].uv1 * b1 + mesh.vertices[i2].uv1 * b2;
+    auto emissive = sceneData.materialTextures.find(material.textureIndices1.x);
+    if (emissive == sceneData.materialTextures.end()) return false;
+    const simd::float2 uv = ApplyTextureTransform(material.textureUvSet1.x == 1u ? uv1 : uv0,
+                                                  material.textureTransform8, material.textureTransform9);
+    const simd::float4 color = SampleTexturedEmitterCpuTexture(emissive->second, uv);
+    float alpha = std::clamp(material.pbrExtras.x, 0.0f, 1.0f);
+    if (material.pbrExtras.w > 0.5f) {
+        auto baseColor = sceneData.materialTextures.find(material.textureIndices0.x);
+        if (baseColor != sceneData.materialTextures.end()) {
+            const simd::float2 baseUv = ApplyTextureTransform(material.textureUvSet0.x == 1u ? uv1 : uv0,
+                                                               material.textureTransform0, material.textureTransform1);
+            alpha *= SampleTexturedEmitterCpuTexture(baseColor->second, baseUv).w;
+        }
+    }
+    if (material.pbrExtras.w > 0.5f && material.pbrExtras.w < 1.5f && alpha < material.pbrExtras.y) return false;
+    const float coverage = material.pbrExtras.w >= 1.5f ? alpha : 1.0f;
+    emission *= simd_make_float3(color.x, color.y, color.z) * coverage;
+    return IsFinite(emission) && (emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f);
+}
+
 PathTracerShaderTypes::MaterialData ShadeMaterialForHit(const EmbreeSceneData& sceneData,
                                                         const PathTracerShaderTypes::MaterialData& material,
                                                         const HitInfo& hit,
                                                         float debugNormalStrengthScale,
-                                                        float surfaceFootprintWorld) {
+                                                        float surfaceFootprintWorld,
+                                                        bool normalVarianceRoughness,
+                                                        float textureLodBias,
+                                                        bool disableOrmTexture,
+                                                        float* debugMetallic,
+                                                        float* debugRoughness,
+                                                        float* debugAO) {
     PathTracerShaderTypes::MaterialData shaded = material;
+    const uint32_t type = static_cast<uint32_t>(shaded.typeEta.x);
+    if (debugMetallic) *debugMetallic =
+        type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) &&
+        hit.primitiveType == GeometryType::Mesh ? std::clamp(shaded.pbrParams.x, 0.0f, 1.0f) : 0.0f;
+    if (debugRoughness) *debugRoughness = std::clamp(shaded.baseColorRoughness.w, 0.0f, 1.0f);
+    if (debugAO) *debugAO = 1.0f;
     if (!hit.hasUv || sceneData.materialTextures.empty()) {
+        if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) &&
+            (shaded.pbrParams.y < 0.0f || shaded.pbrParams.y > 1.0f)) {
+            shaded.pbrParams.y = std::clamp(shaded.pbrParams.y, 0.0f, 1.0f);
+            shaded.baseColorRoughness.w = shaded.pbrParams.y;
+        }
         return shaded;
     }
-    const uint32_t type = static_cast<uint32_t>(shaded.typeEta.x);
 
     auto sampleTexture = [&](uint32_t index,
                              uint32_t uvSet,
@@ -4633,10 +5253,11 @@ PathTracerShaderTypes::MaterialData ShadeMaterialForHit(const EmbreeSceneData& s
                                          ctx.dUVdx,
                                          ctx.dUVdy,
                                          ctx.uvPerWorld,
-                                         surfaceFootprintWorld);
+                                         surfaceFootprintWorld,
+                                         textureLodBias);
         }
         simd::float4 sample = (gradientFiltered && ctx.hasIgehyGradients)
-            ? SampleCpuTextureAnisotropic(found->second, ctx.uv, ctx.dUVdx, ctx.dUVdy, lod)
+            ? SampleCpuTextureAnisotropic(found->second, ctx.uv, ctx.dUVdx, ctx.dUVdy, lod, textureLodBias)
             : SampleCpuTexture(found->second, ctx.uv, lod);
         if (blackKeyAlphaFromRgb) {
             float luma = Luminance(simd_make_float3(sample.x, sample.y, sample.z));
@@ -4654,11 +5275,26 @@ PathTracerShaderTypes::MaterialData ShadeMaterialForHit(const EmbreeSceneData& s
     shaded.baseColorRoughness.x *= baseColorSample.x;
     shaded.baseColorRoughness.y *= baseColorSample.y;
     shaded.baseColorRoughness.z *= baseColorSample.z;
-    shaded.pbrExtras.x = std::clamp(shaded.pbrExtras.x * baseColorSample.w, 0.0f, 1.0f);
+    // Metal's path_cutout_alpha: a PBR MASK cutout or BLEND coverage test reads the hit point's own alpha at mip 0
+    // (bilinear, no gradients), as the shadow test does. The filtered alpha at the path footprint's LOD decides whole
+    // texture regions at once, and a BLEND pass is a MIS null event whose light side NEE takes through the shadow
+    // test's mip-0 alpha.
+    float cutoutAlpha = baseColorSample.w;
+    if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) &&
+        shaded.pbrExtras.w > 0.5f) {
+        cutoutAlpha = sampleTexture(shaded.textureIndices0.x,
+                                    shaded.textureUvSet0.x,
+                                    shaded.textureTransform0,
+                                    shaded.textureTransform1,
+                                    /*forceMip0=*/true,
+                                    (shaded.materialFlags & PathTracerShaderTypes::kMaterialFlagBlackKeyAlphaFromRgb) != 0u,
+                                    /*gradientFiltered=*/false).w;
+    }
+    shaded.pbrExtras.x = std::clamp(shaded.pbrExtras.x * cutoutAlpha, 0.0f, 1.0f);
 
     if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness)) {
         bool ormDisabled = (shaded.materialFlags & PathTracerShaderTypes::kMaterialFlagDisableOrm) != 0u;
-        if (!ormDisabled) {
+        if (!ormDisabled && !disableOrmTexture) {
             simd::float4 ormSample = sampleTexture(shaded.textureIndices0.y,
                                                    shaded.textureUvSet0.y,
                                                    shaded.textureTransform2,
@@ -4669,11 +5305,21 @@ PathTracerShaderTypes::MaterialData ShadeMaterialForHit(const EmbreeSceneData& s
             shaded.pbrParams.x = std::clamp(shaded.pbrParams.x * ormSample.z, 0.0f, 1.0f);
             shaded.pbrParams.y = std::clamp(shaded.pbrParams.y * ormSample.y, 0.0f, 1.0f);
         }
-        shaded.pbrParams.y = ApplyNormalVarianceToRoughness(sceneData,
-                                                            shaded,
-                                                            hit,
-                                                            debugNormalStrengthScale,
-                                                            surfaceFootprintWorld);
+        shaded.pbrParams.y = std::clamp(shaded.pbrParams.y, 0.0f, 1.0f);
+        if (debugMetallic) *debugMetallic = shaded.pbrParams.x;
+        if (debugRoughness) *debugRoughness = shaded.pbrParams.y;
+        if ((shaded.materialFlags & PathTracerShaderTypes::kMaterialFlagFalcorStandardBsdf) != 0u) {
+            // Falcor's StandardMaterial shades the authored roughness unfiltered and
+            // floors GGX alpha at 0.0064 (never delta), as Metal.
+            shaded.pbrParams.y = std::max(std::clamp(shaded.pbrParams.y, 0.0f, 1.0f), 0.08f);
+        } else if (normalVarianceRoughness) {
+            shaded.pbrParams.y = ApplyNormalVarianceToRoughness(sceneData,
+                                                                shaded,
+                                                                hit,
+                                                                debugNormalStrengthScale,
+                                                                surfaceFootprintWorld,
+                                                                textureLodBias);
+        }
         shaded.baseColorRoughness.w = shaded.pbrParams.y;
         simd::float4 occlusionSample = sampleTexture(shaded.textureIndices0.w,
                                                      shaded.textureUvSet0.w,
@@ -4682,6 +5328,7 @@ PathTracerShaderTypes::MaterialData ShadeMaterialForHit(const EmbreeSceneData& s
         float occlusionStrength = std::clamp(shaded.pbrParams.z, 0.0f, 1.0f);
         float occlusion = std::clamp(occlusionSample.x, 0.0f, 1.0f);
         shaded.pbrParams.z = 1.0f + (occlusion - 1.0f) * occlusionStrength;
+        if (debugAO && !ormDisabled) *debugAO = shaded.pbrParams.z;
         simd::float4 transmissionSample = sampleTexture(shaded.textureIndices1.y,
                                                         shaded.textureUvSet1.y,
                                                         shaded.textureTransform10,
@@ -4704,8 +5351,11 @@ simd::float3 ApplyNormalMapForHit(const EmbreeSceneData& sceneData,
                                   const PathTracerShaderTypes::MaterialData& material,
                                   const HitInfo& hit,
                                   const simd::float3& shadingNormal,
+                                  const simd::float3& incidentDir,
                                   float debugNormalStrengthScale,
-                                  float surfaceFootprintWorld) {
+                                  float surfaceFootprintWorld,
+                                  float textureLodBias,
+                                  bool flipNormalGreen) {
     const uint32_t index = material.textureIndices0.z;
     auto found = sceneData.materialTextures.find(index);
     if (index == kInvalidTextureIndex || found == sceneData.materialTextures.end()) {
@@ -4728,11 +5378,13 @@ simd::float3 ApplyNormalMapForHit(const EmbreeSceneData& sceneData,
                                        ctx.dUVdx,
                                        ctx.dUVdy,
                                        ctx.uvPerWorld,
-                                       surfaceFootprintWorld);
+                                       surfaceFootprintWorld,
+                                       textureLodBias);
     simd::float4 texel = ctx.hasIgehyGradients
-        ? SampleCpuTextureAnisotropic(found->second, ctx.uv, ctx.dUVdx, ctx.dUVdy, lod)
+        ? SampleCpuTextureAnisotropic(found->second, ctx.uv, ctx.dUVdx, ctx.dUVdy, lod, textureLodBias)
         : SampleCpuTexture(found->second, ctx.uv, lod);
     simd::float3 normalTs = DecodeNormalMap(simd_make_float3(texel.x, texel.y, texel.z), normalScale);
+    if (flipNormalGreen) normalTs.y = -normalTs.y;
 
     simd::float3 t = simd_make_float3(hit.tangent.x, hit.tangent.y, hit.tangent.z);
     if (!IsFinite(t) || simd::dot(t, t) <= 1.0e-6f) {
@@ -4748,11 +5400,41 @@ simd::float3 ApplyNormalMapForHit(const EmbreeSceneData& sceneData,
         return shadingNormal;
     }
 
-    simd::float3 mapped = simd::normalize(t * normalTs.x +
-                                          b * normalTs.y +
-                                          shadingNormal * normalTs.z);
-    if (simd::dot(mapped, hit.normal) < 0.0f) {
+    simd::float3 mappedNormalTs = normalTs;
+    const bool emeraldVertexNormal = hit.hasVertexTangent && std::fabs(hit.tangent.w) > 0.5f &&
+        (material.materialFlags & (PathTracerShaderTypes::kMaterialFlagAlphaCutoutContinuation |
+                                   PathTracerShaderTypes::kMaterialFlagSourceNormalGreen)) != 0u;
+    if (emeraldVertexNormal) {
+        // Per-material finding: these Emerald materials (the foliage, and Picnic_Table1 through
+        // kMaterialFlagSourceNormalGreen) match the Falcor
+        // references only with G negated (other ORCA normal maps
+        // match with G kept). Then apply Falcor's complete-normal flip when N faced.
+        mappedNormalTs.y = -mappedNormalTs.y;
+        if (hit.authoredNormalWasFaced) {
+            mappedNormalTs.x = -mappedNormalTs.x;
+        }
+    }
+    simd::float3 mapped = simd::normalize(t * mappedNormalTs.x +
+                                          b * mappedNormalTs.y +
+                                          shadingNormal * mappedNormalTs.z);
+    // Metal keeps the mapped normal on the side of the faced geometric normal (material_access.metal: rec.normal
+    // faces the incoming ray). Embree stores the outward Ng, so face it here; on the back face of a double-sided
+    // material the outward Ng would turn the mapped normal away from the viewer.
+    const bool sourceNormalGreen =
+        (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSourceNormalGreen) != 0u;
+    const simd::float3 facedGeometricNormal = hit.frontFace ? hit.normal : -hit.normal;
+    if (simd::dot(mapped, facedGeometricNormal) < 0.0f) {
         mapped = -mapped;
+    }
+    if (sourceNormalGreen) {
+        // Falcor 4.4 adjustShadingNormal(), as Metal applies it to Picnic_Table1 on both executors
+        // (material_access.metal, path_integrators.metal): where the view grazes the mapped normal at a bevel,
+        // blend it toward the faced geometric normal.
+        const float nDotV = simd::dot(mapped, -incidentDir);
+        if (nDotV <= 0.1f) {
+            const float w = std::clamp(nDotV * 10.0f, 0.0f, 1.0f);
+            mapped = SafeNormalize(facedGeometricNormal + (mapped - facedGeometricNormal) * w, facedGeometricNormal);
+        }
     }
     return IsFinite(mapped) ? mapped : shadingNormal;
 }
@@ -4761,7 +5443,8 @@ float ApplyNormalVarianceToRoughness(const EmbreeSceneData& sceneData,
                                      const PathTracerShaderTypes::MaterialData& material,
                                      const HitInfo& hit,
                                      float debugNormalStrengthScale,
-                                     float surfaceFootprintWorld) {
+                                     float surfaceFootprintWorld,
+                                     float textureLodBias) {
     const uint32_t index = material.textureIndices0.z;
     auto found = sceneData.materialTextures.find(index);
     if (index == kInvalidTextureIndex || found == sceneData.materialTextures.end()) {
@@ -4790,15 +5473,14 @@ float ApplyNormalVarianceToRoughness(const EmbreeSceneData& sceneData,
                                        ctx.dUVdx,
                                        ctx.dUVdy,
                                        ctx.uvPerWorld,
-                                       surfaceFootprintWorld);
+                                       surfaceFootprintWorld,
+                                       textureLodBias);
     simd::float4 raw = ctx.hasIgehyGradients
-        ? SampleCpuTextureAnisotropic(texture, ctx.uv, ctx.dUVdx, ctx.dUVdy, lod)
+        ? SampleCpuTextureAnisotropic(texture, ctx.uv, ctx.dUVdx, ctx.dUVdy, lod, textureLodBias)
         : SampleCpuTexture(texture, ctx.uv, lod);
-    simd::float3 n = simd_make_float3(raw.x, raw.y, raw.z) * 2.0f - simd_make_float3(1.0f, 1.0f, 1.0f);
-    n.x *= normalScale;
-    n.y *= normalScale;
-    float normalLength = simd::length(n);
-    float tok = std::max((1.0f - normalLength) / std::max(normalLength, 1.0e-6f), 0.0f);
+    float directionalVariance = raw.w * raw.w;
+    float meanLength = std::sqrt(1.0f - directionalVariance);
+    float tok = directionalVariance / (meanLength * (1.0f + meanLength));
     if (ctx.hasIgehyGradients) {
         float gradMag = std::max(std::max(std::fabs(ctx.dUVdx.x), std::fabs(ctx.dUVdx.y)),
                                  std::max(std::fabs(ctx.dUVdy.x), std::fabs(ctx.dUVdy.y)));
@@ -4810,8 +5492,8 @@ float ApplyNormalVarianceToRoughness(const EmbreeSceneData& sceneData,
             simd::float3 nDy =
                 DecodeNormalMap(simd_make_float3(rawDy.x, rawDy.y, rawDy.z), normalScale);
             simd::float3 nTs = DecodeNormalMap(simd_make_float3(raw.x, raw.y, raw.z), normalScale);
-            float varianceX = std::max(1.0f - simd::dot(nTs, nDx), 0.0f);
-            float varianceY = std::max(1.0f - simd::dot(nTs, nDy), 0.0f);
+            float varianceX = 0.5f * simd::dot(nTs - nDx, nTs - nDx);
+            float varianceY = 0.5f * simd::dot(nTs - nDy, nTs - nDy);
             tok += 0.35f * std::max(varianceX, varianceY);
         }
     }
@@ -4852,6 +5534,108 @@ float TransformDeterminantSign(const simd::float4x4& transform) {
     return simd_determinant(linear) < 0.0f ? -1.0f : 1.0f;
 }
 
+// Reports, once per scene, every material feature that Metal implements and Embree does not, with the
+// materials that use it. A parity run must show each fallback; none may be silent.
+// A source material's bump (height) texture, read by SourceBumpNormal, or kInvalidTextureIndex.
+uint32_t SourceBumpTextureIndex(const PathTracerShaderTypes::MaterialData& material) {
+    return pt_shared::source_material_flag(material, PathTracerShaderTypes::kMaterialFlagSourceFeatures) &&
+                   material.textureControl.z != 0.0f
+               ? material.textureIndices1.w
+               : kInvalidTextureIndex;
+}
+
+void ReportUnsupportedEmbreeMaterialFeatures(const PathTracer::SceneResources& resources) {
+    using PathTracerShaderTypes::MaterialData;
+    using PathTracerShaderTypes::MaterialType;
+    const MaterialData* materials = resources.materialsData();
+    const uint32_t materialCount = resources.materialCount();
+    if (!materials || materialCount == 0u) {
+        return;
+    }
+
+    struct Feature {
+        const char* description;
+        bool (*uses)(const MaterialData&);
+        std::vector<uint32_t> materials;
+    };
+    Feature features[] = {
+        {"source opacity textures are ignored",
+         [](const MaterialData& m) { return m.textureControl.y != 0.0f; }, {}},
+        {"kMaterialFlagThinFoliageShadow is ignored",
+         [](const MaterialData& m) {
+             return (m.materialFlags & PathTracerShaderTypes::kMaterialFlagThinFoliageShadow) != 0u;
+         }, {}},
+        {"kMaterialFlagFoliageBeautyLift is ignored",
+         [](const MaterialData& m) {
+             return (m.materialFlags & PathTracerShaderTypes::kMaterialFlagFoliageBeautyLift) != 0u;
+         }, {}},
+        // ExplicitInterior and MediumInherit are ported (EP8d). Under sourceTransport every spawn already follows
+        // Metal's interface rule, so InterfacePrecision changes nothing there; render() sets gSourceTransport first.
+        {"InterfacePrecision is ignored without sourceTransport",
+         [](const MaterialData& m) {
+             return !gSourceTransport.enabled &&
+                    (m.materialFlags & PathTracerShaderTypes::kMaterialFlagInterfacePrecision) != 0u;
+         }, {}},
+    };
+
+    for (uint32_t i = 0; i < materialCount; ++i) {
+        for (Feature& feature : features) {
+            if (feature.uses(materials[i])) {
+                feature.materials.push_back(i);
+            }
+        }
+    }
+
+    constexpr size_t kListedMaterials = 8;
+    for (const Feature& feature : features) {
+        if (feature.materials.empty()) {
+            continue;
+        }
+        std::cerr << "Embree warning: " << feature.description << " (" << feature.materials.size()
+                  << (feature.materials.size() == 1u ? " material: " : " materials: ");
+        for (size_t k = 0; k < feature.materials.size() && k < kListedMaterials; ++k) {
+            const uint32_t index = feature.materials[k];
+            std::cerr << (k > 0 ? ", " : "") << index << " \"" << resources.materialName(index) << "\"";
+        }
+        if (feature.materials.size() > kListedMaterials) {
+            std::cerr << ", +" << (feature.materials.size() - kListedMaterials) << " more";
+        }
+        std::cerr << ")." << std::endl;
+    }
+}
+
+// EP22: keep a level as its 8-bit texels when every texel's float is the table's value for its byte. The tables fill
+// from the level's own (byte, float) pairs and carry over to the texture's next level; a level whose pairs disagree
+// with them (a level filtered in float, or a byte that decodes to two floats) stays float and leaves them unchanged.
+bool KeepCpuTextureLevelAsBytes(const PathTracer::MaterialTextureCpuData::MipLevel& level,
+                                std::array<float, 256>& rgbFromByte, std::array<float, 256>& alphaFromByte,
+                                std::array<bool, 256>& rgbKnown, std::array<bool, 256>& alphaKnown) {
+    if (level.rgba8.empty() || level.rgba8.size() != level.rgba.size()) {
+        return false;
+    }
+    std::array<float, 256> rgb = rgbFromByte;
+    std::array<float, 256> alpha = alphaFromByte;
+    std::array<bool, 256> rgbSeen = rgbKnown;
+    std::array<bool, 256> alphaSeen = alphaKnown;
+    for (size_t i = 0; i < level.rgba.size(); ++i) {
+        const bool isAlpha = (i & 3u) == 3u;
+        std::array<float, 256>& table = isAlpha ? alpha : rgb;
+        std::array<bool, 256>& seen = isAlpha ? alphaSeen : rgbSeen;
+        const uint8_t byte = level.rgba8[i];
+        if (!seen[byte]) {
+            seen[byte] = true;
+            table[byte] = level.rgba[i];
+        } else if (std::bit_cast<uint32_t>(table[byte]) != std::bit_cast<uint32_t>(level.rgba[i])) {
+            return false;
+        }
+    }
+    rgbFromByte = rgb;
+    alphaFromByte = alpha;
+    rgbKnown = rgbSeen;
+    alphaKnown = alphaSeen;
+    return true;
+}
+
 bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneData& outData, std::string& error) {
     outData = EmbreeSceneData{};
 
@@ -4869,11 +5653,19 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
     outData.device = device;
     outData.scene = scene;
 
+    ReportUnsupportedEmbreeMaterialFeatures(resources);
+
     const auto* materials = resources.materialsData();
     const uint32_t materialCount = resources.materialCount();
+    uint32_t footprintMipChains = 0u;
+    uint32_t byteLevels = 0u;
+    uint32_t floatLevels = 0u;
+    uint32_t rejectedByteLevels = 0u;  // decoded from 8-bit texels, yet failed the table check: kept as floats
+    std::string rejectedExamples;
     if (materials && materialCount > 0) {
         for (uint32_t i = 0; i < materialCount; ++i) {
             const auto& material = materials[i];
+            // textureIndices1.z is a source material's opacity texture (SourceOpacity reads it); others leave it unset.
             const uint32_t indices[] = {
                 material.textureIndices0.x,
                 material.textureIndices0.y,
@@ -4881,6 +5673,8 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
                 material.textureIndices0.w,
                 material.textureIndices1.x,
                 material.textureIndices1.y,
+                pt_shared::source_has_opacity(material) ? material.textureIndices1.z : kInvalidTextureIndex,
+                SourceBumpTextureIndex(material),
             };
             for (uint32_t index : indices) {
                 if (index == kInvalidTextureIndex || outData.materialTextures.count(index) != 0u) {
@@ -4888,39 +5682,147 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
                 }
                 PathTracer::MaterialTextureCpuData cpuData;
                 if (!resources.materialTextureCpuData(index, cpuData)) {
+                    std::cerr << "Embree warning: material " << i << " texture " << index
+                              << " omitted: CPU texture acquisition failed." << std::endl;
                     continue;
                 }
                 CpuTexture cpuTexture;
+                cpuTexture.normalMap = index == material.textureIndices0.z;
                 cpuTexture.width = cpuData.width;
                 cpuTexture.height = cpuData.height;
-                cpuTexture.rgba = std::move(cpuData.rgba);
+                // Level 0 is the full-size texture: cpuData.rgba holds the same texels (every producer copies one into
+                // the other), so it is not kept a second time.
+                if (cpuData.mipLevels.empty() && !cpuData.rgba.empty()) {
+                    cpuData.mipLevels.push_back({cpuData.width, cpuData.height, std::move(cpuData.rgba), {}});
+                }
+                cpuData.rgba = {};
+                std::array<bool, 256> rgbKnown{};
+                std::array<bool, 256> alphaKnown{};
                 cpuTexture.mipLevels.reserve(cpuData.mipLevels.size());
-                for (auto& level : cpuData.mipLevels) {
+                for (size_t levelIndex = 0; levelIndex < cpuData.mipLevels.size(); ++levelIndex) {
+                    auto& level = cpuData.mipLevels[levelIndex];
                     CpuTexture::MipLevel mip;
                     mip.width = level.width;
                     mip.height = level.height;
-                    mip.rgba = std::move(level.rgba);
-                    cpuTexture.mipLevels.push_back(std::move(mip));
-                }
-                if (cpuTexture.mipLevels.empty() && !cpuTexture.rgba.empty()) {
-                    CpuTexture::MipLevel mip;
-                    mip.width = cpuTexture.width;
-                    mip.height = cpuTexture.height;
-                    mip.rgba = cpuTexture.rgba;
+                    if (KeepCpuTextureLevelAsBytes(level, cpuTexture.rgbFromByte, cpuTexture.alphaFromByte,
+                                                   rgbKnown, alphaKnown)) {
+                        mip.rgba8 = std::move(level.rgba8);
+                        ++byteLevels;
+                    } else {
+                        if (!level.rgba8.empty()) {
+                            if (rejectedByteLevels < 3u) {
+                                rejectedExamples += (rejectedExamples.empty() ? "" : ", ") + std::string("texture ") +
+                                                    std::to_string(index) + " level " + std::to_string(levelIndex);
+                            }
+                            ++rejectedByteLevels;
+                        }
+                        mip.rgba = std::move(level.rgba);
+                        ++floatLevels;
+                    }
+                    level = {};
                     cpuTexture.mipLevels.push_back(std::move(mip));
                 }
                 cpuTexture.samplerDesc = cpuData.samplerDesc;
+                footprintMipChains += cpuData.footprintMipChain ? 1u : 0u;
                 outData.materialTextures.emplace(index, std::move(cpuTexture));
             }
         }
     }
+    // Metal picks the nearest texel when both filters do (CpuTextureNearestTexel), and so does Embree's CPU sampler
+    // (EP8c). A texture that mixes a nearest and a linear filter switches between them by LOD on Metal; Embree samples it
+    // bilinear. That is logged, and refused on a source material, whose textureFilter never mixes them.
+    {
+        size_t nearestTextures = 0u, mixedTextures = 0u;
+        for (const auto& [index, texture] : outData.materialTextures) {
+            nearestTextures += CpuTextureNearestTexel(texture.samplerDesc) ? 1u : 0u;
+            mixedTextures += CpuTextureMixesNearestAndLinear(texture.samplerDesc) ? 1u : 0u;
+        }
+        if (nearestTextures > 0u) {
+            std::cout << "[EmbreeTexture] " << nearestTextures << " of " << outData.materialTextures.size()
+                      << " material textures sampled at the nearest texel, as Metal" << std::endl;
+        }
+        if (mixedTextures > 0u) {
+            std::cerr << "[EmbreeTexture] warning: " << mixedTextures << " material textures mix a nearest and a "
+                      << "linear filter; Metal switches between them by LOD, Embree samples them bilinear" << std::endl;
+        }
+    }
+    // A source-opacity material whose opacity texture has no CPU copy would read as opaque, and a bump map without one
+    // would be flat: refuse them instead.
+    if (materials) {
+        std::string missingOpacity, missingBump;
+        for (uint32_t i = 0; i < materialCount; ++i) {
+            const uint32_t index = materials[i].textureIndices1.z;
+            if (pt_shared::source_has_opacity(materials[i]) && index != kInvalidTextureIndex &&
+                outData.materialTextures.count(index) == 0u) {
+                missingOpacity += (missingOpacity.empty() ? "" : ", ") + std::to_string(i);
+            }
+            const uint32_t bump = SourceBumpTextureIndex(materials[i]);
+            if (bump != kInvalidTextureIndex && outData.materialTextures.count(bump) == 0u) {
+                missingBump += (missingBump.empty() ? "" : ", ") + std::to_string(i);
+            }
+        }
+        if (!missingOpacity.empty()) {
+            error = "Embree could not copy the opacity texture of source material(s) " + missingOpacity;
+            return false;
+        }
+        if (!missingBump.empty()) {
+            error = "Embree could not copy the bump texture of source material(s) " + missingBump;
+            return false;
+        }
+    }
+    if (materials) {
+        std::string mixedMaterials;
+        for (uint32_t i = 0; i < materialCount; ++i) {
+            if ((materials[i].materialFlags & PathTracerShaderTypes::kMaterialFlagSourceFeatures) == 0u) continue;
+            for (uint32_t index : {materials[i].textureIndices0.x, materials[i].textureIndices0.y,
+                                   materials[i].textureIndices0.z, materials[i].textureIndices0.w,
+                                   materials[i].textureIndices1.x, materials[i].textureIndices1.y}) {
+                const auto it = outData.materialTextures.find(index);
+                if (it != outData.materialTextures.end() && CpuTextureMixesNearestAndLinear(it->second.samplerDesc)) {
+                    mixedMaterials += (mixedMaterials.empty() ? "" : ", ") + std::to_string(i);
+                    break;
+                }
+            }
+        }
+        if (!mixedMaterials.empty()) {
+            error = "Embree does not support a source material texture that mixes nearest and linear filters: "
+                    "material(s) " + mixedMaterials;
+            return false;
+        }
+    }
+    std::cout << "[MipChain] Embree textures with footprint-filtered mips (size not a power of two): "
+              << footprintMipChains << " of " << outData.materialTextures.size() << std::endl;
+    {
+        size_t byteBytes = 0u, floatBytes = 0u, texels = 0u;
+        for (const auto& [index, texture] : outData.materialTextures) {
+            texels += static_cast<size_t>(texture.width) * texture.height;
+            for (const auto& level : texture.mipLevels) {
+                byteBytes += level.rgba8.size();
+                floatBytes += level.rgba.size() * sizeof(float);
+            }
+        }
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(2) << "[LoadMemory] material textures: "
+             << outData.materialTextures.size() << ", " << static_cast<double>(texels) / 1.0e6 << " M texels at mip 0; "
+             << byteLevels << " levels kept as 8-bit texels (" << static_cast<double>(byteBytes) / 1073741824.0
+             << " GB), " << floatLevels << " as floats (" << static_cast<double>(floatBytes) / 1073741824.0 << " GB)";
+        std::cout << line.str() << std::endl;
+        if (rejectedByteLevels > 0u) {
+            std::cerr << "[LoadMemory] warning: " << rejectedByteLevels << " texture levels decoded from 8-bit texels "
+                      << "failed the byte-to-float table check and stay float, at four times the memory (first: "
+                      << rejectedExamples << ")." << std::endl;
+        }
+    }
+    LogLoadMemory("material textures copied");
 
     const auto& meshes = resources.meshes();
     outData.meshPositions.reserve(meshes.size());
     outData.meshNormals.reserve(meshes.size());
-    outData.meshUvs.reserve(meshes.size());
-    outData.meshIndices.reserve(meshes.size());
+    outData.meshTangents.reserve(meshes.size());
 
+    // Embree shares two arrays rather than keeping its own copies: each mesh's world positions in meshPositions
+    // (simd::float3, a 16-byte stride, so a 16-byte load from the last vertex stays inside the array), and the mesh's
+    // indices in SceneResources, which outlives the render. Hit shading reads uv and uv1 from SceneResources' vertices.
     uint32_t meshTriangleOffset = 0u;
     for (const auto& mesh : meshes) {
         if (mesh.vertices.empty() || mesh.indices.empty()) {
@@ -4932,74 +5834,46 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
 
         std::vector<simd::float3> positions;
         std::vector<simd::float3> normals;
-        std::vector<simd::float2> uvs;
-        std::vector<simd::float2> uvs1;
         std::vector<simd::float4> tangents;
         positions.reserve(mesh.vertices.size());
         normals.reserve(mesh.vertices.size());
-        uvs.reserve(mesh.vertices.size());
-        uvs1.reserve(mesh.vertices.size());
         tangents.reserve(mesh.vertices.size());
 
         for (const auto& vertex : mesh.vertices) {
             positions.push_back(TransformPoint(mesh.localToWorld, vertex.position));
             simd::float3 n = TransformNormal(normalMatrix, vertex.normal);
             normals.push_back(simd::length(n) > 0.0f ? simd::normalize(n) : n);
-            uvs.push_back(vertex.uv);
-            uvs1.push_back(vertex.uv1);
-            simd::float3 t = TransformNormal(normalMatrix,
-                                             simd_make_float3(vertex.tangent.x,
-                                                              vertex.tangent.y,
-                                                              vertex.tangent.z));
-            if (simd::length(t) > 0.0f) {
-                t = simd::normalize(t);
-            }
+            // Metal transforms a tangent by localToWorld (interpolate_tangent_raw), not by the normal matrix, and
+            // normalizes it after interpolation (interpolate_tangent); the two differ under non-uniform scale.
+            const simd::float3 t = mesh.localToWorld.columns[0].xyz * vertex.tangent.x +
+                                   mesh.localToWorld.columns[1].xyz * vertex.tangent.y +
+                                   mesh.localToWorld.columns[2].xyz * vertex.tangent.z;
             tangents.push_back(simd_make_float4(t.x, t.y, t.z, vertex.tangent.w * transformDetSign));
         }
 
         outData.meshPositions.emplace_back(std::move(positions));
         outData.meshNormals.emplace_back(std::move(normals));
-        outData.meshUvs.emplace_back(std::move(uvs));
-        outData.meshUvs1.emplace_back(std::move(uvs1));
         outData.meshTangents.emplace_back(std::move(tangents));
-        outData.meshIndices.emplace_back(mesh.indices);
 
         auto geomData = std::make_unique<GeometryData>();
         geomData->type = GeometryType::Mesh;
         geomData->positions = outData.meshPositions.back().data();
         geomData->normals = outData.meshNormals.back().data();
-        geomData->uvs = outData.meshUvs.back().data();
-        geomData->uvs1 = outData.meshUvs1.back().data();
+        geomData->vertices = mesh.vertices.data();
         geomData->tangents = outData.meshTangents.back().data();
-        geomData->indices = outData.meshIndices.back().data();
-        geomData->indexCount = static_cast<uint32_t>(outData.meshIndices.back().size());
+        geomData->indices = mesh.indices.data();
+        geomData->indexCount = static_cast<uint32_t>(mesh.indices.size());
         geomData->materialIndex = mesh.materialIndex;
         geomData->triangleOffset = meshTriangleOffset;
+        geomData->meshIndex = static_cast<uint32_t>(&mesh - meshes.data());
 
         RTCGeometry geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
-        float* vertexBuffer = reinterpret_cast<float*>(
-            rtcSetNewGeometryBuffer(geometry, RTC_BUFFER_TYPE_VERTEX, 0,
-                                    RTC_FORMAT_FLOAT3, sizeof(float) * 3,
-                                    outData.meshPositions.back().size()));
-        if (vertexBuffer) {
-            const auto& positions = outData.meshPositions.back();
-            for (size_t i = 0; i < positions.size(); ++i) {
-                const simd::float3 p = positions[i];
-                vertexBuffer[i * 3u + 0u] = p.x;
-                vertexBuffer[i * 3u + 1u] = p.y;
-                vertexBuffer[i * 3u + 2u] = p.z;
-            }
-        }
-
+        rtcSetSharedGeometryBuffer(geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
+                                   outData.meshPositions.back().data(), 0, sizeof(simd::float3),
+                                   outData.meshPositions.back().size());
         unsigned int triCount = static_cast<unsigned int>(geomData->indexCount / 3);
-        uint32_t* indexBuffer = reinterpret_cast<uint32_t*>(
-            rtcSetNewGeometryBuffer(geometry, RTC_BUFFER_TYPE_INDEX, 0,
-                                    RTC_FORMAT_UINT3, sizeof(uint32_t) * 3,
-                                    triCount));
-        if (indexBuffer) {
-            memcpy(indexBuffer, outData.meshIndices.back().data(),
-                   sizeof(uint32_t) * geomData->indexCount);
-        }
+        rtcSetSharedGeometryBuffer(geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
+                                   mesh.indices.data(), 0, sizeof(uint32_t) * 3, triCount);
 
         rtcSetGeometryUserData(geometry, geomData.get());
         rtcCommitGeometry(geometry);
@@ -5055,6 +5929,9 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
 
         for (uint32_t i = 0; i < resources.rectangleCount(); ++i) {
             const PathTracerShaderTypes::RectData& rect = rectangles[i];
+            if (AreaPrimitiveIsReferencePoint(rect)) {
+                continue;
+            }
             simd::float3 corner = {rect.corner.x, rect.corner.y, rect.corner.z};
             simd::float3 edgeU = {rect.edgeU.x, rect.edgeU.y, rect.edgeU.z};
             simd::float3 edgeV = {rect.edgeV.x, rect.edgeV.y, rect.edgeV.z};
@@ -5062,36 +5939,66 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
             normal = simd::normalize(normal);
 
             if (AreaPrimitiveIsDisk(rect)) {
-                constexpr uint32_t kDiskSegments = 24u;
-                uint32_t centerIndex = static_cast<uint32_t>(outData.rectPositions.size());
-                outData.rectPositions.push_back(corner);
-                outData.rectNormals.push_back(normal);
-
-                for (uint32_t seg = 0; seg < kDiskSegments; ++seg) {
-                    float angle = (2.0f * static_cast<float>(kPi) * static_cast<float>(seg)) /
-                                  static_cast<float>(kDiskSegments);
-                    simd::float3 ringPoint = corner + std::cos(angle) * edgeU + std::sin(angle) * edgeV;
-                    outData.rectPositions.push_back(ringPoint);
-                    outData.rectNormals.push_back(normal);
-                }
-
-                simd::float3 geomNormal = simd::normalize(simd::cross(edgeU, edgeV));
-                bool flipWinding = simd::dot(geomNormal, normal) < 0.0f;
-                for (uint32_t seg = 0; seg < kDiskSegments; ++seg) {
-                    uint32_t ring0 = centerIndex + 1u + seg;
-                    uint32_t ring1 = centerIndex + 1u + ((seg + 1u) % kDiskSegments);
-                    if (!flipWinding) {
-                        outData.rectIndices.push_back(centerIndex);
-                        outData.rectIndices.push_back(ring0);
-                        outData.rectIndices.push_back(ring1);
-                    } else {
-                        outData.rectIndices.push_back(centerIndex);
-                        outData.rectIndices.push_back(ring1);
-                        outData.rectIndices.push_back(ring0);
+                auto geomData = std::make_unique<GeometryData>();
+                geomData->type = GeometryType::Rectangles;
+                geomData->disk = &rect;
+                RTCGeometry geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_USER);
+                rtcSetGeometryUserPrimitiveCount(geometry, 1u);
+                rtcSetGeometryUserData(geometry, geomData.get());
+                rtcSetGeometryBoundsFunction(geometry, [](const RTCBoundsFunctionArguments* args) {
+                    const auto& disk = *static_cast<const GeometryData*>(args->geometryUserPtr)->disk;
+                    simd::float3 center = simd_make_float3(disk.corner);
+                    simd::float3 extent = simd::abs(simd_make_float3(disk.edgeU)) +
+                                          simd::abs(simd_make_float3(disk.edgeV));
+                    simd::float3 lower = center - extent, upper = center + extent;
+                    args->bounds_o->lower_x = lower.x;
+                    args->bounds_o->lower_y = lower.y;
+                    args->bounds_o->lower_z = lower.z;
+                    args->bounds_o->upper_x = upper.x;
+                    args->bounds_o->upper_y = upper.y;
+                    args->bounds_o->upper_z = upper.z;
+                }, nullptr);
+                rtcSetGeometryIntersectFunction(geometry, [](const RTCIntersectFunctionNArguments* args) {
+                    const auto& disk = *static_cast<const GeometryData*>(args->geometryUserPtr)->disk;
+                    RTCRayN* rays = RTCRayHitN_RayN(args->rayhit, args->N);
+                    RTCHitN* hits = RTCRayHitN_HitN(args->rayhit, args->N);
+                    for (unsigned int i = 0; i < args->N; ++i) {
+                        if (args->valid[i] != -1) continue;
+                        simd::float3 origin = {RTCRayN_org_x(rays, args->N, i),
+                                              RTCRayN_org_y(rays, args->N, i),
+                                              RTCRayN_org_z(rays, args->N, i)};
+                        simd::float3 direction = {RTCRayN_dir_x(rays, args->N, i),
+                                                 RTCRayN_dir_y(rays, args->N, i),
+                                                 RTCRayN_dir_z(rays, args->N, i)};
+                        simd::float3 normal = simd_make_float3(disk.normalAndPlane);
+                        float denom = simd::dot(normal, direction);
+                        if (std::fabs(denom) < 1e-6f) continue;
+                        float t = (disk.normalAndPlane.w - simd::dot(normal, origin)) / denom;
+                        if (t < RTCRayN_tnear(rays, args->N, i) || t > RTCRayN_tfar(rays, args->N, i)) continue;
+                        simd::float3 relative = origin + t * direction - simd_make_float3(disk.corner);
+                        float u = simd::dot(relative, simd_make_float3(disk.edgeU)) * disk.edgeU.w;
+                        float v = simd::dot(relative, simd_make_float3(disk.edgeV)) * disk.edgeV.w;
+                        if ((u * u + v * v) > 1.0f) continue;
+                        RTCRayN_tfar(rays, args->N, i) = t;
+                        RTCHitN_Ng_x(hits, args->N, i) = normal.x;
+                        RTCHitN_Ng_y(hits, args->N, i) = normal.y;
+                        RTCHitN_Ng_z(hits, args->N, i) = normal.z;
+                        RTCHitN_u(hits, args->N, i) = 0.0f;
+                        RTCHitN_v(hits, args->N, i) = 0.0f;
+                        RTCHitN_geomID(hits, args->N, i) = args->geomID;
+                        RTCHitN_primID(hits, args->N, i) = args->primID;
+                        for (unsigned int level = 0; level < RTC_MAX_INSTANCE_LEVEL_COUNT; ++level) {
+                            RTCHitN_instID(hits, args->N, i, level) = args->context->instID[level];
+#if defined(RTC_GEOMETRY_INSTANCE_ARRAY)
+                            RTCHitN_instPrimID(hits, args->N, i, level) = args->context->instPrimID[level];
+#endif
+                        }
                     }
-                    outData.rectMaterials.push_back(rect.materialTwoSided.x);
-                    outData.rectTriangleToRect.push_back(i);
-                }
+                });
+                rtcCommitGeometry(geometry);
+                rtcAttachGeometry(scene, geometry);
+                rtcReleaseGeometry(geometry);
+                outData.geometryData.emplace_back(std::move(geomData));
             } else {
                 uint32_t baseIndex = static_cast<uint32_t>(outData.rectPositions.size());
                 outData.rectPositions.push_back(corner);
@@ -5173,11 +6080,14 @@ bool BuildEmbreeScene(const PathTracer::SceneResources& resources, EmbreeSceneDa
         outData.geometryData.emplace_back(std::move(geomData));
     }
 
+    LogLoadMemory("geometry buffers built");
     rtcCommitScene(scene);
+    LogLoadMemory("BVH committed");
     return true;
 }
 
-bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& outHit) {
+bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& outHit,
+                    float minT = kEpsilon) {
     RTCIntersectArguments args;
     rtcInitIntersectArguments(&args);
 
@@ -5188,7 +6098,7 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
     rayHit.ray.dir_x = ray.direction.x;
     rayHit.ray.dir_y = ray.direction.y;
     rayHit.ray.dir_z = ray.direction.z;
-    rayHit.ray.tnear = kEpsilon;
+    rayHit.ray.tnear = minT;
     rayHit.ray.tfar = std::numeric_limits<float>::infinity();
     rayHit.ray.mask = 0xFFFFFFFFu;
     rayHit.ray.flags = 0;
@@ -5221,7 +6131,10 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
     uint32_t materialIndex = geomData->materialIndex;
     outHit.primitiveType = geomData->type;
     outHit.primitiveIndex = primID;
+    outHit.meshIndex = geomData->meshIndex;
     outHit.twoSided = false;
+    outHit.hasVertexTangent = false;
+    outHit.authoredNormalWasFaced = false;
 
     if (geomData->type == GeometryType::Mesh && geomData->indices && geomData->normals) {
         outHit.primitiveIndex = geomData->triangleOffset + primID;
@@ -5240,13 +6153,14 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
             if (simd::dot(interp, interp) > 0.0f) {
                 shadingNormal = simd::normalize(interp);
                 if (simd::dot(shadingNormal, adjustedNormal) < 0.0f) {
+                    outHit.authoredNormalWasFaced = true;
                     shadingNormal = -shadingNormal;
                 }
             }
-            if (geomData->uvs) {
-                simd::float2 uv0 = geomData->uvs[i0];
-                simd::float2 uv1 = geomData->uvs[i1];
-                simd::float2 uv2 = geomData->uvs[i2];
+            if (geomData->vertices) {
+                simd::float2 uv0 = geomData->vertices[i0].uv;
+                simd::float2 uv1 = geomData->vertices[i1].uv;
+                simd::float2 uv2 = geomData->vertices[i2].uv;
                 outHit.uv = w * uv0 + u * uv1 + v * uv2;
                 outHit.hasUv = true;
                 if (geomData->positions) {
@@ -5263,12 +6177,17 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
                                                        outHit.dPdu0,
                                                        outHit.dPdv0,
                                                        outHit.uvPerWorld0);
+                    outHit.hasSourceBumpFrame = true;
+                    outHit.sourceBumpQ1 = p1 - p0;
+                    outHit.sourceBumpQ2 = p2 - p0;
+                    outHit.sourceBumpE1 = uv1 - uv0;
+                    outHit.sourceBumpE2 = uv2 - uv0;
                 }
             }
-            if (geomData->uvs1) {
-                simd::float2 uv10 = geomData->uvs1[i0];
-                simd::float2 uv11 = geomData->uvs1[i1];
-                simd::float2 uv12 = geomData->uvs1[i2];
+            if (geomData->vertices) {
+                simd::float2 uv10 = geomData->vertices[i0].uv1;
+                simd::float2 uv11 = geomData->vertices[i1].uv1;
+                simd::float2 uv12 = geomData->vertices[i2].uv1;
                 outHit.uv1 = w * uv10 + u * uv11 + v * uv12;
                 outHit.hasUv1 = true;
                 if (geomData->positions) {
@@ -5293,13 +6212,27 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
                 simd::float4 t2 = geomData->tangents[i2];
                 outHit.tangent = w * t0 + u * t1 + v * t2;
                 outHit.hasTangent = IsFinite4(outHit.tangent);
-            } else if (geomData->positions && geomData->uvs) {
+                const float tangentLengthSq = simd::dot(outHit.tangent.xyz, outHit.tangent.xyz);
+                if (outHit.hasTangent && tangentLengthSq > 1.0e-12f) {
+                    const simd::float3 unit = outHit.tangent.xyz / std::sqrt(tangentLengthSq);
+                    outHit.tangent = simd_make_float4(unit.x, unit.y, unit.z, outHit.tangent.w);
+                }
+                // triangle_has_valid_vertex_tangents checks the stored (local) vertex tangents.
+                const simd::float4 l0 = geomData->vertices ? geomData->vertices[i0].tangent : t0;
+                const simd::float4 l1 = geomData->vertices ? geomData->vertices[i1].tangent : t1;
+                const simd::float4 l2 = geomData->vertices ? geomData->vertices[i2].tangent : t2;
+                outHit.hasVertexTangent = outHit.hasTangent &&
+                    IsFinite4(l0) && IsFinite4(l1) && IsFinite4(l2) &&
+                    std::fabs(l0.w) > 0.5f && std::fabs(l1.w) > 0.5f && std::fabs(l2.w) > 0.5f &&
+                    simd::dot(l0.xyz, l0.xyz) > 1.0e-6f && simd::dot(l1.xyz, l1.xyz) > 1.0e-6f &&
+                    simd::dot(l2.xyz, l2.xyz) > 1.0e-6f;
+            } else if (geomData->positions && geomData->vertices) {
                 simd::float3 p0 = geomData->positions[i0];
                 simd::float3 p1 = geomData->positions[i1];
                 simd::float3 p2 = geomData->positions[i2];
-                simd::float2 uv0 = geomData->uvs[i0];
-                simd::float2 uv1 = geomData->uvs[i1];
-                simd::float2 uv2 = geomData->uvs[i2];
+                simd::float2 uv0 = geomData->vertices[i0].uv;
+                simd::float2 uv1 = geomData->vertices[i1].uv;
+                simd::float2 uv2 = geomData->vertices[i2].uv;
                 simd::float3 edge1 = p1 - p0;
                 simd::float3 edge2 = p2 - p0;
                 simd::float2 dUv1 = uv1 - uv0;
@@ -5322,6 +6255,10 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
                 }
             }
         }
+    } else if (geomData->disk) {
+        outHit.primitiveIndex = static_cast<uint32_t>(geomData->disk - sceneData.rectangles);
+        outHit.twoSided = geomData->disk->materialTwoSided.y != 0u;
+        materialIndex = geomData->disk->materialTwoSided.x;
     } else if (geomData->type == GeometryType::Rectangles && geomData->normals) {
         uint32_t index = primID * 3u;
         if (index < geomData->indexCount) {
@@ -5347,9 +6284,12 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
         if (primID < geomData->count) {
             simd::float4 sphere = geomData->spheres[primID];
             simd::float3 center = {sphere.x, sphere.y, sphere.z};
-            simd::float3 normal = simd::normalize(outHit.position - center);
-            shadingNormal = normal;
+            // Metal's outward normal is (p - c) / radius (visibility.metal): a negative radius turns it inward.
+            simd::float3 normal = simd::normalize((outHit.position - center) / sphere.w);
             adjustedNormal = simd::dot(ray.direction, normal) < 0.0f ? normal : -normal;
+            // The shading normal faces the incoming ray, as on meshes here and in Metal's set_face_normal
+            // (rec.shadingNormal = rec.normal, the faced normal).
+            shadingNormal = adjustedNormal;
             outHit.normal = normal;
             outHit.frontFace = simd::dot(ray.direction, normal) < 0.0f;
             outHit.primitiveType = GeometryType::Spheres;
@@ -5366,68 +6306,527 @@ bool IntersectScene(const EmbreeSceneData& sceneData, const Ray& ray, HitInfo& o
     return true;
 }
 
+// Metal's constants for the subsurface random walk (shaders/core/constants.metal).
+constexpr float kSssRayOriginEpsilon = 1.0e-4f;          // kRayOriginEpsilon
+constexpr float kSssThroughputCutoff = 1.0e-3f;          // kSssThroughputCutoff
+constexpr float kSssHardwareOcclusionEpsilon = 5.0e-3f;  // kHardwareOcclusionEpsilon
+
+// Metal's offset_surface_point (visibility.metal).
+simd::float3 OffsetSurfacePoint(simd::float3 point, simd::float3 normal, simd::float3 direction) {
+    const simd::float3 n = (IsFinite(normal) && simd::dot(normal, normal) > 0.0f) ? simd::normalize(normal)
+                                                                                : simd_make_float3(0.0f, 1.0f, 0.0f);
+    const float sign = simd::dot(direction, n) >= 0.0f ? 1.0f : -1.0f;
+    return point + n * (sign * kSssRayOriginEpsilon * 4.0f) + direction * (kSssRayOriginEpsilon * 0.5f);
+}
+
+// Metal's sample_henyey_greenstein_world: a Henyey-Greenstein direction about `reference`.
+simd::float3 SampleHenyeyGreenstein(simd::float3 reference, float g, Rng& rng) {
+    const float u1 = rng.nextFloat();
+    const float u2 = rng.nextFloat();
+    float cosTheta = 1.0f - 2.0f * u1;
+    if (std::fabs(g) >= 1.0e-3f) {
+        const float s = (1.0f - g * g) / (1.0f - g + 2.0f * g * u1);
+        cosTheta = std::clamp((1.0f + g * g - s * s) / (2.0f * g), -1.0f, 1.0f);
+    }
+    const float sinTheta = std::sqrt(std::max(0.0f, 1.0f - cosTheta * cosTheta));
+    const float phi = 2.0f * kPi * u2;
+    const Onb onb = BuildOnb(SafeNormalize(reference, simd_make_float3(0.0f, 0.0f, 1.0f)));
+    return SafeNormalize(sinTheta * std::cos(phi) * onb.tangent + sinTheta * std::sin(phi) * onb.bitangent +
+                             cosTheta * onb.normal,
+                         onb.normal);
+}
+
+// Metal's random-walk subsurface (#73, closures_eval.metal: sss_walk_*), the model Arnold's randomwalk uses: light
+// enters the mesh as a diffuse transmission, walks through a homogeneous medium behind an index-matched boundary, and
+// where it leaves the mesh the path continues from an ordinary diffuse surface vertex. `base` is the colour a dense
+// medium converges to, `mfp` is 1 / sigma_t and `g` the Henyey-Greenstein anisotropy; `ior` plays no part.
+
+// Single-scattering albedo whose semi-infinite medium reflects the fraction `colour` of diffuse light: the closed-form
+// inverse of van de Hulst's fit (Chiang et al. 2016), as sss_walk_single_scatter_albedo.
+simd::float3 SssWalkSingleScatterAlbedo(simd::float3 colour) {
+    const simd::float3 c = simd::clamp(colour, Splat3(0.0f), Splat3(0.999f));
+    const simd::float3 s = Splat3(4.09712f) + 4.20863f * c - simd::sqrt(Splat3(9.59217f) + 41.6808f * c + 17.7126f * c * c);
+    return simd::clamp(Splat3(1.0f) - s * s, Splat3(0.0f), Splat3(1.0f));
+}
+
+struct SssWalkMedium {
+    simd::float3 sigmaT{0.0f, 0.0f, 0.0f};
+    simd::float3 sigmaS{0.0f, 0.0f, 0.0f};
+    float g = 0.0f;
+};
+
+// Metal's sss_walk_medium.
+SssWalkMedium SssWalkMediumFor(const PathTracerShaderTypes::MaterialData& material) {
+    SssWalkMedium medium;
+    medium.g = SssAnisotropy(material);
+    if (SssHasSigmaOverride(material)) {
+        // Explicit sigma_a and sigma_s are used as given.
+        medium.sigmaS = simd::max(simd_make_float3(material.sssSigmaS.x, material.sssSigmaS.y, material.sssSigmaS.z),
+                                  Splat3(0.0f));
+        medium.sigmaT = simd::max(simd::max(simd_make_float3(material.sssSigmaA.x, material.sssSigmaA.y,
+                                                             material.sssSigmaA.z),
+                                            Splat3(0.0f)) + medium.sigmaS,
+                                  Splat3(1.0e-6f));
+        return medium;
+    }
+    // The inversion holds for isotropic scattering; the similarity relation carries it to g != 0.
+    const simd::float3 reduced = SssWalkSingleScatterAlbedo(MaterialBaseColor(material));
+    const simd::float3 albedo =
+        reduced / simd::max(Splat3(1.0f - medium.g) + medium.g * reduced, Splat3(1.0e-6f));
+    const float sigmaT = 1.0f / SssMeanFreePath(material);
+    medium.sigmaT = Splat3(sigmaT);
+    medium.sigmaS = Clamp01(albedo) * sigmaT;
+    return medium;
+}
+
+// Metal's kSssWalk* outcome codes, which are also the per-material counter slots after the walk count.
+enum class SssWalkOutcome : uint32_t { Continue = 0u, Exit = 1u, Absorbed = 2u, OpenMesh = 3u, StepLimit = 4u };
+constexpr uint32_t kSssWalkMaxSkips = 8u;
+
+// Metal's sss_walk_note_outcome: walks and endings per material over the render (slot 0 the walk count, then the
+// outcome code), counted from every render thread and reported in the metadata and the [SSS] lines.
+struct SssWalkStats {
+    std::vector<std::atomic<uint64_t>> counts =
+        std::vector<std::atomic<uint64_t>>(PathTracerShaderTypes::kMaxMaterials * PathTracerShaderTypes::kSssWalkStatCount);
+    void note(uint32_t materialIndex, SssWalkOutcome outcome) {
+        // Metal clamps an index past the table into the last slot, so such walks are still counted.
+        const size_t base = static_cast<size_t>(std::min(materialIndex, PathTracerShaderTypes::kMaxMaterials - 1u)) *
+                            PathTracerShaderTypes::kSssWalkStatCount;
+        counts[base + PathTracerShaderTypes::kSssWalkStatWalks].fetch_add(1u, std::memory_order_relaxed);
+        counts[base + static_cast<uint32_t>(outcome)].fetch_add(1u, std::memory_order_relaxed);
+    }
+};
+
+struct SssWalkState {
+    simd::float3 position{0.0f, 0.0f, 0.0f};
+    simd::float3 direction{0.0f, 0.0f, 1.0f};
+    simd::float3 throughput{1.0f, 1.0f, 1.0f};
+    simd::float3 channelProbability{0.0f, 0.0f, 0.0f};  // probability of drawing this segment's length per channel
+    float distance = 0.0f;                              // free-flight length drawn for the current segment
+    float travelled = 0.0f;                             // part of it already behind the walk (other objects skipped)
+    float traceMin = kSssRayOriginEpsilon;              // kRayOriginEpsilon from a surface, 0 from a scatter point
+    uint32_t skips = 0u;
+};
+
+// Metal's sss_walk_sample_segment: the channel is chosen in proportion to the throughput and the weights divide by
+// the density averaged over the channels.
+void SssWalkSampleSegment(SssWalkState& walk, const SssWalkMedium& medium, Rng& rng) {
+    const float sum = walk.throughput.x + walk.throughput.y + walk.throughput.z;
+    walk.channelProbability = walk.throughput / std::max(sum, 1.0e-20f);
+    const float pick = rng.nextFloat();
+    float sigma = medium.sigmaT.z;
+    if (pick < walk.channelProbability.x) {
+        sigma = medium.sigmaT.x;
+    } else if (pick < walk.channelProbability.x + walk.channelProbability.y) {
+        sigma = medium.sigmaT.y;
+    }
+    const float xi = std::clamp(rng.nextFloat(), 1.0e-6f, 1.0f - 1.0e-6f);
+    walk.distance = -std::log(1.0f - xi) / sigma;
+    walk.travelled = 0.0f;
+    walk.skips = 0u;
+}
+
+// Metal's sss_walk_same_object: the entry's own mesh for triangles, its own primitive otherwise.
+bool SssWalkSameObject(const HitInfo& entry, const HitInfo& hit) {
+    if (hit.primitiveType != entry.primitiveType) {
+        return false;
+    }
+    return hit.primitiveType == GeometryType::Mesh ? hit.meshIndex == entry.meshIndex
+                                                   : hit.primitiveIndex == entry.primitiveIndex;
+}
+
+// Metal's sss_walk_advance: consumes the closest-hit trace of the current segment.
+SssWalkOutcome SssWalkAdvance(SssWalkState& walk, const SssWalkMedium& medium, const HitInfo& entry, bool hit,
+                              const HitInfo& boundary, Rng& rng) {
+    if (!hit) {
+        return SssWalkOutcome::OpenMesh;  // nothing ahead in any direction means the walk is outside its mesh
+    }
+    const float remaining = walk.distance - walk.travelled;
+    if (boundary.t >= remaining) {
+        // Scatter inside the medium before reaching any surface. As Metal, the transmittance is over the whole drawn
+        // length, which is the density the length was drawn from.
+        const simd::float3 transmittance = Exp3(-medium.sigmaT * walk.distance);
+        const float density = simd::dot(walk.channelProbability, medium.sigmaT * transmittance);
+        walk.throughput *= medium.sigmaS * transmittance / std::max(density, 1.0e-30f);
+        if (!(std::max({walk.throughput.x, walk.throughput.y, walk.throughput.z}) >= kSssThroughputCutoff)) {
+            return SssWalkOutcome::Absorbed;
+        }
+        walk.position += walk.direction * remaining;
+        walk.direction = SampleHenyeyGreenstein(walk.direction, medium.g, rng);
+        if (!IsFinite(walk.direction) || simd::dot(walk.direction, walk.direction) <= 0.0f) {
+            return SssWalkOutcome::Absorbed;
+        }
+        // A scatter point lies inside the medium, not on a surface, so the next trace needs no offset.
+        walk.traceMin = 0.0f;
+        SssWalkSampleSegment(walk, medium, rng);
+        return SssWalkOutcome::Continue;
+    }
+    if (!SssWalkSameObject(entry, boundary)) {
+        // Another object's surface inside this one: the medium continues behind it.
+        if (walk.skips >= kSssWalkMaxSkips) {
+            return SssWalkOutcome::OpenMesh;
+        }
+        walk.skips += 1u;
+        walk.travelled += boundary.t + kSssRayOriginEpsilon;
+        walk.position = boundary.position + walk.direction * kSssRayOriginEpsilon;
+        walk.traceMin = kSssRayOriginEpsilon;
+        return SssWalkOutcome::Continue;
+    }
+    if (boundary.frontFace) {
+        return SssWalkOutcome::OpenMesh;  // met its own surface from outside
+    }
+    // Reached the boundary from inside before the drawn length: the walk leaves the mesh here.
+    const simd::float3 reach = Exp3(-medium.sigmaT * (walk.travelled + boundary.t));
+    walk.throughput *= reach / std::max(simd::dot(walk.channelProbability, reach), 1.0e-30f);
+    return SssWalkOutcome::Exit;
+}
+
+// Metal's sss_random_walk_software / _hardware, from a front-face hit of a random-walk subsurface material. Returns
+// the outcome; on Exit, `exitHit` is the front-face record a ray arriving from outside would have produced at the
+// exit point (Metal's sss_walk_exit_record) and `weight` the walk's throughput.
+SssWalkOutcome SssRandomWalk(const EmbreeSceneData& sceneData,
+                             const PathTracerShaderTypes::MaterialData& material,
+                             const HitInfo& entry,
+                             uint32_t maxSteps,
+                             Rng& rng,
+                             HitInfo& exitHit,
+                             simd::float3& weight) {
+    const SssWalkMedium medium = SssWalkMediumFor(material);
+    // Metal's sss_walk_begin: a diffuse transmission, cosine-weighted about the inward normal, with weight 1. The entry
+    // is a front-face hit, so Embree's outward geometric normal faces the incoming ray there, as Metal's rec.normal.
+    SssWalkState walk;
+    const simd::float3 inward = -entry.normal;
+    float cosinePdf = 0.0f;
+    walk.direction = SafeNormalize(SampleCosineHemisphere(rng, inward, cosinePdf), inward);
+    walk.position = OffsetSurfacePoint(entry.position, inward, walk.direction);
+    walk.throughput = Splat3(1.0f);
+    walk.traceMin = kSssRayOriginEpsilon;
+    SssWalkSampleSegment(walk, medium, rng);
+    for (uint32_t step = 0u; step < std::max(maxSteps, 1u); ++step) {
+        Ray segment;
+        segment.origin = walk.position;
+        segment.direction = walk.direction;
+        segment.unnormalizedDirection = walk.direction;
+        HitInfo boundary;
+        const bool hit = IntersectScene(sceneData, segment, boundary, walk.traceMin);
+        const SssWalkOutcome event = SssWalkAdvance(walk, medium, entry, hit, boundary, rng);
+        if (event == SssWalkOutcome::Continue) {
+            continue;
+        }
+        if (event == SssWalkOutcome::Exit) {
+            // Seen from inside, the boundary is a back-face hit: Embree's geometric normal already points out of the
+            // mesh and its interpolated shading normal faces the walk, inward. The exit record turns the shading
+            // normal outward, to the side of the geometric normal (Metal negates it, and SSS15 turns its software
+            // exit's interpolated normal to that side), and marks the hit a front face.
+            exitHit = boundary;
+            simd::float3 shading = -boundary.shadingNormal;
+            if (simd::dot(shading, exitHit.normal) < 0.0f) {
+                shading = -shading;
+            }
+            exitHit.shadingNormal = SafeNormalize(shading, exitHit.normal);
+            exitHit.frontFace = true;
+            weight = walk.throughput;
+        }
+        return event;
+    }
+    return SssWalkOutcome::StepLimit;
+}
+
+// Metal's shadow-ray constants: spawn_ray_min(material, kEpsilon) for a material without interface precision (Embree
+// ignores that flag and logs it), which is also the radius of trace_scene_hardware's same-mesh exclusion (Metal's
+// kEpsilon); the step past a skipped hit (kHardwareOcclusionEpsilon, which the subsurface walk uses too); and the
+// alpha-aware shadow trace's skip limits (path_integrators.metal).
+constexpr float kShadowSpawnMinT = 1.0e-3f;
+// A shadow ray toward a light with a position stops this far short of it, and never shorter than this, as Metal's
+// shadowMax = max(distance - kEpsilon, kEpsilon) at its rect, tagged-mesh, RIS-winner and audit sites.
+constexpr float kShadowLightEndMargin = 1.0e-3f;
+// Under source transport (EP8d): Metal's source_ray_epsilon and its 1e-6 end margin toward a light with a position.
+inline float ShadowSpawnMinT() { return gSourceTransport.enabled ? gSourceTransport.epsilon : kShadowSpawnMinT; }
+inline float ShadowLightEndMargin() { return gSourceTransport.enabled ? 1.0e-6f : kShadowLightEndMargin; }
+constexpr float kShadowSkipStep = kSssHardwareOcclusionEpsilon;  // Metal's kHardwareOcclusionEpsilon.
+constexpr uint32_t kShadowAlphaSkips = 16u;
+constexpr uint32_t kShadowAlphaSkipsContinuation = 64u;
+
+// What a shadow ray must not report as its blocker, as Metal's compute_exclusion_indices gives it to
+// trace_scene_hardware: the shaded triangle (`triangle`, a global triangle index) of mesh `mesh`. `attempts` is
+// UniformBuilder's hardwareExcludeMaxAttempts, the number of traces one query may spend on skipped hits.
+struct ShadowExclusion {
+    uint32_t mesh = std::numeric_limits<uint32_t>::max();
+    uint32_t triangle = std::numeric_limits<uint32_t>::max();
+    uint32_t attempts = 1u;
+};
+
+ShadowExclusion ShadedTriangleExclusion(const HitInfo& hit, uint32_t attempts) {
+    ShadowExclusion exclusion;
+    exclusion.attempts = attempts;
+    if (hit.primitiveType == GeometryType::Mesh) {
+        exclusion.mesh = hit.meshIndex;
+        exclusion.triangle = hit.primitiveIndex;
+    }
+    return exclusion;
+}
+
+// One query with trace_scene_hardware's exclusion (visibility.metal): a hit on the excluded mesh is skipped when it is
+// the excluded triangle or, for an occlusion query (`shadowQuery`), lies within kShadowSpawnMinT of the trace origin,
+// and the trace starts again kShadowSkipStep past it with no minimum distance, at most `exclusion.attempts` traces in
+// all; when they run out, the query reports no hit. A path ray (shadowQuery false) skips the excluded triangle only.
+// outHit.t is in units of ray.direction from ray.origin, re-traces included. Three departures from Metal, all rare
+// because each needs a skipped hit first:
+// - Metal tests spheres and rectangles separately, along the whole original ray. Here they share the triangle trace,
+//   so one within kShadowSkipStep past a skipped hit, or behind the hits that used up the attempts, is not seen.
+// - Metal's re-trace keeps the caller's tMax from the re-trace origin and returns its t from there, so it can reach
+//   up to kShadowSkipStep plus the skipped distance past the light. Here every distance is from ray.origin.
+// - Metal also skips a same-mesh hit within kShadowSkipStep that its software triangle test cannot reproduce
+//   (hwOnlyNearMeshHit), an artefact of the hardware intersector with no Embree counterpart.
+bool IntersectSceneExcludingShaded(const EmbreeSceneData& sceneData,
+                                   const Ray& ray,
+                                   float minT,
+                                   const ShadowExclusion& exclusion,
+                                   HitInfo& outHit,
+                                   bool shadowQuery = true,
+                                   bool preciseSpawn = gSourceTransport.enabled) {
+    const float directionLength = simd::length(ray.direction);
+    if (!(directionLength > 0.0f) || !std::isfinite(directionLength)) {
+        return false;
+    }
+    const simd::float3 unitDirection = ray.direction / directionLength;
+    Ray currentRay = ray;
+    float currentMinT = minT;
+    float base = 0.0f;
+    const uint32_t attempts = std::max(exclusion.attempts, 1u);
+    for (uint32_t attempt = 0u; attempt < attempts; ++attempt) {
+        if (!IntersectScene(sceneData, currentRay, outHit, currentMinT)) {
+            return false;
+        }
+        const bool excluded = exclusion.mesh != std::numeric_limits<uint32_t>::max() &&
+                              outHit.primitiveType == GeometryType::Mesh && outHit.meshIndex == exclusion.mesh &&
+                              (outHit.primitiveIndex == exclusion.triangle ||
+                               (!preciseSpawn && shadowQuery && outHit.t * directionLength <= ShadowSpawnMinT()));
+        if (!excluded) {
+            outHit.t += base;
+            return true;
+        }
+        if (preciseSpawn) {
+            // Metal's precise spawn (visibility.metal, a ray whose tMin is the source epsilon): keep the ray's origin
+            // and line and resume one float past the excluded triangle, so no world interval is skipped.
+            currentMinT = std::nextafter(std::max(outHit.t, currentMinT), std::numeric_limits<float>::infinity());
+            continue;
+        }
+        base += outHit.t + kShadowSkipStep / directionLength;
+        currentRay.origin = outHit.position + unitDirection * kShadowSkipStep;
+        currentMinT = 0.0f;
+    }
+    return false;
+}
+
+// Metal's source_opacity (material_access.metal): the material's opacity times the first channel of its opacity
+// texture, read at level 0 at uv0 through the source texture transform, saturated; 1 without source opacity. The texture
+// is read on triangles only.
+float SourceOpacity(const EmbreeSceneData& sceneData, const PathTracerShaderTypes::MaterialData& material,
+                    const HitInfo& hit) {
+    if (!pt_shared::source_has_opacity(material)) return 1.0f;
+    float alpha = material.textureControl.x;
+    const auto texture = sceneData.materialTextures.find(material.textureIndices1.z);
+    if (texture != sceneData.materialTextures.end() && hit.primitiveType == GeometryType::Mesh) {
+        const simd::float2 uv = ApplyTextureTransform(hit.uv, material.textureTransform0, material.textureTransform1);
+        alpha *= SampleCpuTextureLevel(texture->second, uv, 0u).x;
+    }
+    return std::clamp(alpha, 0.0f, 1.0f);
+}
+
+// Metal's source_height_derivatives (material_access.metal), after Tungsten's BitmapTexture::derivatives: two-texel
+// differences of the height texture's first channel, read at level 0 without filtering and wrapped, interpolated
+// bilinearly, with no division by two or by the texel size. xy truncates toward zero, as Tungsten's does, also at the
+// repeat seam.
+simd::float2 SourceHeightDerivatives(const CpuTexture& texture, const simd::float2& uv) {
+    const CpuTexture::MipLevel& level = texture.mipLevels.front();
+    const int width = static_cast<int>(level.width);
+    const int height = static_cast<int>(level.height);
+    const auto texel = [&](int x, int y) {
+        x = (x % width + width) % width;
+        y = (y % height + height) % height;
+        return CpuTextureTexel(texture, level, (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                                static_cast<size_t>(x)) * 4ull).x;
+    };
+    const float fx = uv.x * static_cast<float>(width) - 0.5f;
+    const float fy = uv.y * static_cast<float>(height) - 0.5f;
+    const int px = static_cast<int>(fx);
+    const int py = static_cast<int>(fy);
+    const float tx = fx - static_cast<float>(px);
+    const float ty = fy - static_cast<float>(py);
+    simd::float2 gradients[4];
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            const int qx = px + x;
+            const int qy = py + y;
+            gradients[y * 2 + x] = simd_make_float2(texel(qx + 1, qy) - texel(qx - 1, qy),
+                                                    texel(qx, qy + 1) - texel(qx, qy - 1));
+        }
+    }
+    const auto mix = [](simd::float2 a, simd::float2 b, float t) { return a + (b - a) * t; };
+    return mix(mix(gradients[0], gradients[1], tx), mix(gradients[2], gradients[3], tx), ty);
+}
+
+// Metal's source_bump_normal (material_access.metal), after Tungsten: the height texture (textureIndices1.w, scaled by
+// bumpScale, textureControl.z) perturbs the authored normal in the triangle's uv tangent frame, before the frame is
+// faced. Tungsten's tangentSpace normalizes the frame's numerators without dividing by the uv determinant. Triangles only;
+// a degenerate uv frame or result keeps the normal.
+simd::float3 SourceBumpNormal(const EmbreeSceneData& sceneData, const PathTracerShaderTypes::MaterialData& material,
+                              const HitInfo& hit, simd::float3 ns) {
+    if (material.textureControl.z == 0.0f || hit.primitiveType != GeometryType::Mesh || !hit.hasSourceBumpFrame) {
+        return ns;
+    }
+    const auto texture = sceneData.materialTextures.find(material.textureIndices1.w);
+    if (texture == sceneData.materialTextures.end() || texture->second.mipLevels.empty()) {
+        return ns;
+    }
+    const simd::float3 facedNs = ns;
+    const bool backFace = !hit.frontFace;
+    if (backFace) ns = -ns;
+    const simd::float2 e1 = hit.sourceBumpE1;
+    const simd::float2 e2 = hit.sourceBumpE2;
+    if (std::fabs(e1.x * e2.y - e2.x * e1.y) < 1.0e-6f) return facedNs;
+    simd::float3 t = simd::normalize(hit.sourceBumpQ1 * e2.y - e1.y * hit.sourceBumpQ2);
+    simd::float3 b = simd::normalize(hit.sourceBumpQ2 * e1.x - e2.x * hit.sourceBumpQ1);
+    const simd::float2 dh = SourceHeightDerivatives(
+        texture->second, ApplyTextureTransform(hit.uv, material.textureTransform0, material.textureTransform1)) *
+        material.textureControl.z;
+    t += ns * (dh.x - simd::dot(ns, t));
+    b += ns * (dh.y - simd::dot(ns, b));
+    simd::float3 n = simd::cross(t, b);
+    if (!std::isfinite(n.x) || !std::isfinite(n.y) || !std::isfinite(n.z) || simd::dot(n, n) < 1.0e-16f) {
+        return facedNs;
+    }
+    n = simd::normalize(n);
+    n = simd::dot(n, ns) < 0.0f ? -n : n;
+    return backFace ? -n : n;
+}
+
+// Metal's source_forward_min_t (visibility.metal): the ray's tMin to resume on the same line just past a hit at t.
+float SourceForwardMinT(const Ray& ray, float t, float epsilon) {
+    const float scale = std::max(simd::length(ray.direction), 1.0e-20f);
+    const float nextUlp = std::bit_cast<float>(std::bit_cast<uint32_t>(std::max(t, 0.0f)) + 1u);
+    return std::max(t + epsilon / scale, nextUlp);
+}
+
+// Source visibility along a shadow ray under source transport (Metal's source shadow traversal,
+// path_integrators.metal). Each source-opacity hit multiplies `transmission` by 1 - opacity, and each thin source sheet
+// multiplies `rgb` by its forward transmission (source_thin_forward); both count a bounce from the shading vertex's
+// depth + 1. At maxDepth bounces, or when nothing is left, the ray is blocked; otherwise it passes, as through an alpha
+// hole. weight() is what the light's contribution is multiplied by.
+struct SourceOpacityShadow {
+    float transmission = 1.0f;
+    uint32_t bounce = 0u;
+    uint32_t maxDepth = 0u;
+    simd::float3 rgb{1.0f, 1.0f, 1.0f};
+    simd::float3 weight() const { return rgb * transmission; }
+};
+
+// Metal's trace_scene_hardware_alpha_aware_shadow (path_integrators.metal), the hardware megakernel's shadow trace: the
+// first trace starts kShadowSpawnMinT out and skips the shaded triangle (`exclusion`); after an alpha-cutout hole the
+// next trace starts kShadowSkipStep past the hole along the ray, with the same minimum distance and no exclusion. Up
+// to kShadowAlphaSkips holes are skipped (kShadowAlphaSkipsContinuation once a hole belongs to an
+// AlphaCutoutContinuation or SingleScatterSpecular material), and running out counts as occluded. Metal's
+// specular-NEE and MNEE rays and its direct-light audit rays skip holes too (its alpha-aware tracers).
+// maxT is in units of ray.direction; outHit.t is the blocker's distance from ray.origin in the same units.
 bool IntersectSceneSkippingAlpha(const EmbreeSceneData& sceneData,
                                  const Ray& ray,
                                  float maxT,
                                  const PathTracerShaderTypes::MaterialData* materials,
                                  uint32_t materialCount,
                                  float debugNormalStrengthScale,
-                                 HitInfo& outHit) {
+                                 ShadowExclusion exclusion,
+                                 HitInfo& outHit,
+                                 const bool referencePunctualShadow = false,
+                                 SourceOpacityShadow* sourceOpacity = nullptr) {
+    const float directionLength = simd::length(ray.direction);
+    if (!(directionLength > 0.0f) || !std::isfinite(directionLength)) {
+        return false;
+    }
+    const simd::float3 unitDirection = ray.direction / directionLength;
     Ray currentRay = ray;
     float traveled = 0.0f;
-    constexpr uint32_t kMaxAlphaSkips = 128u;
-    for (uint32_t i = 0; i < kMaxAlphaSkips; ++i) {
+    uint32_t maxSkips = kShadowAlphaSkips;
+    for (uint32_t skip = 0u; skip < maxSkips; ++skip) {
         HitInfo hit;
-        if (!IntersectScene(sceneData, currentRay, hit)) {
+        if (!IntersectSceneExcludingShaded(sceneData, currentRay, ShadowSpawnMinT(), exclusion, hit)) {
             return false;
         }
         traveled += hit.t;
         if (!(traveled < maxT)) {
             return false;
         }
-        if (!materials || hit.materialIndex >= materialCount) {
-            hit.t = traveled;
-            outHit = hit;
-            return true;
+        const PathTracerShaderTypes::MaterialData* hitMaterial =
+            materials && hit.materialIndex < materialCount ? &materials[hit.materialIndex] : nullptr;
+        bool sourcePass = false;
+        // Metal tests a thin source sheet, then source opacity, before alpha cutouts, on every primitive. A thin sheet
+        // passes whatever its alpha.
+        if (sourceOpacity && hitMaterial && gSourceTransport.enabled && pt_shared::source_is_thin(*hitMaterial)) {
+            sourceOpacity->rgb *= pt_shared::source_thin_forward(*hitMaterial, hit.shadingNormal, -unitDirection);
+            const simd::float3 rgb = sourceOpacity->rgb;
+            if (++sourceOpacity->bounce >= sourceOpacity->maxDepth || !(rgb.x > 0.0f || rgb.y > 0.0f || rgb.z > 0.0f)) {
+                hit.t = traveled;
+                outHit = hit;
+                return true;
+            }
+            maxSkips = kShadowAlphaSkipsContinuation;
+            sourcePass = true;
         }
-        PathTracerShaderTypes::MaterialData material =
-            ShadeMaterialForHit(sceneData,
-                                materials[hit.materialIndex],
-                                hit,
-                                debugNormalStrengthScale,
-                                0.0f);
-        if (!MaterialAlphaMaskDiscards(material)) {
-            hit.t = traveled;
-            outHit = hit;
-            return true;
+        if (sourceOpacity && hitMaterial && pt_shared::source_has_opacity(*hitMaterial)) {
+            if (++sourceOpacity->bounce >= sourceOpacity->maxDepth) {
+                sourceOpacity->transmission = 0.0f;
+            } else {
+                sourceOpacity->transmission *= 1.0f - SourceOpacity(sceneData, *hitMaterial, hit);
+            }
+            if (!(sourceOpacity->transmission > 0.0f)) {
+                hit.t = traveled;
+                outHit = hit;
+                return true;
+            }
+            maxSkips = kShadowAlphaSkipsContinuation;
+            sourcePass = true;
         }
-        currentRay.origin = OffsetRayOrigin(hit, currentRay.direction);
+        if (!sourcePass) {
+            // Metal alpha-tests shadow hits on triangles only.
+            if (!materials || hit.materialIndex >= materialCount || hit.primitiveType != GeometryType::Mesh) {
+                hit.t = traveled;
+                outHit = hit;
+                return true;
+            }
+            PathTracerShaderTypes::MaterialData material =
+                ShadeMaterialForHit(sceneData,
+                                    materials[hit.materialIndex],
+                                    hit,
+                                    debugNormalStrengthScale,
+                                    0.0f);
+            if (!ShadowRayAlphaDiscards(material, referencePunctualShadow, ShadowBlendAlphaSample(hit))) {
+                hit.t = traveled;
+                outHit = hit;
+                return true;
+            }
+        }
+        if ((materials[hit.materialIndex].materialFlags &
+             (PathTracerShaderTypes::kMaterialFlagAlphaCutoutContinuation |
+              PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular)) != 0u) {
+            maxSkips = kShadowAlphaSkipsContinuation;
+        }
+        outHit = hit;
+        outHit.t = traveled;
+        // Under source transport Metal continues on the same line, the source epsilon past the hole
+        // (source_forward_min_t in the source shadow traversal); otherwise it steps kShadowSkipStep past it.
+        const float skipStep = gSourceTransport.enabled ? 0.0f : kShadowSkipStep;
+        const float minRemaining = gSourceTransport.enabled ? gSourceTransport.epsilon : kShadowSkipStep;
+        traveled += skipStep / directionLength;
+        if (!((maxT - traveled) * directionLength > minRemaining)) {
+            return false;
+        }
+        currentRay.origin = hit.position + unitDirection * skipStep;
+        exclusion = ShadowExclusion{};
     }
-    return false;
+    // Exhausting the bounded visibility walk must not clear an unseen blocker.
+    return true;
 }
 
-bool IsOccluded(const EmbreeSceneData& sceneData,
-                const simd::float3& origin,
-                const simd::float3& direction,
-                float tMax) {
-    RTCOccludedArguments args;
-    rtcInitOccludedArguments(&args);
-
-    RTCRay ray{};
-    ray.org_x = origin.x;
-    ray.org_y = origin.y;
-    ray.org_z = origin.z;
-    ray.dir_x = direction.x;
-    ray.dir_y = direction.y;
-    ray.dir_z = direction.z;
-    ray.tnear = kEpsilon;
-    ray.tfar = tMax;
-    ray.mask = 0xFFFFFFFFu;
-    ray.flags = 0;
-
-    rtcOccluded1(sceneData.scene, &ray, &args);
-    return ray.tfar < 0.0f;
-}
 
 #endif
 
@@ -5446,11 +6845,14 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                     bool captureAuxBuffers,
                                     HeadlessRenderOutput& out,
                                     std::string& error) {
-    (void)captureAuxBuffers;
 #if !defined(PATH_TRACER_ENABLE_EMBREE)
+    (void)captureAuxBuffers;
     (void)scene;
     (void)settings;
     (void)sppTotal;
+    (void)statsMode;
+    (void)verbose;
+    (void)out;
     error = "Embree backend not enabled (build with PATH_TRACER_ENABLE_EMBREE=ON)";
     return false;
 #else
@@ -5458,20 +6860,78 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
         error = "Embree backend requires scene resources";
         return false;
     }
+    gSourceTransport.enabled = settings.sourceTransport;
+    gSourceTransport.epsilon = settings.sourceRayEpsilon > 0.0f ? settings.sourceRayEpsilon : 1.0e-6f;
+    if (settings.sourceTransport) {
+        std::ostringstream epsilonText;
+        epsilonText << gSourceTransport.epsilon;
+        std::cout << "[SourceTransport] Embree: interface-origin spawns, tMin " << epsilonText.str()
+                  << ", shadow end margin 1e-6, shadow rays attenuated by the medium they start in, no light "
+                  << "sampled at the last vertex, specular NEE off (as Metal's wavefront)" << std::endl;
+        if (settings.enableMnee) {
+            std::cerr << "Embree warning: enableMnee is ignored under sourceTransport, as on Metal's wavefront, which "
+                      << "has no bounce-level MNEE; every delta bounce is unpaired." << std::endl;
+        }
+    }
+
+    if (settings.volumeTransportMode == PathTracer::RenderSettings::VolumeTransportMode::Homogeneous)
+        std::cerr << "Embree warning: volumeTransportMode=homogeneous is ignored; only surface transport is implemented." << std::endl;
+    if (settings.spectralRenderingMode == PathTracer::RenderSettings::SpectralRenderingMode::HeroWavelength)
+        std::cerr << "Embree warning: spectralMode=hero_wavelength is ignored; RGB transport is used." << std::endl;
+    if (settings.causticTransportMode == PathTracer::RenderSettings::CausticTransportMode::PathSpacePrototype)
+        std::cerr << "Embree warning: causticTransportMode=path_space is ignored; path-space caustic connections are not implemented." << std::endl;
+    if (settings.svgfDenoiseEnabled)
+        std::cerr << "Embree warning: svgfDenoise is ignored; SVGF reconstruction is not implemented." << std::endl;
+    if (settings.mlBackendMode == PathTracer::RenderSettings::MlBackendMode::ReconstructionTiny)
+        std::cerr << "Embree warning: mlBackendMode=reconstruction_tiny is ignored; tiny ML reconstruction is not implemented." << std::endl;
+    if (settings.enableMnee && settings.enableMneeSecondary)
+        std::cerr << "Embree warning: enableMneeSecondary is ignored; secondary environment delta chains are not implemented." << std::endl;
+    if (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::Ris)
+        std::cerr << "Embree warning: directLightMode=ris is ignored; legacy direct lighting is used." << std::endl;
+    if (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RisSpatialReuse)
+        std::cerr << "Embree warning: directLightMode=ris_spatial is ignored; legacy direct lighting is used." << std::endl;
+    if (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RisTemporalReuse)
+        std::cerr << "Embree warning: directLightMode=ris_temporal is ignored; legacy direct lighting is used." << std::endl;
+    if (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RisWorldReuse)
+        std::cerr << "Embree warning: directLightMode=ris_world is ignored; legacy direct lighting is used." << std::endl;
+    if (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RisRegirCache)
+        std::cerr << "Embree warning: directLightMode=ris_regir is ignored; legacy direct lighting is used." << std::endl;
+    if (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid)
+        std::cerr << "Embree warning: directLightMode=restir_di_regir_hybrid uses ordinary ReSTIR DI; the ReGIR component is not implemented." << std::endl;
+    // Metal headless switches ReSTIR DI to its explicit screen-space passes when restirDebug is on, unless
+    // PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE is set or a homogeneous volume turns ReSTIR DI off (RenderLoop.mm,
+    // ExplicitRestirDiEnabled and HeadlessFusedRestirDiReferenceEnabled). Embree implements only the fused path.
+    if (settings.restirDebugEnabled &&
+        (settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDi ||
+         settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid) &&
+        settings.volumeTransportMode != PathTracer::RenderSettings::VolumeTransportMode::Homogeneous &&
+        !MetalEnvFlagEnabled("PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE"))
+        std::cerr << "Embree warning: restirDebug selects Metal's explicit screen-space ReSTIR DI passes; Embree renders "
+                     "the fused per-sample path (Metal's default) instead, so the two backends can differ." << std::endl;
+
+    if (settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::EnhancedBiased)
+        std::cerr << "Embree warning: enhanced ReSTIR PT modes use ordinary capture/reuse; enhanced feature measurements are unavailable and remain zero." << std::endl;
+
+    if (settings.debugSpecularOnly) std::cerr << "Embree warning: debugSpecularOnly is ignored; material shading is unchanged." << std::endl;
+    if (settings.workingColorSpace == PathTracer::RenderSettings::WorkingColorSpace::ACEScg)
+        std::cerr << "Embree warning: workingColorSpace=acescg is ignored; Embree shades in linear sRGB." << std::endl;
 
     const uint32_t width = settings.renderWidth > 0 ? settings.renderWidth : 1280u;
     const uint32_t height = settings.renderHeight > 0 ? settings.renderHeight : 720u;
 
+    LogLoadMemory("scene loaded, before the Embree build");
     EnvironmentMap envMap;
     EnvironmentMap* envPtr = nullptr;
     if (!settings.environmentMapPath.empty()) {
-        if (!LoadEnvironmentMap(settings.environmentMapPath, envMap)) {
+        if (!LoadEnvironmentMap(settings.environmentMapPath, settings.environmentSunClamp, envMap)) {
             error = "Failed to load environment map for Embree backend: " + settings.environmentMapPath;
             return false;
         }
         envPtr = &envMap;
     }
 
+    LogLoadMemory("environment loaded");
     EmbreeSceneData sceneData;
     if (!BuildEmbreeScene(*scene.resources, sceneData, error)) {
         return false;
@@ -5479,6 +6939,19 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
 
     const auto* materials = scene.resources->materialsData();
     const uint32_t materialCount = scene.resources->materialCount();
+    if (settings.sssMode == PathTracer::RenderSettings::SssMode::Separable && materials) {
+        const uint32_t separable = static_cast<uint32_t>(std::count_if(materials, materials + materialCount,
+            [](const PathTracerShaderTypes::MaterialData& m) {
+                return static_cast<uint32_t>(m.typeEta.x) ==
+                           static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Subsurface) &&
+                       m.sssParams.y < 0.5f;
+            }));
+        if (separable > 0u) {
+            std::cerr << "Embree warning: sss=separable: Metal's separable diffusion profile is not implemented; "
+                      << separable << (separable == 1u ? " material takes" : " materials take")
+                      << " its Lambert fallback instead." << std::endl;
+        }
+    }
     const auto* rectangles = scene.resources->rectanglesData();
     const uint32_t rectangleCount = scene.resources->rectangleCount();
     const float emissionScale = LoadEmbreeEmissionScale();
@@ -5486,6 +6959,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
 
     std::vector<RectLightInfo> rectLights;
     std::vector<int32_t> rectLightIndexByRect;
+    uint32_t rectLightsWithEnvEmissionIgnored = 0;
     if (rectangles && rectangleCount > 0 && materials && materialCount > 0) {
         rectLights.reserve(rectangleCount);
         rectLightIndexByRect.assign(rectangleCount, -1);
@@ -5515,8 +6989,15 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                            rect.normalAndPlane.z));
             info.twoSided = rect.materialTwoSided.y != 0u;
             info.isDisk = AreaPrimitiveIsDisk(rect);
+            info.isReferencePoint = AreaPrimitiveIsReferencePoint(rect);
+            info.inverseSquareFalloff = info.isReferencePoint && rect.materialTwoSided.w != 0u;
+            info.jitterRadius = std::max(rect.corner.w, 0.0f);
+            info.legacyMinimumDistanceSq = info.isReferencePoint ? rect.edgeU.w : 0.0f;
             info.baseEmission = baseEmission;
             // Disable emitEnv for Embree rect lights to match SWRT energy during parity checks.
+            if (material.emission.w > 0.5f) {
+                ++rectLightsWithEnvEmissionIgnored;
+            }
             info.emissionUsesEnv = false;
             info.area = AreaPrimitiveArea(rect);
 
@@ -5524,7 +7005,17 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
             rectLights.push_back(info);
         }
     }
+    if (rectLightsWithEnvEmissionIgnored > 0u) {
+        std::cerr << "Embree warning: emitEnv=1 is ignored when sampling " << rectLightsWithEnvEmissionIgnored
+                  << " rect light(s); light sampling uses the base emission, while direct hits still read the "
+                     "environment map when one is loaded." << std::endl;
+    }
     const uint32_t rectLightCount = static_cast<uint32_t>(rectLights.size());
+    const uint32_t stochasticRectCount = settings.referencePointExactNee
+        ? CountAnalyticLights(rectLights, true) : rectLightCount;
+    const bool exactPointNeeActive = settings.referencePointExactNee && stochasticRectCount < rectLightCount;
+    const uint32_t rectNeeLightCount = exactPointNeeActive ? stochasticRectCount : rectLightCount;
+
 
     std::vector<DirectionalLightInfo> directionalLights;
     {
@@ -5544,6 +7035,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
             DirectionalLightInfo info;
             info.direction = primitive.centroid / dirLen;
             info.emission = primitive.emission;
+            info.cosDelta = primitive.directionalCosDelta;
             directionalLights.push_back(info);
         }
     }
@@ -5551,6 +7043,13 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
     std::vector<MeshLightInfo> meshLights;
     {
         float totalMeshLightPower = 0.0f;
+        const auto& meshes = scene.resources->meshes();
+        std::vector<uint32_t> meshTriangleOffsets(meshes.size(), 0u);
+        uint32_t triangleOffset = 0u;
+        for (size_t i = 0u; i < meshes.size(); ++i) {
+            meshTriangleOffsets[i] = triangleOffset;
+            triangleOffset += static_cast<uint32_t>(meshes[i].indices.size() / 3u);
+        }
         meshLights.reserve(emissivePrimitives.size());
         for (const auto& primitive : emissivePrimitives) {
             if ((primitive.flags & PathTracerShaderTypes::kLightPrimitiveFlagDirectional) != 0u) {
@@ -5558,7 +7057,10 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
             }
             simd::float3 emission = primitive.emission * emissionScale;
             const float emissionLuma = Luminance(emission);
-            const float power = primitive.area * emissionLuma;
+            const bool texturedEmission =
+                (primitive.flags & PathTracerShaderTypes::kLightPrimitiveFlagTexturedEmission) != 0u;
+            const float power = texturedEmission ? primitive.power * emissionScale
+                                                   : primitive.area * emissionLuma;
             if (primitive.triangleIndex == std::numeric_limits<uint32_t>::max() ||
                 !(primitive.area > 0.0f) ||
                 !(power > 0.0f) ||
@@ -5579,6 +7081,16 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
             info.emission = emission;
             info.area = primitive.area;
             info.power = power;
+            info.twoSided = (primitive.flags & PathTracerShaderTypes::kLightPrimitiveFlagTwoSided) != 0u;
+            info.texturedEmission = texturedEmission;
+            if (texturedEmission) {
+                const uint32_t meshIndex = primitive.reserved1;
+                if (meshIndex >= meshes.size() || primitive.triangleIndex < meshTriangleOffsets[meshIndex] ||
+                    materialCount == 0u) continue;
+                info.texturedMesh = &meshes[meshIndex];
+                info.texturedMaterial = &materials[std::min(info.texturedMesh->materialIndex, materialCount - 1u)];
+                info.localTriangle = primitive.triangleIndex - meshTriangleOffsets[meshIndex];
+            }
             totalMeshLightPower += power;
             meshLights.push_back(info);
         }
@@ -5598,11 +7110,38 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
         }
     }
 
+    const bool baselineDirectLight =
+        settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::BaselineEmissive;
+    const bool sssRandomWalk = settings.sssMode == PathTracer::RenderSettings::SssMode::RandomWalk;
+    SssWalkStats sssWalkStats;
+    // UniformBuilder's hardwareExcludeMaxAttempts: how often one trace may skip an excluded hit (a shadow ray's shaded
+    // triangle).
+    const uint32_t hardwareExcludeAttempts = std::min(settings.hardwareExcludeRetries, 3u) + 1u;
+    // baseline_emissive draws one mesh emitter per non-delta vertex from every emitter, as Metal's
+    // sample_direct_light_baseline does on both executors. Before EP8e Embree drew only two-sided or textured emitters
+    // and reached plain one-sided ones by BSDF hits alone.
+    const bool meshNeeBaseline = baselineDirectLight && !meshLights.empty();
+    if (meshNeeBaseline) {
+        size_t twoSidedCount = 0u, texturedCount = 0u;
+        for (const MeshLightInfo& l : meshLights) {
+            twoSidedCount += l.twoSided ? 1u : 0u;
+            texturedCount += l.texturedEmission ? 1u : 0u;
+        }
+        std::cout << "[EmbreeLights] baseline_emissive NEE over " << meshLights.size() << " mesh emitter triangles ("
+                  << twoSidedCount << " two-sided, " << texturedCount << " textured)" << std::endl;
+    }
     const bool envMapAvailable = envPtr && envPtr->width > 0 && envPtr->height > 0 && !envPtr->rgba.empty();
     const bool envSampling = envPtr && envPtr->hasDistribution && envMapAvailable;
     const bool restirDirectMode =
         settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDi ||
         settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+    // As in Metal, directLightMode=legacy samples rect lights and the environment only: analytic `sun` lines are lit
+    // by baseline_emissive (sample_direct_light_baseline) and the RIS/ReSTIR providers. Gate on the requested mode,
+    // so the RIS modes, which Embree runs through its legacy path, keep their directional NEE. Metal renders ReSTIR DI
+    // as baseline_emissive under homogeneous volumes (RestirDiDemotedByVolume); Embree does not mirror that because it
+    // ignores volumes altogether and says so.
+    const bool directionalNeeMode =
+        settings.directLightMode != PathTracer::RenderSettings::DirectLightMode::LegacyRect;
     const FireflyClampParams clampParams = MakeFireflyParams(settings);
 
     CameraBasis camera = BuildCamera(settings, width, height);
@@ -5611,8 +7150,10 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
     DirectDebugConfig debugCfg = LoadDirectDebugConfig(settings, width, height);
 
     std::vector<float> linearRGB(width * height * 3u, 0.0f);
-    const bool collectAlbedoGuide = settings.denoiseEnabled && settings.denoiseUseAlbedo;
-    const bool collectNormalGuide = settings.denoiseEnabled && settings.denoiseUseNormal;
+    const bool collectAlbedoGuide = captureAuxBuffers || (settings.denoiseEnabled && settings.denoiseUseAlbedo);
+    const bool collectNormalGuide = captureAuxBuffers || (settings.denoiseEnabled && settings.denoiseUseNormal);
+    const bool showMaterial = settings.debugShowBaseColor || settings.debugShowMetallic ||
+                              settings.debugShowRoughness || settings.debugShowAO;
     std::vector<float> albedoLinearRGB;
     std::vector<float> normalLinearRGB;
     if (collectAlbedoGuide) {
@@ -5655,429 +7196,22 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
         maxThroughputByBounce.assign(settings.maxDepth, 0.0f);
     }
 
-    std::vector<simd::float3> restirDiDirectSum;
-    uint64_t restirDiInitialCandidateDispatchCount = 0;
-    uint64_t restirDiTemporalReuseDispatchCount = 0;
-    uint64_t restirDiSpatialReuseDispatchCount = 0;
-    uint64_t restirDiVisibilityDispatchCount = 0;
-    uint64_t restirDiApplyLightingDispatchCount = 0;
-    if (restirDirectMode) {
-        const size_t pixelCount = static_cast<size_t>(width) * height;
-        restirDiDirectSum.assign(pixelCount, simd_make_float3(0.0f, 0.0f, 0.0f));
-        std::vector<CpuRestirDiReservoirState> currentReservoirs(pixelCount);
-        std::vector<CpuRestirDiReservoirState> previousReservoirs(pixelCount);
-        std::vector<CpuRestirDiReservoirState> temporalReservoirs(pixelCount);
-        std::vector<CpuRestirDiReservoirState> spatialReservoirs(pixelCount);
-        std::vector<CpuRestirDiVisibilityState> visibilityStates(pixelCount);
-
-        auto makeRestirSurface = [&](uint32_t x,
-                                     uint32_t y,
-                                     HitInfo& hit,
-                                     PathTracerShaderTypes::MaterialData& material,
-                                     simd::float3& shadingNormal,
-                                     simd::float3& wo) -> bool {
-            Rng centerRng;
-            centerRng.state = Rng::Hash(seedBase ^
-                                        (y * width + x) ^
-                                        0xD1B54A35u);
-            Ray centerRay = GenerateCameraRay(camera, width, height, x, y, centerRng, true);
-            if (!IntersectSceneSkippingAlpha(sceneData,
-                                             centerRay,
-                                             std::numeric_limits<float>::infinity(),
-                                             materials,
-                                             materialCount,
-                                             settings.debugNormalStrengthScale,
-                                             hit) ||
-                hit.materialIndex >= materialCount) {
-                return false;
-            }
-            PopulateFirstHitUvGradients(hit, centerRay, primaryRayDiff);
-            float surfaceFootprintWorld = PrimarySurfaceFootprint(primaryCone, hit, centerRay);
-            material = ShadeMaterialForHit(sceneData,
-                                           materials[hit.materialIndex],
-                                           hit,
-                                           settings.debugNormalStrengthScale,
-                                           surfaceFootprintWorld);
-            if (MaterialAlphaMaskDiscards(material)) {
-                return false;
-            }
-            const uint32_t type = static_cast<uint32_t>(material.typeEta.x);
-            if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::DiffuseLight)) {
-                return false;
-            }
-            shadingNormal = hit.shadingNormal;
-            if (simd::dot(shadingNormal, shadingNormal) <= 0.0f) {
-                shadingNormal = hit.normal;
-            }
-            if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric) ||
-                MaterialUsesGeometricNormal(material)) {
-                shadingNormal = hit.frontFace ? hit.normal : -hit.normal;
-            }
-            if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness)) {
-                shadingNormal = ApplyNormalMapForHit(sceneData,
-                                                     material,
-                                                     hit,
-                                                     shadingNormal,
-                                                     settings.debugNormalStrengthScale,
-                                                     surfaceFootprintWorld);
-            }
-            if (!IsFinite(shadingNormal) || simd::dot(shadingNormal, shadingNormal) <= 0.0f) {
-                return false;
-            }
-            shadingNormal = simd::normalize(shadingNormal);
-            wo = -centerRay.direction;
-            if (!IsFinite(wo) || simd::dot(wo, wo) <= 0.0f) {
-                return false;
-            }
-            wo = simd::normalize(wo);
-            return true;
-        };
-
-        auto previousHistoryValid = [](const CpuRestirDiReservoirState& current,
-                                       const CpuRestirDiReservoirState& previous,
-                                       uint32_t frameIndex) {
-            if (!CpuRestirDiReservoirValid(current) ||
-                !CpuRestirDiReservoirValid(previous)) {
-                return false;
-            }
-            if (frameIndex == 0u || previous.frameTag + 1u != frameIndex) {
-                return false;
-            }
-            if (current.primitiveIndex != previous.primitiveIndex ||
-                current.flags != previous.flags) {
-                return false;
-            }
-            if (!(current.targetPdf > 0.0f) || !(previous.targetPdf > 0.0f)) {
-                return false;
-            }
-            float targetRatio = std::min(current.targetPdf, previous.targetPdf) /
-                                std::max(std::max(current.targetPdf, previous.targetPdf), 1.0e-6f);
-            return targetRatio >= 0.25f;
-        };
-
-        auto mergeTemporal = [&](const CpuRestirDiReservoirState& current,
-                                 const CpuRestirDiReservoirState& previous,
-                                 uint32_t frameIndex) {
-            CpuRestirDiReservoirState out = current;
-            if (!previousHistoryValid(current, previous, frameIndex)) {
-                out.temporalAccepted = 0u;
-                out.stateFlags &= ~2u;
-                return out;
-            }
-            float mergedWeight = current.weight + previous.weight;
-            if (!(mergedWeight > 0.0f) || !std::isfinite(mergedWeight)) {
-                out.temporalAccepted = 0u;
-                out.stateFlags &= ~2u;
-                return out;
-            }
-            out.weight = mergedWeight;
-            out.candidateCount = std::max(1u, current.candidateCount + previous.candidateCount);
-            out.temporalAccepted = 1u;
-            out.stateFlags |= 2u;
-            out.frameTag = frameIndex;
-            return out;
-        };
-
-        auto payloadFromRestirState = [](const CpuRestirDiReservoirState& state) {
-            CpuRisSamplePayload payload;
-            payload.primitiveIndex = state.primitiveIndex;
-            payload.flags = state.flags;
-            payload.position = CpuRisPayloadIsDirectional(payload)
-                ? simd::normalize(state.position)
-                : state.position;
-            payload.normal = state.normal;
-            payload.emission = state.emission;
-            payload.pdf = state.pdf;
-            return payload;
-        };
-
-        auto reservoirFromRestirState = [&](const CpuRestirDiReservoirState& state) {
-            CpuReservoir reservoir = MakeEmptyCpuReservoir();
-            if (!CpuRestirDiReservoirValid(state)) {
-                return reservoir;
-            }
-            reservoir.winner = payloadFromRestirState(state);
-            reservoir.wSum = state.weight;
-            reservoir.M = std::max(state.candidateCount, 1u);
-            reservoir.valid = true;
-            return reservoir;
-        };
-
-        for (uint32_t s = 0; s < targetSamples; ++s) {
-            std::fill(currentReservoirs.begin(),
-                      currentReservoirs.end(),
-                      MakeEmptyCpuRestirDiReservoir(s));
-            std::fill(temporalReservoirs.begin(),
-                      temporalReservoirs.end(),
-                      MakeEmptyCpuRestirDiReservoir(s));
-            std::fill(spatialReservoirs.begin(),
-                      spatialReservoirs.end(),
-                      MakeEmptyCpuRestirDiReservoir(s));
-            std::fill(visibilityStates.begin(),
-                      visibilityStates.end(),
-                      MakeEmptyCpuRestirDiVisibility(s));
-
-            ++restirDiInitialCandidateDispatchCount;
-            tbb::parallel_for(uint32_t(0), height, [&](uint32_t y) {
-                for (uint32_t x = 0; x < width; ++x) {
-                    const size_t pixelIndex = static_cast<size_t>(y) * width + x;
-                    HitInfo hit;
-                    PathTracerShaderTypes::MaterialData material;
-                    simd::float3 shadingNormal;
-                    simd::float3 wo;
-                    if (!makeRestirSurface(x, y, hit, material, shadingNormal, wo)) {
-                        continue;
-                    }
-                    Rng rng;
-                    rng.state = seedBase ^
-                                (s * 9781u) ^
-                                (x * 6271u) ^
-                                (y * 13007u) ^
-                                0xD1B54A35u;
-                    CpuReservoir reservoir;
-                    CpuBuildRestirDiProviderReservoirForHit(directionalLights,
-                                                            meshLights,
-                                                            rectLights,
-                                                            envPtr,
-                                                            settings,
-                                                            hit,
-                                                            material,
-                                                            shadingNormal,
-                                                            wo,
-                                                            clampParams,
-                                                            std::max(settings.risCandidateCount, 1u),
-                                                            rng,
-                                                            reservoir);
-                    currentReservoirs[pixelIndex] =
-                        CpuRestirDiStateFromReservoir(hit,
-                                                      material,
-                                                      shadingNormal,
-                                                      wo,
-                                                      clampParams,
-                                                      s,
-                                                      reservoir);
-                }
-            });
-
-            ++restirDiTemporalReuseDispatchCount;
-            tbb::parallel_for(size_t(0), pixelCount, [&](size_t pixelIndex) {
-                temporalReservoirs[pixelIndex] =
-                    mergeTemporal(currentReservoirs[pixelIndex], previousReservoirs[pixelIndex], s);
-            });
-
-            ++restirDiSpatialReuseDispatchCount;
-            const uint32_t spatialNeighborCount = std::min(std::max(settings.spatialReuseNeighborCount, 1u), 4u);
-            tbb::parallel_for(uint32_t(0), height, [&](uint32_t y) {
-                static constexpr int kOffsets[4][2] = {
-                    {-1, 0},
-                    {1, 0},
-                    {0, -1},
-                    {0, 1},
-                };
-                for (uint32_t x = 0; x < width; ++x) {
-                    const size_t pixelIndex = static_cast<size_t>(y) * width + x;
-                    CpuRestirDiReservoirState stateReservoir = temporalReservoirs[pixelIndex];
-                    CpuReservoir reservoir = reservoirFromRestirState(stateReservoir);
-                    HitInfo hit;
-                    PathTracerShaderTypes::MaterialData material;
-                    simd::float3 shadingNormal;
-                    simd::float3 wo;
-                    const bool currentSurfaceValid =
-                        makeRestirSurface(x, y, hit, material, shadingNormal, wo);
-                    for (uint32_t n = 0; n < spatialNeighborCount; ++n) {
-                        int nx = static_cast<int>(x) + kOffsets[n][0];
-                        int ny = static_cast<int>(y) + kOffsets[n][1];
-                        if (nx < 0 || ny < 0 ||
-                            nx >= static_cast<int>(width) ||
-                            ny >= static_cast<int>(height)) {
-                            continue;
-                        }
-                        const size_t neighborIndex = static_cast<size_t>(ny) * width +
-                                                     static_cast<uint32_t>(nx);
-                        const CpuRestirDiReservoirState& neighborState =
-                            temporalReservoirs[neighborIndex];
-                        if (!currentSurfaceValid ||
-                            !CpuRestirDiReservoirValid(neighborState) ||
-                            !reservoir.valid) {
-                            continue;
-                        }
-                        HitInfo neighborHit;
-                        PathTracerShaderTypes::MaterialData neighborMaterial;
-                        simd::float3 neighborNormal;
-                        simd::float3 neighborWo;
-                        if (!makeRestirSurface(static_cast<uint32_t>(nx),
-                                               static_cast<uint32_t>(ny),
-                                               neighborHit,
-                                               neighborMaterial,
-                                               neighborNormal,
-                                               neighborWo)) {
-                            continue;
-                        }
-                        float depthRel = std::fabs(hit.t - neighborHit.t) / std::max(hit.t, kEpsilon);
-                        if (!(depthRel <= 0.1f) || !std::isfinite(depthRel)) {
-                            continue;
-                        }
-                        float normalDot = simd::dot(simd::normalize(shadingNormal),
-                                                    simd::normalize(neighborNormal));
-                        if (!(normalDot >= 0.9f) || !std::isfinite(normalDot)) {
-                            continue;
-                        }
-                        CpuReservoir neighborReservoir = reservoirFromRestirState(neighborState);
-                        if (!neighborReservoir.valid) {
-                            continue;
-                        }
-                        float phatCurrent =
-                            CpuReservoirWinnerPHatForHit(hit,
-                                                         material,
-                                                         shadingNormal,
-                                                         wo,
-                                                         clampParams,
-                                                         neighborReservoir.winner);
-                        float phatNeighbor =
-                            CpuReservoirWinnerPHatForHit(neighborHit,
-                                                         neighborMaterial,
-                                                         neighborNormal,
-                                                         neighborWo,
-                                                         clampParams,
-                                                         neighborReservoir.winner);
-                        float denom = phatCurrent * static_cast<float>(std::max(reservoir.M, 1u)) +
-                                      phatNeighbor * static_cast<float>(std::max(neighborReservoir.M, 1u));
-                        if (!(denom > 0.0f) || !std::isfinite(denom) || !(phatCurrent > 0.0f)) {
-                            continue;
-                        }
-                        float mis = phatCurrent / denom;
-                        float mergeWeight = mis * neighborReservoir.wSum;
-                        if (!(mergeWeight > 0.0f) || !std::isfinite(mergeWeight)) {
-                            continue;
-                        }
-                        Rng spatialRng;
-                        spatialRng.state = Rng::Hash(seedBase ^
-                                                      (s * 9781u) ^
-                                                      (x * 1664525u) ^
-                                                      (y * 1013904223u) ^
-                                                      ((n + 1u) * 747796405u));
-                        CpuUpdateReservoir(reservoir,
-                                           neighborReservoir.winner,
-                                           mergeWeight,
-                                           spatialRng.nextFloat());
-                    }
-                    if (currentSurfaceValid && reservoir.valid) {
-                        spatialReservoirs[pixelIndex] =
-                            CpuRestirDiStateFromReservoir(hit,
-                                                          material,
-                                                          shadingNormal,
-                                                          wo,
-                                                          clampParams,
-                                                          s,
-                                                          reservoir);
-                        spatialReservoirs[pixelIndex].spatialAccepted =
-                            std::max(spatialReservoirs[pixelIndex].spatialAccepted, 1u);
-                        spatialReservoirs[pixelIndex].stateFlags |= 4u;
-                    } else {
-                        spatialReservoirs[pixelIndex] = stateReservoir;
-                    }
-                }
-            });
-
-            ++restirDiVisibilityDispatchCount;
-            tbb::parallel_for(uint32_t(0), height, [&](uint32_t y) {
-                for (uint32_t x = 0; x < width; ++x) {
-                    const size_t pixelIndex = static_cast<size_t>(y) * width + x;
-                    CpuRestirDiReservoirState reservoir = spatialReservoirs[pixelIndex];
-                    previousReservoirs[pixelIndex] = reservoir;
-                    visibilityStates[pixelIndex] = MakeEmptyCpuRestirDiVisibility(s);
-                    if (!CpuRestirDiReservoirValid(reservoir)) {
-                        continue;
-                    }
-                    HitInfo hit;
-                    PathTracerShaderTypes::MaterialData material;
-                    simd::float3 shadingNormal;
-                    simd::float3 wo;
-                    if (!makeRestirSurface(x, y, hit, material, shadingNormal, wo)) {
-                        continue;
-                    }
-                    CpuRisSamplePayload winner;
-                    winner.primitiveIndex = reservoir.primitiveIndex;
-                    winner.flags = reservoir.flags;
-                    winner.position = CpuRisPayloadIsDirectional(winner)
-                        ? simd::normalize(reservoir.position)
-                        : reservoir.position;
-                    winner.normal = reservoir.normal;
-                    winner.emission = reservoir.emission;
-                    winner.pdf = reservoir.pdf;
-
-                    simd::float3 omegaL = CpuRisPayloadOmegaL(hit, winner);
-                    float cosThetaSurface = std::clamp(simd::dot(shadingNormal, omegaL), 0.0f, 1.0f);
-                    float distSq = CpuRisPayloadDistanceSq(hit, winner);
-                    if (!(cosThetaSurface > 0.0f) || !(distSq > 0.0f)) {
-                        continue;
-                    }
-                    BsdfEval bsdfEval = EvaluateBsdf(material,
-                                                     hit.position,
-                                                     shadingNormal,
-                                                     wo,
-                                                     omegaL,
-                                                     clampParams);
-                    if (bsdfEval.isDelta) {
-                        continue;
-                    }
-                    float shadowMax = CpuRisPayloadIsDirectional(winner)
-                        ? std::numeric_limits<float>::infinity()
-                        : std::max(simd::length(winner.position - hit.position) - kEpsilon, kEpsilon);
-                    HitInfo shadowHit;
-                    Ray shadowRay;
-                    shadowRay.origin = OffsetRayOrigin(hit, omegaL);
-                    shadowRay.direction = omegaL;
-                    bool occluded =
-                        IntersectSceneSkippingAlpha(sceneData,
-                                                    shadowRay,
-                                                    shadowMax,
-                                                    materials,
-                                                    materialCount,
-                                                    settings.debugNormalStrengthScale,
-                                                    shadowHit);
-                    if (occluded && CpuShadowHitIsSelectedLight(shadowHit, winner)) {
-                        occluded = false;
-                    }
-                    float targetPdf = std::max(reservoir.targetPdf, 1.0e-6f);
-                    float reservoirW =
-                        (reservoir.weight / static_cast<float>(std::max(reservoir.candidateCount, 1u))) /
-                        targetPdf;
-                    CpuRestirDiVisibilityState visibility = MakeEmptyCpuRestirDiVisibility(s);
-                    visibility.primitiveIndex = reservoir.primitiveIndex;
-                    visibility.flags = reservoir.flags;
-                    visibility.stateFlags = reservoir.stateFlags;
-                    if (!occluded && reservoirW > 0.0f) {
-                        visibility.contribution =
-                            bsdfEval.value * winner.emission * (cosThetaSurface * reservoirW);
-                        if (!IsFinite(visibility.contribution)) {
-                            visibility.contribution = simd_make_float3(0.0f, 0.0f, 0.0f);
-                        }
-                        visibility.visible = 1.0f;
-                    }
-                    visibilityStates[pixelIndex] = visibility;
-                    restirDiDirectSum[pixelIndex] +=
-                        simd::max(visibility.contribution,
-                                  simd_make_float3(0.0f, 0.0f, 0.0f));
-                }
-            });
-            ++restirDiApplyLightingDispatchCount;
-        }
-    }
-
     constexpr uint32_t kCpuPathReservoirDepthCount = 8u;
     const size_t pixelCount = static_cast<size_t>(width) * height;
     const bool restirGiActive =
-        settings.restirGiMode == PathTracer::RenderSettings::RestirGiMode::DiffusePrototype;
+        settings.restirGiMode == PathTracer::RenderSettings::RestirGiMode::ProductionDiffuse;
     const bool restirPtActive =
-        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::Research ||
-        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::ExperimentalPathReuse;
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::ProductionReservoirCapture ||
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::ProductionPathReuse ||
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::EnhancedBiased;
     const bool restirPtReuseActive =
-        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::ExperimentalPathReuse;
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::ProductionPathReuse ||
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::EnhancedBiased;
     const bool pathGuidingActive =
         settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype;
-    const bool radianceCacheActive =
-        settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Prototype;
+    const bool radianceCacheActive = PathTracer::RadianceCacheActive(settings);
     std::vector<CpuPathReservoirState> restirGiReservoirs(
         restirGiActive ? pixelCount : 0u);
     std::vector<CpuPathReservoirState> restirPtReservoirs(
@@ -6116,6 +7250,74 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
     std::atomic<uint64_t> radianceCacheTrainCount{0};
     std::atomic<uint64_t> radianceCacheFallbackCount{0};
     std::atomic<uint64_t> radianceCacheInvalidCount{0};
+    static_assert(PathTracerShaderTypes::kRadianceCacheStatCount == PathTracer::RadianceCacheTraining::kStatCount,
+                  "radiance cache stat layout mismatch");
+    std::array<std::atomic<uint64_t>, PathTracer::RadianceCacheTraining::kStatCount> radianceCacheStats{};
+    auto cacheStat = [&radianceCacheStats](uint32_t index, uint64_t value) {
+        if (value != 0u) {
+            radianceCacheStats[index].fetch_add(value, std::memory_order_relaxed);
+        }
+    };
+    // Trains the cell of one record with the radiance its path ended with (radiance_cache_train_from_record and
+    // radiance_cache_store_sample on Metal).
+    auto trainRadianceCache = [&](const CpuRadianceCacheTrainRecord& record,
+                                  const simd::float3& radianceEnd,
+                                  uint32_t sampleIndex) {
+        using namespace PathTracer::RadianceCacheTraining;
+        cacheStat(kStatTrainRecords, 1u);
+        const TargetResult result = ComputeTarget(record.throughputAtQuery,
+                                                  record.radianceBaseline,
+                                                  radianceEnd,
+                                                  settings.radianceCacheMaxRadiance);
+        if (result.status == TargetStatus::RejectedNonFinite) {
+            cacheStat(kStatTrainRejectedNonFinite, 1u);
+            return;
+        }
+        if (result.status == TargetStatus::RejectedZeroThroughput) {
+            cacheStat(kStatTrainRejectedZeroThroughput, 1u);
+            return;
+        }
+        cacheStat(kStatTargetLumaFixed, StatLumaToFixed(result.targetLuma));
+        if (result.status == TargetStatus::Clamped) {
+            cacheStat(kStatTrainClamped, 1u);
+            cacheStat(kStatClampedLumaFixed, StatLumaToFixed(result.clampedLuma));
+        }
+        const float luma = PathTracer::RadianceCacheTraining::Luminance(result.target);
+        std::lock_guard<std::mutex> cacheLock(radianceCacheMutexes[record.cellIndex]);
+        CpuRadianceCacheCell& cell = radianceCacheCells[record.cellIndex];
+        if (!cell.valid ||
+            cell.invalidated ||
+            cell.domainKey != record.domainKey ||
+            cell.materialType != record.materialType ||
+            cell.lobeType != 0u) {
+            if (cell.sampleCount > 0u && cell.domainKey != record.domainKey) {
+                radianceCacheInvalidCount.fetch_add(1u, std::memory_order_relaxed);
+                cacheStat(kStatCellEvictions, 1u);
+            }
+            cell = CpuRadianceCacheCell{};
+            cell.valid = true;
+            cell.domainKey = record.domainKey;
+            cell.materialType = record.materialType;
+            cell.lobeType = 0u;
+        }
+        if (cell.sampleCount >= kMaxStoredSamples) {
+            radianceCacheFallbackCount.fetch_add(1u, std::memory_order_relaxed);
+            cacheStat(kStatTrainSaturated, 1u);
+            return;
+        }
+        cell.sampleCount += 1u;
+        cell.radianceSum += result.target;
+        cell.lumaMomentSum += luma * luma;
+        const float samples = static_cast<float>(std::max(cell.sampleCount, 1u));
+        cell.position = record.position;
+        cell.normal = record.normal;
+        cell.roughness = record.roughness;
+        cell.storedVariance = samples > 1.0f ? (luma * luma) / samples : 1.0f;
+        cell.confidence = std::clamp(std::log2(samples + 1.0f) / 6.0f, 0.0f, 1.0f);
+        cell.frameTag = sampleIndex;
+        radianceCacheTrainCount.fetch_add(1u, std::memory_order_relaxed);
+        cacheStat(kStatTrainAccepted, 1u);
+    };
 
     auto reportProgress = [&](uint32_t doneTiles) {
         uint32_t percent = static_cast<uint32_t>(
@@ -6204,9 +7406,6 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                 simd::float3 pixelAlbedo = {0.0f, 0.0f, 0.0f};
                 simd::float3 pixelNormal = {0.0f, 0.0f, 0.0f};
                 uint32_t pixelIndex = y * width + x;
-                if (restirDirectMode && pixelIndex < restirDiDirectSum.size()) {
-                    pixelRadiance += restirDiDirectSum[pixelIndex];
-                }
                 const bool debugPixel = debugCfg.enabled && x == debugCfg.pixelX && y == debugCfg.pixelY;
 
                 for (uint32_t s = 0; s < targetSamples; ++s) {
@@ -6229,12 +7428,43 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                     simd::float3 throughput = {1.0f, 1.0f, 1.0f};
                     simd::float3 radiance = {0.0f, 0.0f, 0.0f};
                     float lastBsdfPdf = 1.0f;
+                    // Metal's medium stack (path_integrators.metal, kMaxMediumStack): the absorption of the solid
+                    // dielectrics the path is inside, innermost last.
+                    constexpr uint32_t kMaxMediumStack = 8u;
+                    std::array<simd::float3, kMaxMediumStack> mediumSigmaStack{};
+                    uint32_t mediumDepth = 0u;
                     bool lastScatterWasDelta = true;
-                    bool envLodActive = false;
-                    float envLod = 0.0f;
+                    // A delta scatter without a specular connection leaves the emitter hit
+                    // or environment miss as the only estimator, so it takes full weight.
+                    bool lastDeltaUnpaired = false;
+                    // Where the last real scatter left from, kept across alpha holes (MIS null events): the light
+                    // pdf of the next emitter hit is measured from there, as that vertex's NEE was.
+                    simd::float3 holeMisOrigin = simd_make_float3(0.0f, 0.0f, 0.0f);
+                    bool holeMisOriginValid = false;
+                    // After a source-opacity null the ray keeps its origin: the next trace starts at sourceNullMinT,
+                    // and the medium absorbs from segmentStartT, the null's distance (Metal's sourceOffset).
+                    float sourceNullMinT = -1.0f;
+                    float segmentStartT = 0.0f;
+                    bool previousMeshNeeEligible = false;
+                    // ReSTIR DI estimated the primary vertex's mesh lights along the current
+                    // scatter direction (restir_di / hybrid).
+                    bool previousRestirDiCovered = false;
+                    bool primaryVertexScattered = false;
                     uint32_t specularDepth = 0;
-                    bool hadTransmission = false;
-                    auto addContribution = [&](const simd::float3& contribution) {
+                    float pathMaxRoughness = 0.0f;
+                    // Radiance cache training (RadianceCacheTraining.h): one pixel in kTrainingPathStride per sample
+                    // index never loads from the cache, records its cacheable vertices, and trains them when it ends.
+                    const bool cacheTrainingPath =
+                        radianceCacheActive && !showMaterial &&
+                        (s % std::max(settings.radianceCacheTrainingInterval, 1u)) == 0u &&
+                        PathTracer::RadianceCacheTraining::IsTrainingPath(pixelIndex, s);
+                    std::array<CpuRadianceCacheTrainRecord, PathTracer::RadianceCacheTraining::kTrainRecordCount>
+                        cacheTrainRecords{};
+                    uint32_t cacheTrainValidMask = 0u;
+                    // postClampScale multiplies after the firefly clamp: Metal clamps a light sample when it queues
+                    // the shadow ray and applies the source shadow transmittance in the shadow kernel.
+                    auto addContribution = [&](const simd::float3& contribution,
+                                               const simd::float3& postClampScale = simd_make_float3(1.0f, 1.0f, 1.0f)) {
                         bool clamped = false;
                         bool invalid = false;
                         simd::float3 safeContribution =
@@ -6250,6 +7480,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                         if (clamped) {
                             ++tileClampEventCount;
                         }
+                        safeContribution *= postClampScale;
                         if (!IsFinite(safeContribution)) {
                             ++tileRadianceNanInfCount;
                             return;
@@ -6257,17 +7488,67 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                         radiance += safeContribution;
                     };
 
+                    // Metal's path trace (trace_path_hardware): every path ray starts kShadowSpawnMinT (Metal's
+                    // kEpsilon, interfaceMinT) out, in world units, and skips the previous hit's triangle, a cutout
+                    // hole's included (prevRec, compute_exclusion_indices), with trace_scene_hardware's re-trace.
+                    HitInfo previousHit;
+                    bool previousHitValid = false;
+                    bool guidePending = true;  // the denoiser guides of this sample are not taken yet
+                    // Metal's camera ray and its PBR alpha pass-through ray keep kEpsilon (1e-3) as tMin under source
+                    // transport too (kernels.metal); bounce rays take the source epsilon.
+                    bool legacyRaySpawn = true;
                     for (uint32_t depth = 0; depth < settings.maxDepth; ++depth) {
                         ++tilePathSegmentCount;
                         HitInfo hit;
-                        if (!IntersectScene(sceneData, ray, hit)) {
+                        const float legacyPathMinT = kShadowSpawnMinT / std::max(simd::length(ray.direction), 1.0e-8f);
+                        const float pathMinT = sourceNullMinT >= 0.0f ? sourceNullMinT
+                                             : legacyRaySpawn ? legacyPathMinT
+                                                              : ShadowSpawnMinT() / std::max(simd::length(ray.direction), 1.0e-8f);
+                        sourceNullMinT = -1.0f;
+                        bool hasHit = previousHitValid
+                            ? IntersectSceneExcludingShaded(sceneData, ray, pathMinT,
+                                                            ShadedTriangleExclusion(previousHit, hardwareExcludeAttempts),
+                                                            hit, /*shadowQuery=*/false,
+                                                            /*preciseSpawn=*/gSourceTransport.enabled && !legacyRaySpawn)
+                            : IntersectScene(sceneData, ray, hit, pathMinT);
+                        float intersectionMinT = kEpsilon;
+                        for (uint32_t alphaSkip = 0u; hasHit && alphaSkip < 64u; ++alphaSkip) {
+                            if (!materials || hit.primitiveType != GeometryType::Mesh ||
+                                hit.materialIndex >= materialCount) break;
+                            const auto& cutoutMaterial = materials[hit.materialIndex];
+                            if ((cutoutMaterial.materialFlags &
+                                 (PathTracerShaderTypes::kMaterialFlagAlphaCutoutContinuation |
+                                  PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular)) == 0u ||
+                                cutoutMaterial.pbrExtras.w <= 0.5f || cutoutMaterial.pbrExtras.w >= 1.5f) break;
+                            if (depth == 0u) {
+                                PopulateFirstHitUvGradients(hit, ray, primaryRayDiff,
+                                    (cutoutMaterial.materialFlags &
+                                     PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u);
+                            }
+                            const float footprint = SurfaceFootprintFromCone(
+                                RayConeWidthAtDistance(rayCone, hit.t), hit.normal, -ray.direction);
+                            const auto resolvedCutout = ShadeMaterialForHit(sceneData, cutoutMaterial, hit,
+                                settings.debugNormalStrengthScale, footprint, settings.normalVarianceRoughness,
+                                settings.textureLodBias);
+                            if (!PathRayAlphaDiscards(resolvedCutout, rng)) break;
+                            // Metal traces again from the hole (advance_pavilion_alpha_visibility_ray) kEpsilon (1e-3)
+                            // past it, under source transport too, so nothing within that distance is reported.
+                            const float nextMinT = hit.t + legacyPathMinT;
+                            if (!std::isfinite(nextMinT) || nextMinT <= intersectionMinT) break;
+                            intersectionMinT = nextMinT;
+                            // Preserve origin, t, cone/differentials, depth, PDF,
+                            // and RNG: a MASK hole is visibility, not scattering.
+                            hasHit = IntersectScene(sceneData, ray, hit, intersectionMinT);
+                        }
+                        if (!hasHit) {
+                            if (showMaterial) break;
                             simd::float3 background =
-                                EvaluateBackground(settings, envPtr, ray.direction, envLodActive, envLod);
+                                EvaluateBackground(settings, envPtr, ray.direction);
                             float misWeight = 1.0f;
                             bool useSpecularMis = depth > 0u &&
                                                   ((!lastScatterWasDelta) ||
-                                                   settings.enableSpecularNee ||
-                                                   settings.enableMnee);
+                                                   (!lastDeltaUnpaired &&
+                                                    (settings.enableSpecularNee || settings.enableMnee)));
                             if (useSpecularMis && envSampling) {
                                 float lightPdf = EnvironmentPdf(*envPtr, settings.environmentRotation, ray.direction);
                                 float denom = lastBsdfPdf + lightPdf;
@@ -6278,53 +7559,222 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                        kMisWeightClampMin,
                                                        kMisWeightClampMax);
                             }
-                            addContribution(background * misWeight);
+                            simd::float3 contribution = background * misWeight;
+                            if (depth == 0u && envMapAvailable &&
+                                settings.backgroundMode == PathTracer::RenderSettings::BackgroundMode::Environment &&
+                                settings.environmentBackgroundScale != 1.0f) {
+                                contribution *= std::isfinite(settings.environmentBackgroundScale)
+                                    ? std::max(settings.environmentBackgroundScale, 0.0f) : 1.0f;
+                            }
+                            addContribution(contribution);
                             break;
                         }
+                        previousHit = hit;
+                        previousHitValid = true;
 
                         if (!materials || materialCount == 0) {
                             break;
                         }
 
+                        // Beer-Lambert absorption over the segment inside a solid dielectric, as Metal applies it
+                        // at each hit.
+                        if (mediumDepth > 0u) {
+                            const simd::float3 sigma = mediumSigmaStack[mediumDepth - 1u];
+                            if (sigma.x > 0.0f || sigma.y > 0.0f || sigma.z > 0.0f) {
+                                throughput *= Exp3(-sigma * std::max(hit.t - segmentStartT, 0.0f));
+                            }
+                        }
+                        segmentStartT = 0.0f;
+
                         uint32_t matIndex = std::min(hit.materialIndex, materialCount - 1);
                         if (depth == 0u) {
-                            PopulateFirstHitUvGradients(hit, ray, primaryRayDiff);
+                            PopulateFirstHitUvGradients(hit, ray, primaryRayDiff,
+                                (materials[matIndex].materialFlags &
+                                 PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u);
                         }
                         float surfaceFootprintWorld =
                             SurfaceFootprintFromCone(RayConeWidthAtDistance(rayCone, hit.t),
                                                      hit.normal,
                                                      -ray.direction);
+                        float debugMetallic, debugRoughness, debugAO;
                         PathTracerShaderTypes::MaterialData material =
                             ShadeMaterialForHit(sceneData,
                                                 materials[matIndex],
                                                 hit,
                                                 settings.debugNormalStrengthScale,
-                                                surfaceFootprintWorld);
-                        if (MaterialAlphaMaskDiscards(material)) {
-                            ray.origin = OffsetRayOrigin(hit, ray.direction);
+                                                surfaceFootprintWorld,
+                                                settings.normalVarianceRoughness && !settings.debugDisableNormalMap,
+                                                settings.textureLodBias,
+                                                settings.debugDisableOrmTexture,
+                                                &debugMetallic, &debugRoughness, &debugAO);
+                        // Metal's source opacity on a path ray (resolve_surface_material, and the wavefront's source
+                        // null in kernels.metal): the ray passes the surface with probability 1 - opacity. As an alpha
+                        // hole, the pass consumes a depth and is a null event for MIS. The ray keeps its origin and line,
+                        // resumes just past the hit (source_forward_min_t) without the hit triangle, and stays in its
+                        // medium, which absorbs from the hit on.
+                        if (pt_shared::source_has_opacity(materials[matIndex]) &&
+                            rng.nextFloat() >= SourceOpacity(sceneData, materials[matIndex], hit)) {
+                            if (depth == 0u) {
+                                lastScatterWasDelta = true;
+                                lastDeltaUnpaired = true;
+                            }
+                            if (!holeMisOriginValid) {
+                                holeMisOrigin = ray.origin;
+                                holeMisOriginValid = true;
+                            }
+                            sourceNullMinT = SourceForwardMinT(ray, hit.t, ShadowSpawnMinT());
+                            segmentStartT = hit.t;
+                            legacyRaySpawn = false;
                             continue;
                         }
+                        // Metal alpha-tests path rays on PBR triangles only.
+                        if (hit.primitiveType == GeometryType::Mesh &&
+                            static_cast<uint32_t>(material.typeEta.x) ==
+                                static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) &&
+                            PathRayAlphaDiscards(material, rng)) {
+                            // As on Metal, the hole consumes a depth but is a null event for MIS: the last real
+                            // vertex's BSDF pdf, delta flags and origin stay, so the next emitter hit or miss takes the
+                            // BSDF side of the balance heuristic whose light side that vertex's NEE (its alpha-aware
+                            // shadow ray passes the same MASK hole, and a BLEND texel with the path's probability
+                            // 1 - alpha) took. A hole before any scatter is unpaired.
+                            if (depth == 0u) {
+                                lastScatterWasDelta = true;
+                                lastDeltaUnpaired = true;
+                            }
+                            if (!holeMisOriginValid) {
+                                holeMisOrigin = ray.origin;
+                                holeMisOriginValid = true;
+                            }
+                            ray.origin = LegacyOffsetRayOrigin(hit, ray.direction);
+                            legacyRaySpawn = true;
+                            continue;
+                        }
+                        if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagBlackBackFace) != 0u &&
+                            !hit.frontFace) {
+                            break;  // Single-sided back face: the reference shades it black.
+                        }
+                        if (showMaterial) {
+                            if (settings.debugShowBaseColor) radiance = MaterialBaseColor(material);
+                            else if (settings.debugShowMetallic) radiance = simd_make_float3(debugMetallic, debugMetallic, debugMetallic);
+                            else if (settings.debugShowRoughness) radiance = simd_make_float3(debugRoughness, debugRoughness, debugRoughness);
+                            else radiance = simd_make_float3(debugAO, debugAO, debugAO);
+                            break;
+                        }
+                        if (settings.debugDisableAO) material.pbrParams.z = 1.0f;
+                        RegularizeDielectricMaterial(material, hit.frontFace, pathMaxRoughness);
                         uint32_t type = static_cast<uint32_t>(material.typeEta.x);
+                        // Metal marks a double-sided PBR triangle two-sided when it shades it (path_integrators.metal,
+                        // material_access.metal), so a path that hits its back face sees its emission. Light sampling
+                        // stays one-sided unless the light inventory flags the emitter two-sided, as on Metal.
+                        if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) &&
+                            hit.primitiveType == GeometryType::Mesh && material.typeEta.z > 0.5f) {
+                            hit.twoSided = true;
+                        }
+                        // Metal's thin double-sided MASK cutouts (foliage, Bistro signage): direct light reaches them from
+                        // both sides (material_is_two_sided_alpha_cutout, path_integrators.metal).
+                        hit.twoSidedAlphaCutout = hit.twoSided && material.typeEta.z > 0.5f &&
+                            material.pbrExtras.w > 0.5f && material.pbrExtras.w < 1.5f &&
+                            sceneData.materialTextures.count(material.textureIndices0.x) != 0u;
+                        if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness) &&
+                            (material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u) {
+                            const float ior = std::max(material.typeEta.y, 1.0f);
+                            material.typeEta.y = hit.frontFace ? ior : 1.0f / ior;
+                        }
                         simd::float3 incidentDir = simd::normalize(ray.direction);
                         simd::float3 wo = -incidentDir;
                         simd::float3 shadingNormal = hit.shadingNormal;
                         if (simd::dot(shadingNormal, shadingNormal) <= 0.0f) {
                             shadingNormal = hit.normal;
                         }
-                        if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric) ||
-                            MaterialUsesGeometricNormal(material)) {
+                        // An analytic sphere's authored dielectric normal is its outward normal (hit.normal; the hit setup
+                        // faces the shading normal), as Metal uses it (EP8-f3).
+                        if (hit.primitiveType == GeometryType::Spheres &&
+                            pt_shared::source_material_flag(
+                                material, PathTracerShaderTypes::kMaterialFlagAuthoredDielectricNormal)) {
+                            shadingNormal = hit.normal;
+                        }
+                        // Metal (path_integrators.metal): a source material with an authored dielectric normal keeps the raw
+                        // interpolated normal (not faced) and skips the glass geometric-normal override;
+                        // source_dielectric_frame then picks the side and the relative IOR.
+                        const bool authoredDielectricNormal = pt_shared::source_material_flag(
+                            material, PathTracerShaderTypes::kMaterialFlagAuthoredDielectricNormal);
+                        if (authoredDielectricNormal && hit.authoredNormalWasFaced) {
+                            shadingNormal = -shadingNormal;
+                        }
+                        if (!authoredDielectricNormal &&
+                            (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric) ||
+                             MaterialUsesGeometricNormal(material))) {
                             shadingNormal = hit.frontFace ? hit.normal : -hit.normal;
                         }
+                        // A source bump map perturbs this normal (resolve_wavefront_surface_state, and the
+                        // megakernel's shading), after the normal choices above.
+                        if (pt_shared::source_material_flag(materials[matIndex],
+                                                            PathTracerShaderTypes::kMaterialFlagSourceFeatures)) {
+                            shadingNormal = SourceBumpNormal(sceneData, materials[matIndex], hit, shadingNormal);
+                            hit.shadingNormal = shadingNormal;
+                        }
+                        // A thin source sheet under source transport (resolve_wavefront_surface_state): the ray passes
+                        // forward with probability p, the mean of the sheet's forward transmission, weighted forward / p,
+                        // as a null event like a source-opacity pass. Otherwise the sheet only reflects, weighted
+                        // F / (1 - p): wavefrontShadeKernel sets sourceFresnel.z = 2, which the shared closure reads.
+                        if (gSourceTransport.enabled && pt_shared::source_is_thin(materials[matIndex])) {
+                            const simd::float3 forward =
+                                pt_shared::source_thin_forward(materials[matIndex], shadingNormal, wo);
+                            const float forwardProbability =
+                                std::clamp(simd::dot(forward, simd_make_float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f)),
+                                           0.0f, 1.0f);
+                            if (rng.nextFloat() < forwardProbability) {
+                                throughput *= forward / std::max(forwardProbability, 1.0e-30f);
+                                if (depth == 0u) {
+                                    lastScatterWasDelta = true;
+                                    lastDeltaUnpaired = true;
+                                }
+                                if (!holeMisOriginValid) {
+                                    holeMisOrigin = ray.origin;
+                                    holeMisOriginValid = true;
+                                }
+                                sourceNullMinT = SourceForwardMinT(ray, hit.t, ShadowSpawnMinT());
+                                segmentStartT = hit.t;
+                                legacyRaySpawn = false;
+                                continue;
+                            }
+                            material.sourceFresnel.z = 2.0f;
+                        }
                         if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness)) {
-                            shadingNormal = ApplyNormalMapForHit(sceneData,
+                            if (!settings.debugDisableNormalMap) shadingNormal = ApplyNormalMapForHit(sceneData,
                                                                  material,
                                                                  hit,
                                                                  shadingNormal,
+                                                                 incidentDir,
                                                                  settings.debugNormalStrengthScale,
-                                                                 surfaceFootprintWorld);
+                                                                 surfaceFootprintWorld,
+                                                                 settings.textureLodBias,
+                                                                 settings.debugFlipNormalGreen);
+                            if ((material.materialFlags & PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular) != 0u) {
+                                // Tagged (Pavilion) PBR takes the path's maximum roughness, as Metal.
+                                pathMaxRoughness = std::max(pathMaxRoughness,
+                                                            std::clamp(material.baseColorRoughness.w, 0.0f, 1.0f));
+                                material.baseColorRoughness.w = std::max(pathMaxRoughness, 0.01f);
+                                material.pbrParams.y = material.baseColorRoughness.w;
+                            }
                         }
                         shadingNormal = simd::normalize(shadingNormal);
-                        if (depth == 0u) {
+                        // Metal stores the shading normal it resolved (overrides, bump, normal map) in rec.shadingNormal,
+                        // and offset_ray_origin offsets the NEE and bounce rays along it. LegacyOffsetRayOrigin reads
+                        // hit.shadingNormal, which still held the interpolated normal.
+                        hit.shadingNormal = shadingNormal;
+                        pt_shared::source_mark_closure_side(material, shadingNormal, wo);  // EP8-f2, as Metal
+                        // The denoiser guides come from the first vertex, except that Metal's wavefrontShadeKernel passes
+                        // them on behind a smooth source mirror (denoiseMirrorGuides) and behind a delta source dielectric
+                        // (denoiseTransmissionGuides), so they describe what the colour shows through it (EP8d).
+                        const bool followMirrorGuide = settings.denoiseMirrorGuides &&
+                            pt_shared::source_model(material) == 1.0f && material.sourceParams.z == 0.0f;
+                        const bool followTransmissionGuide = settings.denoiseTransmissionGuides &&
+                            pt_shared::source_model(material) == 3.0f &&
+                            (material.sourceParams.z == 0.0f || material.typeEta.w > 0.5f ||
+                             material.sourceFresnel.w == 1.0f);
+                        if (guidePending && !followMirrorGuide && !followTransmissionGuide) {
+                            guidePending = false;
                             if (collectAlbedoGuide) {
                                 pixelAlbedo += MaterialBaseColor(material);
                             }
@@ -6368,7 +7818,8 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                  baseCtx.dUVdx,
                                                                  baseCtx.dUVdy,
                                                                  baseCtx.uvPerWorld,
-                                                                 surfaceFootprintWorld);
+                                                                 surfaceFootprintWorld,
+                                                                 settings.textureLodBias);
                             }
                             directLightAudit.entries.clear();
                             directLightAudit.entries.reserve(rectLightCount);
@@ -6395,7 +7846,8 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                     Ray shadowRay;
                                     shadowRay.origin = OffsetRayOrigin(hit, auditLight.direction);
                                     shadowRay.direction = auditLight.direction;
-                                    float shadowMax = std::max(auditLight.distance - kEpsilon, kEpsilon);
+                                    float shadowMax =
+                                        std::max(auditLight.distance - ShadowLightEndMargin(), ShadowLightEndMargin());
                                     bool blocked =
                                         IntersectSceneSkippingAlpha(sceneData,
                                                                     shadowRay,
@@ -6403,7 +7855,9 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                     materials,
                                                                     materialCount,
                                                                     settings.debugNormalStrengthScale,
-                                                                    shadowHit);
+                                                                    ShadedTriangleExclusion(hit, hardwareExcludeAttempts),
+                                                                    shadowHit,
+                                                                    PavilionPunctualShadowEnabled(material, auditLight.isReferencePoint));
                                     if (blocked &&
                                         shadowHit.primitiveType == GeometryType::Rectangles &&
                                         shadowHit.primitiveIndex == auditLight.rectIndex) {
@@ -6424,11 +7878,12 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                  shadingNormal,
                                                                  wo,
                                                                  auditLight.direction,
-                                                                 clampParams);
+                                                                 clampParams,
+                                                                 auditLight.isReferencePoint);
                                 entry.bsdfValue = bsdfEval.value;
                                 entry.bsdfPdf = bsdfEval.pdf;
                                 float misWeight = 1.0f;
-                                if (bsdfEval.pdf > 0.0f) {
+                                if (bsdfEval.pdf > 0.0f && !auditLight.isReferencePoint) {
                                     float denom = auditLight.pdf + bsdfEval.pdf;
                                     if (denom > 0.0f) {
                                         misWeight = std::clamp(auditLight.pdf / denom,
@@ -6479,16 +7934,22 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                             materialMrDebug.shadingNormal = hit.shadingNormal;
                             materialMrDebug.perturbedNormal = shadingNormal;
                             materialMrDebug.tangent = simd_make_float3(hit.tangent.x, hit.tangent.y, hit.tangent.z);
-                            if (hit.hasTangent) {
-                                simd::float3 t = simd::normalize(materialMrDebug.tangent -
-                                                                 shadingNormal * simd::dot(shadingNormal, materialMrDebug.tangent));
+                            // The same guards as the normal-map shading (it keeps the shading normal for a zero
+                            // or non-finite tangent frame): such a frame is reported as the raw tangent with a zero
+                            // bitangent, not normalized into NaN.
+                            const simd::float3 rawTangent = materialMrDebug.tangent;
+                            if (hit.hasTangent && IsFinite(rawTangent) && simd::dot(rawTangent, rawTangent) > 1.0e-6f) {
+                                simd::float3 t = simd::normalize(rawTangent - shadingNormal * simd::dot(shadingNormal, rawTangent));
                                 float tangentSign = hit.tangent.w < 0.0f ? -1.0f : 1.0f;
-                                materialMrDebug.tangent = t;
-                                materialMrDebug.bitangent =
-                                    simd::normalize(simd::cross(shadingNormal, t)) * tangentSign;
+                                simd::float3 b = simd::normalize(simd::cross(shadingNormal, t)) * tangentSign;
+                                if (IsFinite(t) && simd::dot(t, t) > 1.0e-6f && IsFinite(b) && simd::dot(b, b) > 1.0e-6f) {
+                                    materialMrDebug.tangent = t;
+                                    materialMrDebug.bitangent = b;
+                                }
                             }
                             auto normalTexIt = sceneData.materialTextures.find(material.textureIndices0.z);
-                            if (normalTexIt != sceneData.materialTextures.end() && hit.hasUv) {
+                            if (normalTexIt != sceneData.materialTextures.end() && hit.hasUv &&
+                                !settings.debugDisableNormalMap) {
                                 CpuTextureSamplingContext normalCtx =
                                     MakeCpuTextureSamplingContext(hit,
                                                                   material.textureUvSet0.z,
@@ -6500,13 +7961,19 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                            normalCtx.dUVdx,
                                                            normalCtx.dUVdy,
                                                            normalCtx.uvPerWorld,
-                                                           surfaceFootprintWorld);
-                                simd::float4 raw = SampleCpuTexture(normalTexIt->second, normalCtx.uv, normalLod);
+                                                           surfaceFootprintWorld,
+                                                           settings.textureLodBias);
+                                simd::float4 raw = normalCtx.hasIgehyGradients
+                                    ? SampleCpuTextureAnisotropic(normalTexIt->second, normalCtx.uv,
+                                        normalCtx.dUVdx, normalCtx.dUVdy, normalLod, settings.textureLodBias)
+                                    : SampleCpuTexture(normalTexIt->second, normalCtx.uv, normalLod);
                                 materialMrDebug.normalSampleRaw = simd_make_float3(raw.x, raw.y, raw.z);
                                 materialMrDebug.normalScale = material.pbrParams.w;
                                 materialMrDebug.normalLod = normalLod;
                                 materialMrDebug.normalSampleTs =
                                     DecodeNormalMap(materialMrDebug.normalSampleRaw, materialMrDebug.normalScale);
+                                if (settings.debugFlipNormalGreen)
+                                    materialMrDebug.normalSampleTs.y = -materialMrDebug.normalSampleTs.y;
                             }
                             float dielectricF0 = DielectricF0FromIor(material.typeEta.y);
                             materialMrDebug.f0 =
@@ -6551,22 +8018,32 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                           settings.environmentRotation,
                                                           settings.environmentIntensity);
                         }
+                        // Metal's camera_visible_emission (material_access.metal): seen directly by the camera, an
+                        // emitter flagged CameraVisibleEmissionTint shows its base colour x 16 instead of its emission.
+                        // Metal applies it only where the primary closure is not emissive, that is to every emitter
+                        // except DiffuseLight, whose branch reads the raw emission (path_integrators.metal).
+                        if (depth == 0u &&
+                            type != static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::DiffuseLight) &&
+                            (material.materialFlags & PathTracerShaderTypes::kMaterialFlagCameraVisibleEmissionTint) != 0u &&
+                            (material.emission.x != 0.0f || material.emission.y != 0.0f || material.emission.z != 0.0f)) {
+                            emission = MaterialBaseColor(material) * 16.0f;
+                        }
 
-                        if ((simd::dot(emission, emission) > 0.0f) &&
-                            (hit.frontFace || hit.twoSided)) {
+                        const simd::float3 misOrigin = holeMisOriginValid ? holeMisOrigin : ray.origin;
+                        if ((simd::dot(emission, emission) > 0.0f) && (hit.frontFace || hit.twoSided)) {
                             if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::DiffuseLight)) {
                                 float misWeight = 1.0f;
                                 bool useSpecularMis = (depth > 0) &&
                                                       ((!lastScatterWasDelta) ||
-                                                      settings.enableSpecularNee ||
-                                                      settings.enableMnee);
+                                                       (!lastDeltaUnpaired &&
+                                                        (settings.enableSpecularNee || settings.enableMnee)));
                                 if (useSpecularMis && rectLightCount > 0) {
                                     float lightPdf = RectLightPdfForHit(rectLightIndexByRect,
                                                                         rectangles,
                                                                         rectangleCount,
-                                                                        rectLightCount,
+                                                                        rectNeeLightCount,
                                                                         hit,
-                                                                        ray.origin);
+                                                                        misOrigin);
                                     float denom = lastBsdfPdf + lightPdf;
                                     if (denom > 0.0f) {
                                         misWeight = lastBsdfPdf / denom;
@@ -6574,6 +8051,19 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                     misWeight = std::clamp(misWeight,
                                                            kMisWeightClampMin,
                                                            kMisWeightClampMax);
+                                }
+                                // Mesh emitters pair with the mesh-emitter NEE, not the rect lights (Metal's emitter
+                                // branch, kernels.metal ~2516 and path_integrators.metal ~2923):
+                                // mesh_emitter_bsdf_hit_weight after a vertex whose mesh NEE covered this direction.
+                                if (hit.primitiveType == GeometryType::Mesh && depth > 0u && !lastScatterWasDelta &&
+                                    previousMeshNeeEligible && meshNeeBaseline) {
+                                    const float lightPdf = MeshLightPdfForHit(meshLights, hit, misOrigin);
+                                    misWeight = (lightPdf > 0.0f && lastBsdfPdf > 0.0f)
+                                        ? lastBsdfPdf / (lastBsdfPdf + lightPdf) : 1.0f;
+                                }
+                                // ReSTIR DI already counted this mesh light at the primary vertex.
+                                if (previousRestirDiCovered && MeshLightFacesOrigin(meshLights, hit, ray.origin)) {
+                                    misWeight = 0.0f;
                                 }
                                 if (debugSample && depth == 0) {
                                     std::cerr << "[EmbreeDirectDebug] emissive_hit"
@@ -6586,30 +8076,196 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                 addContribution(emission * misWeight);
                                 break;
                             }
+                            // Metal's mesh_emitter_bsdf_hit_weight: the BSDF side of the balance heuristic, after a
+                            // vertex whose mesh NEE covered this direction; 1 where NEE cannot reach the emitter.
+                            if (depth > 0u && !lastScatterWasDelta && previousMeshNeeEligible && meshNeeBaseline) {
+                                const float pdf = MeshLightPdfForHit(meshLights, hit, misOrigin);
+                                if (pdf > 0.0f && lastBsdfPdf > 0.0f) emission *= lastBsdfPdf / (lastBsdfPdf + pdf);
+                            }
+                            // ReSTIR DI already counted this mesh light at the primary vertex.
+                            if (previousRestirDiCovered && MeshLightFacesOrigin(meshLights, hit, ray.origin)) {
+                                emission = simd_make_float3(0.0f, 0.0f, 0.0f);
+                            }
                             addContribution(emission);
                         }
 
-                        bool surfaceIsDelta = MaterialIsDelta(material);
-                        const bool restirDirectEligibleMaterial =
-                            !restirDirectMode ||
-                            type == static_cast<uint32_t>(
-                                        PathTracerShaderTypes::MaterialType::PbrMetallicRoughness);
+                        // Subsurface, before direct light (Metal's subsurface_vertex_begin and subsurface_vertex_exit,
+                        // closures_eval.metal; path_integrators.metal ~2042). At a front-face hit of a random-walk
+                        // material the walk runs and the shading vertex moves to where it leaves the mesh: a white
+                        // diffuse surface (under the coat's light-side crossing when coated), so direct light, MIS and
+                        // the next ray are the ordinary ones there. A walk that does not leave ends the path with no
+                        // light. Any other subsurface hit is shaded as its dense limit, except the separable method
+                        // under sss=separable, which Embree does not port (reported at load) and shades as before.
+                        // The ray cone still grows over this ray's own length, to the walk's entry point (Metal's
+                        // hitDistanceWorld, taken before the walk).
+                        bool subsurfaceExitVertex = false;
+                        const float coneHitDistance = hit.t;
+                        if (type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Subsurface) &&
+                            !(settings.sssMode == PathTracer::RenderSettings::SssMode::Separable &&
+                              material.sssParams.y < 0.5f)) {
+                            bool runWalk = false;
+                            if (!sssRandomWalk || material.sssParams.y < 0.5f || !hit.frontFace) {
+                                material = SubsurfaceDenseLimitMaterial(material);
+                            } else if (!SubsurfaceHasCoat(material)) {
+                                runWalk = true;
+                            } else {
+                                // One-sample choice between the coat lobe and the walk, with the plastic closure's lobe
+                                // probabilities. The coat lobe is shaded as plastic with a black base; the walk takes
+                                // the view-side coat crossing here and the light-side one at its exit point.
+                                PathTracerShaderTypes::MaterialData plastic = SubsurfaceDenseLimitMaterial(material);
+                                const PlasticLobeProbabilities probs = PlasticLobeProbabilitiesFor(plastic, shadingNormal, wo);
+                                if (!(probs.coat + probs.diffuse > 0.0f)) {
+                                    material = plastic;  // the view direction is below the shading normal
+                                } else if (rng.nextFloat() < probs.coat) {
+                                    plastic.baseColorRoughness.x = 0.0f;
+                                    plastic.baseColorRoughness.y = 0.0f;
+                                    plastic.baseColorRoughness.z = 0.0f;
+                                    material = plastic;
+                                    throughput /= probs.coat;
+                                } else {
+                                    const float cosThetaO = simd::dot(shadingNormal, wo);
+                                    const float coatF0 = DielectricF0(PlasticCoatIor(plastic));
+                                    throughput *= (Splat3(1.0f) - SchlickFresnel(Splat3(coatF0), cosThetaO)) *
+                                                  PlasticCoatCrossing(plastic, cosThetaO) / probs.diffuse;
+                                    runWalk = true;
+                                }
+                            }
+                            if (runWalk) {
+                                HitInfo exitHit;
+                                simd::float3 walkWeight = Splat3(0.0f);
+                                const SssWalkOutcome outcome =
+                                    SssRandomWalk(sceneData, material, hit, settings.sssMaxSteps, rng, exitHit, walkWeight);
+                                sssWalkStats.note(matIndex, outcome);
+                                if (outcome != SssWalkOutcome::Exit) {
+                                    break;
+                                }
+                                throughput *= walkWeight;
+                                hit = exitHit;
+                                hit.authoredNormalWasFaced = false;
+                                subsurfaceExitVertex = true;
+                                if (SubsurfaceHasCoat(material)) {
+                                    material = SubsurfaceDenseLimitMaterial(material);
+                                    material.materialFlags |= PathTracerShaderTypes::kMaterialFlagSubsurfaceExit;
+                                } else {
+                                    material.typeEta.x = static_cast<float>(PathTracerShaderTypes::MaterialType::Lambertian);
+                                }
+                                material.baseColorRoughness.x = 1.0f;
+                                material.baseColorRoughness.y = 1.0f;
+                                material.baseColorRoughness.z = 1.0f;
+                                shadingNormal = hit.shadingNormal;
+                                wo = shadingNormal;
+                                incidentDir = -wo;
+                                // Shadow rays and the next ray leave from the exit point.
+                                previousHit = hit;
+                            }
+                            type = static_cast<uint32_t>(material.typeEta.x);
+                        }
 
-                        if ((!restirDirectMode || depth == 1u) &&
+                        bool surfaceIsDelta = MaterialIsDelta(material);
+                        // Under source transport Metal's wavefront samples no light at a path's last vertex
+                        // (sourceDirectAllowed, kernels.metal): the path ends with its last emission hit, as Tungsten's
+                        // bounce count does, not with one more bounce of direct light.
+                        const bool sourceDirectAllowed = !gSourceTransport.enabled || depth + 1u < settings.maxDepth;
+                        // Metal's source shadow medium (wavefront_prepare_source_shadow, and the source shadow
+                        // traversal in path_integrators.metal): under source transport a shadow ray starts in the
+                        // path's current medium, after interface_select_medium for its direction, and is attenuated
+                        // over its length from the hit point. A dielectric interface on the way blocks it, so one
+                        // medium covers the whole segment; an unbounded segment through an absorbing medium carries
+                        // nothing. tMax is the shadow ray's own. Metal also re-selects the medium at each alpha hole
+                        // it passes; that only matters at a hole in an explicit-interior material, which
+                        // ResolveSourceCapabilities refuses under source transport.
+                        const auto sourceShadowTransmittance = [&](const Ray& shadowRay, float tMax) -> simd::float3 {
+                            const simd::float3 zero = simd_make_float3(0.0f, 0.0f, 0.0f);
+                            if (!gSourceTransport.enabled) {
+                                return simd_make_float3(1.0f, 1.0f, 1.0f);
+                            }
+                            simd::float3 sigma = mediumDepth > 0u ? mediumSigmaStack[mediumDepth - 1u] : zero;
+                            if (pt_shared::source_material_flag(material, PathTracerShaderTypes::kMaterialFlagExplicitInterior)) {
+                                sigma = simd::dot(shadowRay.direction, hit.normal) < 0.0f
+                                    ? simd::max(DielectricSigmaA(material), zero) : zero;
+                            }
+                            if (!(sigma.x > 0.0f || sigma.y > 0.0f || sigma.z > 0.0f)) {
+                                return simd_make_float3(1.0f, 1.0f, 1.0f);
+                            }
+                            const float segment =
+                                std::max(tMax + simd::dot(shadowRay.origin - hit.position, shadowRay.direction), 0.0f);
+                            return Exp3(-sigma * std::min(segment, 1.0e20f));
+                        };
+
+                        // ReSTIR DI at the primary surface (the first one the path scatters from, so one reached
+                        // through alpha cutouts too), as Metal renders it by default: the fused shader path, which
+                        // headless and GUI runs use unless restirDebug or PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI
+                        // selects the explicit screen-space passes (RenderLoop.mm). One reservoir over the sun and the
+                        // mesh lights (Metal's emissive primitives; rect lights and the environment keep their own
+                        // NEE, restir_di_make_provider_set) at this sample's own hit; its winner is shaded with
+                        // W = wSum / (M * p_hat) and one shadow ray (path_integrators.metal, RIS winner shading).
+                        if (sourceDirectAllowed && restirDirectMode && !primaryVertexScattered && !surfaceIsDelta &&
+                            type != static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::DiffuseLight)) {
+                            CpuReservoir reservoir;
+                            if (CpuBuildRestirDiProviderReservoirForHit(sceneData, directionalLights, meshLights,
+                                                                        hit, material, shadingNormal, wo,
+                                                                        clampParams, std::max(settings.risCandidateCount, 1u),
+                                                                        rng, reservoir)) {
+                                const CpuRisSamplePayload& winner = reservoir.winner;
+                                const bool winnerDirectional = CpuRisPayloadIsDirectional(winner);
+                                const simd::float3 omegaL = CpuRisPayloadOmegaL(hit, winner);
+                                const float cosThetaSurface = ReferenceDirectCos(material, hit, shadingNormal, omegaL);
+                                const float phat =
+                                    CpuReservoirWinnerPHatForHit(hit, material, shadingNormal, wo, clampParams, winner);
+                                const float reservoirW =
+                                    phat > 0.0f ? (reservoir.wSum / static_cast<float>(reservoir.M)) / phat : 0.0f;
+                                const BsdfEval bsdfEval = DirectLightTargetBsdf(material, hit, shadingNormal, wo, omegaL,
+                                                                                clampParams, winnerDirectional);
+                                if (cosThetaSurface > 0.0f && reservoirW > 0.0f && !bsdfEval.isDelta) {
+                                    ++tileShadowRayCount;
+                                    Ray shadowRay;
+                                    shadowRay.origin = OffsetRayOrigin(hit, omegaL);
+                                    shadowRay.direction = omegaL;
+                                    const float shadowMax = winnerDirectional
+                                        ? std::numeric_limits<float>::infinity()
+                                        : std::max(simd::length(winner.position - hit.position) - ShadowLightEndMargin(),
+                                                   ShadowLightEndMargin());
+                                    HitInfo shadowHit;
+                                    SourceOpacityShadow opacityShadow{.transmission = 1.0f, .bounce = depth + 1u, .maxDepth = settings.maxDepth};
+                                    bool occluded = IntersectSceneSkippingAlpha(sceneData, shadowRay, shadowMax, materials,
+                                                                                materialCount, settings.debugNormalStrengthScale,
+                                                                                ShadedTriangleExclusion(hit, hardwareExcludeAttempts),
+                                                                                shadowHit,
+                                                                                PavilionPunctualShadowEnabled(material,
+                                                                                                              winnerDirectional),
+                                gSourceTransport.enabled ? &opacityShadow : nullptr);
+                                    if (occluded && CpuShadowHitIsSelectedLight(shadowHit, winner)) {
+                                        occluded = false;
+                                    }
+                                    if (!occluded) {
+                                        addContribution(bsdfEval.value * winner.emission * (cosThetaSurface * reservoirW),
+                                                        sourceShadowTransmittance(shadowRay, shadowMax) * opacityShadow.weight());
+                                    }
+                                }
+                            }
+                        }
+
+                        // Every vertex after the first scatter samples the sun, as Metal's RIS NEE does there for
+                        // any non-delta material (path_integrators.metal, non-explicit stage).
+                        if (sourceDirectAllowed && directionalNeeMode &&
+                            (!restirDirectMode || primaryVertexScattered) &&
                             !surfaceIsDelta &&
-                            restirDirectEligibleMaterial &&
                             !directionalLights.empty()) {
                             for (const DirectionalLightInfo& light : directionalLights) {
-                                float nDotL = std::max(simd::dot(shadingNormal, light.direction), 0.0f);
+                                const simd::float3 lightDirection = SampleDirectionalCone(light.direction, light.cosDelta, rng);
+                                // Plain NEE's cosine in every mode: Metal's reservoir modes draw the sun with
+                                // direct_light_target_cos, which lights a two-sided cutout from behind (PR #80).
+                                float nDotL = ReferenceDirectCos(material, hit, shadingNormal, lightDirection);
                                 if (!(nDotL > 0.0f)) {
                                     continue;
                                 }
 
                                 ++tileShadowRayCount;
                                 Ray shadowRay;
-                                shadowRay.origin = OffsetRayOrigin(hit, light.direction);
-                                shadowRay.direction = light.direction;
+                                shadowRay.origin = OffsetRayOrigin(hit, lightDirection);
+                                shadowRay.direction = lightDirection;
                                 HitInfo shadowHit;
+                                SourceOpacityShadow opacityShadow{.transmission = 1.0f, .bounce = depth + 1u, .maxDepth = settings.maxDepth};
                                 const bool occluded =
                                     IntersectSceneSkippingAlpha(sceneData,
                                                                 shadowRay,
@@ -6617,7 +8273,10 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                 materials,
                                                                 materialCount,
                                                                 settings.debugNormalStrengthScale,
-                                                                shadowHit);
+                                                                ShadedTriangleExclusion(hit, hardwareExcludeAttempts),
+                                                                shadowHit,
+                                                                PavilionPunctualShadowEnabled(material, true),
+                                gSourceTransport.enabled ? &opacityShadow : nullptr);
                                 if (debugSample && depth == 0) {
                                     std::cerr << "[EmbreeDirectDebug] directional_sample"
                                               << " pixel=(" << x << "," << y << ")"
@@ -6634,8 +8293,10 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                  hit.position,
                                                                  shadingNormal,
                                                                  wo,
-                                                                 light.direction,
-                                                                 clampParams);
+                                                                 lightDirection,
+                                                                 clampParams,
+                                                                 true);
+                                ApplyTwoSidedAlphaCutoutDiffuseFallback(material, hit, shadingNormal, lightDirection, bsdfEval);
                                 if (debugSample && depth == 0) {
                                     std::cerr << "[EmbreeDirectDebug] directional_bsdf"
                                               << " bsdfPdf=" << bsdfEval.pdf
@@ -6650,94 +8311,176 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                   << " contribLum=" << Luminance(contribution)
                                                   << std::endl;
                                     }
-                                    addContribution(contribution);
+                                    addContribution(contribution, sourceShadowTransmittance(shadowRay, 1.0e20f) * opacityShadow.weight());
                                 }
                             }
                         }
 
-                        if (!restirDirectMode &&
-                            !surfaceIsDelta &&
-                            restirDirectEligibleMaterial &&
-                            rectLightCount > 0) {
-                            RectLightSample lightSample;
-                            bool sampled = SampleRectLight(rectLights, envPtr, settings, hit, rng, lightSample);
-                            if (debugSample && depth == 0 && !sampled) {
-                                std::cerr << "[EmbreeDirectDebug] rect_sample_failed"
-                                          << " pixel=(" << x << "," << y << ")"
-                                          << std::endl;
-                            }
-                            if (sampled) {
-                                float nDotL = std::max(simd::dot(shadingNormal, lightSample.direction), 0.0f);
-                                if (lightSample.pdf > 0.0f && nDotL > 0.0f) {
-                                    float shadowMax = std::max(lightSample.distance - kEpsilon, kEpsilon);
-                                    ++tileShadowRayCount;
-                                    HitInfo shadowHit;
-                                    Ray shadowRay;
-                                    shadowRay.origin = OffsetRayOrigin(hit, lightSample.direction);
-                                    shadowRay.direction = lightSample.direction;
-                                    bool occluded = false;
-                                    if (IntersectSceneSkippingAlpha(sceneData,
-                                                                    shadowRay,
-                                                                    shadowMax,
-                                                                    materials,
-                                                                    materialCount,
-                                                                    settings.debugNormalStrengthScale,
-                                                                    shadowHit)) {
-                                        occluded = !(shadowHit.primitiveType == GeometryType::Rectangles &&
-                                                     shadowHit.primitiveIndex == lightSample.rectIndex);
+                        // Baseline mesh NEE (Metal's sample_direct_light_baseline): one draw by power over every
+                        // emitter. CpuSampleMeshLight rejects a point seen from a side its emitter does not emit to
+                        // (emissive_light_cosine), so one-sided emitters stay one-sided.
+                        if (sourceDirectAllowed && meshNeeBaseline && !surfaceIsDelta) {
+                            CpuRisSamplePayload light;
+                            if (CpuSampleMeshLight(sceneData, meshLights, hit, 1.0f, rng, light)) {
+                                const simd::float3 toLight = light.position - hit.position;
+                                const float distance = simd::length(toLight);
+                                const simd::float3 direction = toLight / distance;
+                                const float cosine = ReferenceDirectCos(material, hit, shadingNormal, direction);
+                                if (cosine > 0.0f && light.pdf > 0.0f) {
+                                    Ray shadow;
+                                    shadow.origin = OffsetRayOrigin(hit, direction);
+                                    // Metal aims the shadow ray of a two-sided or textured emitter at the sampled point
+                                    // from the offset origin, and every one under source transport
+                                    // (wavefront_prepare_source_shadow); a plain emitter's leaves along the sampled
+                                    // direction and stops the end margin short of the sampled distance.
+                                    const bool aimFromOrigin = gSourceTransport.enabled ||
+                                        (light.flags & (PathTracerShaderTypes::kLightPrimitiveFlagTwoSided |
+                                                        PathTracerShaderTypes::kLightPrimitiveFlagTexturedEmission)) != 0u;
+                                    float shadowMax = 0.0f;
+                                    if (aimFromOrigin) {
+                                        const simd::float3 visibilityDelta = light.position - shadow.origin;
+                                        const float visibilityDistance = simd::length(visibilityDelta);
+                                        shadow.direction = visibilityDelta / visibilityDistance;
+                                        shadowMax = std::max(visibilityDistance - ShadowLightEndMargin(), ShadowLightEndMargin());
+                                    } else {
+                                        shadow.direction = direction;
+                                        shadowMax = std::max(distance - ShadowLightEndMargin(), ShadowLightEndMargin());
                                     }
-                                    if (debugSample && depth == 0) {
-                                        std::cerr << "[EmbreeDirectDebug] rect_sample"
-                                                  << " pixel=(" << x << "," << y << ")"
-                                                  << " nDotL=" << nDotL
-                                                  << " cosLight=" << lightSample.cosLight
-                                                  << " area=" << lightSample.area
-                                                  << " dist=" << lightSample.distance
-                                                  << " lightPdf=" << lightSample.pdf
-                                                  << " occluded=" << (occluded ? 1 : 0)
-                                                  << " emissionLum=" << Luminance(lightSample.emission)
-                                                  << std::endl;
+                                    HitInfo blocker;
+                                    ++tileShadowRayCount;
+                                    SourceOpacityShadow opacityShadow{.transmission = 1.0f, .bounce = depth + 1u, .maxDepth = settings.maxDepth};
+                                    bool occluded = IntersectSceneSkippingAlpha(sceneData, shadow, shadowMax,
+                                                                                materials, materialCount, settings.debugNormalStrengthScale,
+                                                                                ShadedTriangleExclusion(hit, hardwareExcludeAttempts),
+                                                                                blocker, false,
+                                gSourceTransport.enabled ? &opacityShadow : nullptr);
+                                    // A hit on the sampled light itself does not shadow it, as on Metal's wavefront
+                                    // (kWavefrontShadowFlagEmissivePrimitive with primitiveIndex == lightId). Under
+                                    // source transport the end margin is 1e-6, within float error of the light's own t.
+                                    if (occluded && CpuShadowHitIsSelectedLight(blocker, light)) {
+                                        occluded = false;
                                     }
                                     if (!occluded) {
-                                    BsdfEval bsdfEval = EvaluateBsdf(material,
-                                                                     hit.position,
-                                                                     shadingNormal,
-                                                                     wo,
-                                                                     lightSample.direction,
-                                                                     clampParams);
-                                        if (debugSample && depth == 0) {
-                                            std::cerr << "[EmbreeDirectDebug] rect_bsdf"
-                                                      << " bsdfPdf=" << bsdfEval.pdf
-                                                      << " bsdfLum=" << Luminance(bsdfEval.value)
-                                                      << " isDelta=" << (bsdfEval.isDelta ? 1 : 0)
-                                                      << std::endl;
-                                        }
-                                        if (!bsdfEval.isDelta && bsdfEval.pdf > 0.0f) {
-                                            float weight = lightSample.pdf /
-                                                           (lightSample.pdf + bsdfEval.pdf);
-                                            simd::float3 contribution = lightSample.emission * bsdfEval.value * nDotL;
-                                            contribution *= weight / lightSample.pdf;
-                                            if (materialMrDebugCaptured &&
-                                                debugSample &&
-                                                depth == 0 &&
-                                                type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness)) {
-                                                materialMrDebug.directContribution = contribution;
-                                                materialMrDebug.directContributionKind = 2.0f;
-                                            }
-                                            if (debugSample && depth == 0) {
-                                                std::cerr << "[EmbreeDirectDebug] rect_contrib"
-                                                          << " weight=" << weight
-                                                          << " contribLum=" << Luminance(contribution)
-                                                          << std::endl;
-                                            }
-                                            addContribution(contribution);
+                                        BsdfEval eval = EvaluateBsdf(material, hit.position, shadingNormal, wo, direction, clampParams);
+                                        const bool cutoutBackLightUnsampled =
+                                            ApplyTwoSidedAlphaCutoutDiffuseFallback(material, hit, shadingNormal, direction, eval);
+                                        if (!eval.isDelta) {
+                                            // Metal's mesh_emitter_nee_mis_weight: the light side of the balance
+                                            // heuristic; 1 at the last vertex or where the BSDF cannot sample the
+                                            // direction.
+                                            const float misBsdfPdf = NeeMisBsdfPdf(eval, cutoutBackLightUnsampled);
+                                            const float weight = (depth + 1u < settings.maxDepth && misBsdfPdf > 0.0f)
+                                                ? light.pdf / (light.pdf + misBsdfPdf) : 1.0f;
+                                            const simd::float3 value = ReferenceContinuationNeeValue(material, shadingNormal, wo, direction, eval.value);
+                                            addContribution(light.emission * value * cosine * (weight / std::max(light.pdf, 1.0e-6f)),
+                                                            sourceShadowTransmittance(shadow, shadowMax) * opacityShadow.weight());
                                         }
                                     }
                                 }
                             }
                         }
 
-                        if (!surfaceIsDelta && envSampling) {
+                        // Rect lights keep their own NEE at every non-delta vertex in every mode, as on Metal,
+                        // where the ReSTIR DI reservoir holds emissive primitives only.
+                        if (sourceDirectAllowed && !surfaceIsDelta && !rectLights.empty()) {
+                            const uint32_t neeDrawCount = exactPointNeeActive ? rectLightCount + 1u : 1u;
+                            for (uint32_t neeDraw = 0u; neeDraw < neeDrawCount; ++neeDraw) {
+                                RectLightSample lightSample;
+                                bool sampled = SampleRectLightNeeDraw(rectLights, envPtr, settings, hit, rng, lightSample,
+                                                               neeDraw, exactPointNeeActive);
+                                if (debugSample && depth == 0 && !sampled) {
+                                    std::cerr << "[EmbreeDirectDebug] rect_sample_failed"
+                                              << " pixel=(" << x << "," << y << ")"
+                                              << std::endl;
+                                }
+                                if (sampled) {
+                                    float nDotL = ReferenceDirectCos(material, hit, shadingNormal, lightSample.direction);
+                                    if (lightSample.pdf > 0.0f && nDotL > 0.0f) {
+                                        float shadowMax =
+                                            std::max(lightSample.distance - ShadowLightEndMargin(), ShadowLightEndMargin());
+                                        ++tileShadowRayCount;
+                                        HitInfo shadowHit;
+                                        Ray shadowRay;
+                                        shadowRay.origin = OffsetRayOrigin(hit, lightSample.direction);
+                                        shadowRay.direction = lightSample.direction;
+                                        bool occluded = false;
+                                        SourceOpacityShadow opacityShadow{.transmission = 1.0f, .bounce = depth + 1u, .maxDepth = settings.maxDepth};
+                                        if (IntersectSceneSkippingAlpha(sceneData,
+                                                                        shadowRay,
+                                                                        shadowMax,
+                                                                        materials,
+                                                                        materialCount,
+                                                                        settings.debugNormalStrengthScale,
+                                                                        ShadedTriangleExclusion(hit, hardwareExcludeAttempts),
+                                                                        shadowHit,
+                                                                        PavilionPunctualShadowEnabled(material, lightSample.isReferencePoint),
+                                gSourceTransport.enabled ? &opacityShadow : nullptr)) {
+                                            occluded = !(shadowHit.primitiveType == GeometryType::Rectangles &&
+                                                         shadowHit.primitiveIndex == lightSample.rectIndex);
+                                        }
+                                        if (debugSample && depth == 0) {
+                                            std::cerr << "[EmbreeDirectDebug] rect_sample"
+                                                      << " pixel=(" << x << "," << y << ")"
+                                                      << " nDotL=" << nDotL
+                                                      << " cosLight=" << lightSample.cosLight
+                                                      << " area=" << lightSample.area
+                                                      << " dist=" << lightSample.distance
+                                                      << " lightPdf=" << lightSample.pdf
+                                                      << " occluded=" << (occluded ? 1 : 0)
+                                                      << " emissionLum=" << Luminance(lightSample.emission)
+                                                      << std::endl;
+                                        }
+                                        if (!occluded) {
+                                        BsdfEval bsdfEval = EvaluateBsdf(material,
+                                                                         hit.position,
+                                                                         shadingNormal,
+                                                                         wo,
+                                                                         lightSample.direction,
+                                                                         clampParams,
+                                                                         lightSample.isReferencePoint);
+                                        const bool cutoutBackLightUnsampled =
+                                            ApplyTwoSidedAlphaCutoutDiffuseFallback(material, hit, shadingNormal,
+                                                                                    lightSample.direction, bsdfEval);
+                                            if (debugSample && depth == 0) {
+                                                std::cerr << "[EmbreeDirectDebug] rect_bsdf"
+                                                          << " bsdfPdf=" << bsdfEval.pdf
+                                                          << " bsdfLum=" << Luminance(bsdfEval.value)
+                                                          << " isDelta=" << (bsdfEval.isDelta ? 1 : 0)
+                                                          << std::endl;
+                                            }
+                                            if (!bsdfEval.isDelta && bsdfEval.pdf > 0.0f) {
+                                                const float misBsdfPdf = NeeMisBsdfPdf(bsdfEval, cutoutBackLightUnsampled);
+                                                float weight = lightSample.isReferencePoint ? 1.0f : lightSample.pdf /
+                                                               (lightSample.pdf + misBsdfPdf);
+                                                const simd::float3 value = lightSample.isReferencePoint ? bsdfEval.value :
+                                                    ReferenceContinuationNeeValue(material, shadingNormal, wo, lightSample.direction, bsdfEval.value);
+                                                if ((material.materialFlags & (PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular |
+                                                      PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation)) != 0u &&
+                                                    depth + 1u >= settings.maxDepth) weight = 1.0f;
+                                                simd::float3 contribution = lightSample.emission * value * nDotL;
+                                                contribution *= weight / lightSample.pdf;
+                                                if (materialMrDebugCaptured &&
+                                                    debugSample &&
+                                                    depth == 0 &&
+                                                    type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness)) {
+                                                    materialMrDebug.directContribution = contribution;
+                                                    materialMrDebug.directContributionKind = 2.0f;
+                                                }
+                                                if (debugSample && depth == 0) {
+                                                    std::cerr << "[EmbreeDirectDebug] rect_contrib"
+                                                              << " weight=" << weight
+                                                              << " contribLum=" << Luminance(contribution)
+                                                              << std::endl;
+                                                }
+                                                addContribution(contribution, sourceShadowTransmittance(shadowRay, shadowMax) * opacityShadow.weight());
+                                            }
+                                        }
+                                    }
+                                }
+                            } // analytic NEE draw loop
+                        }
+
+                        if (sourceDirectAllowed && !surfaceIsDelta && envSampling) {
                             PathTracer::EnvImportanceSample envSample =
                                 PathTracer::SampleEnvironmentCpu(envPtr->distribution,
                                                                  rng.nextFloat(),
@@ -6746,56 +8489,51 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                  settings.environmentRotation,
                                                                  settings.environmentIntensity,
                                                                  envPtr->rgba.data());
-                            float nDotL = std::max(simd::dot(shadingNormal, envSample.direction), 0.0f);
+                            float nDotL = ReferenceDirectCos(material, hit, shadingNormal, envSample.direction);
                             if (envSample.pdf > 0.0f && nDotL > 0.0f) {
                                 Ray envShadowRay;
                                 envShadowRay.origin = OffsetRayOrigin(hit, envSample.direction);
                                 envShadowRay.direction = envSample.direction;
                                 HitInfo envShadowHit;
+                                SourceOpacityShadow opacityShadow{.transmission = 1.0f, .bounce = depth + 1u, .maxDepth = settings.maxDepth};
                                 if (!IntersectSceneSkippingAlpha(sceneData,
                                                                  envShadowRay,
                                                                  std::numeric_limits<float>::infinity(),
                                                                  materials,
                                                                  materialCount,
                                                                  settings.debugNormalStrengthScale,
-                                                                 envShadowHit)) {
-                                    float envNeeLod = 0.0f;
-                                    bool envNeeLodActive = false;
-                                    if (EnvironmentMaxMip(*envPtr) > 0.0f) {
-                                        const float envRoughness = EnvironmentLightingRoughness(material);
-                                        if (envRoughness < 0.95f) {
-                                            envNeeLod = EnvironmentLodFromRoughness(envRoughness, *envPtr);
-                                            envNeeLodActive = true;
-                                        }
-                                    }
+                                                                 ShadedTriangleExclusion(hit, hardwareExcludeAttempts),
+                                                                 envShadowHit, false,
+                                gSourceTransport.enabled ? &opacityShadow : nullptr)) {
                                     simd::float3 envRadiance =
-                                        envNeeLodActive
-                                            ? SampleEnvironmentLod(*envPtr,
-                                                                   envSample.direction,
-                                                                   settings.environmentRotation,
-                                                                   settings.environmentIntensity,
-                                                                   envNeeLod)
-                                            : SampleEnvironment(*envPtr,
-                                                                envSample.direction,
-                                                                settings.environmentRotation,
-                                                                settings.environmentIntensity);
+                                        SampleEnvironment(*envPtr,
+                                                          envSample.direction,
+                                                          settings.environmentRotation,
+                                                          settings.environmentIntensity);
                                 BsdfEval bsdfEval = EvaluateBsdf(material,
                                                                  hit.position,
                                                                  shadingNormal,
                                                                  wo,
                                                                  envSample.direction,
                                                                  clampParams);
+                                const bool cutoutBackLightUnsampled =
+                                    ApplyTwoSidedAlphaCutoutDiffuseFallback(material, hit, shadingNormal, envSample.direction,
+                                                                            bsdfEval);
                                     if (!bsdfEval.isDelta && bsdfEval.pdf > 0.0f) {
-                                        float weight = envSample.pdf / (envSample.pdf + bsdfEval.pdf);
-                                        simd::float3 contribution = envRadiance * bsdfEval.value * nDotL;
+                                        float weight = envSample.pdf / (envSample.pdf + NeeMisBsdfPdf(bsdfEval, cutoutBackLightUnsampled));
+                                        if ((material.materialFlags & (PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular |
+                                              PathTracerShaderTypes::kMaterialFlagReferenceDielectricContinuation)) != 0u &&
+                                            depth + 1u >= settings.maxDepth) weight = 1.0f;
+                                        simd::float3 contribution = envRadiance *
+                                            ReferenceContinuationNeeValue(material, shadingNormal, wo, envSample.direction, bsdfEval.value) * nDotL;
                                         contribution *= weight / envSample.pdf;
+                                        contribution *= sourceShadowTransmittance(envShadowRay, std::numeric_limits<float>::infinity()) * opacityShadow.weight();
                                         if (materialMrDebugCaptured &&
                                             debugSample &&
                                             depth == 0 &&
                                             type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::PbrMetallicRoughness)) {
                                             materialMrDebug.directContribution = contribution;
                                             materialMrDebug.directContributionKind = 1.0f;
-                                            materialMrDebug.envLod = envNeeLodActive ? envNeeLod : 0.0f;
                                         }
                                         addContribution(contribution);
                                     }
@@ -6811,6 +8549,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                        hit.frontFace,
                                                        rng,
                                                        clampParams);
+                    bsdfSample.isBssrdf = subsurfaceExitVertex;
                     if (materialMrDebugCaptured &&
                         debugSample &&
                         depth == 0 &&
@@ -6839,8 +8578,12 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                     }
                     if (bsdfSample.pdf <= 0.0f ||
                         simd::dot(bsdfSample.direction, bsdfSample.direction) <= 0.0f ||
-                        !IsFinite(bsdfSample.weight)) {
+                        !IsFinite(bsdfSample.weight) ||
+                        !FalcorFaceVisible(material, hit, bsdfSample.direction)) {
                         break;
+                    }
+                    if (!bsdfSample.isDelta) {
+                        pathMaxRoughness = std::max(pathMaxRoughness, PathRegularizationRoughness(material));
                     }
 
                     if (restirGiActive) {
@@ -7022,11 +8765,36 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                     }
 
                     bool radianceCacheTerminated = false;
-                    if (radianceCacheActive) {
+                    if (cacheTrainingPath) {
+                        // A training path never loads from the cache: its suffix is the unbiased sample the cache
+                        // learns from. Its records train when it ends.
+                        const uint32_t slot =
+                            PathTracer::RadianceCacheTraining::TrainSlot(depth, settings.radianceCacheMinDepth);
+                        if (slot < PathTracer::RadianceCacheTraining::kTrainRecordCount &&
+                            CpuRadianceCacheCanQuery(settings, material, bsdfSample, depth)) {
+                            CpuRadianceCacheTrainRecord& record = cacheTrainRecords[slot];
+                            record.materialType = static_cast<uint32_t>(material.typeEta.x);
+                            record.domainKey =
+                                CpuRadianceCacheDomainKey(settings, hit.position, depth, record.materialType, 0u);
+                            record.cellIndex =
+                                radianceCacheCapacity > 0u ? (record.domainKey % radianceCacheCapacity) : 0u;
+                            record.position = hit.position;
+                            record.normal = simd::normalize(shadingNormal);
+                            record.roughness = MaterialRoughness(material);
+                            record.throughputAtQuery = throughput;
+                            record.radianceBaseline = radiance;
+                            cacheTrainValidMask |= 1u << slot;
+                        }
+                    } else if (radianceCacheActive) {
                         if (!CpuRadianceCacheCanQuery(settings, material, bsdfSample, depth)) {
                             radianceCacheFallbackCount.fetch_add(1u, std::memory_order_relaxed);
+                            cacheStat(PathTracer::RadianceCacheTraining::kStatFallbackReasonBase +
+                                          CpuRadianceCacheCannotQueryReason(settings, material, depth),
+                                      1u);
                         } else {
                             radianceCacheQueryCount.fetch_add(1u, std::memory_order_relaxed);
+                            const uint32_t cacheDepthBin = std::min(depth, kCpuPathReservoirDepthCount - 1u);
+                            cacheStat(PathTracer::RadianceCacheTraining::kStatDepthQueryBase + cacheDepthBin, 1u);
                             const uint32_t materialType = static_cast<uint32_t>(material.typeEta.x);
                             const uint32_t domainKey =
                                 CpuRadianceCacheDomainKey(settings,
@@ -7039,6 +8807,16 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                             std::lock_guard<std::mutex> cacheLock(radianceCacheMutexes[cacheIndex]);
                             CpuRadianceCacheCell& cell = radianceCacheCells[cacheIndex];
                             bool cacheHit = false;
+                            // Miss reason for the diagnostics, in radiance_cache_load's order and codes.
+                            uint32_t cacheMissReason = 4u;  // empty cell
+                            if (cell.valid && cell.sampleCount > 0u) {
+                                if (cell.invalidated || cell.frameTag >= s) {
+                                    cacheMissReason = 6u;
+                                } else if (cell.domainKey != domainKey || cell.materialType != materialType ||
+                                           cell.lobeType != 0u) {
+                                    cacheMissReason = 7u;
+                                }
+                            }
                             if (cell.valid &&
                                 !cell.invalidated &&
                                 cell.sampleCount > 0u &&
@@ -7077,64 +8855,25 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                     radianceCacheHitCount.fetch_add(1u, std::memory_order_relaxed);
                                     cacheHit = true;
                                     radianceCacheTerminated = true;
+                                    cacheStat(PathTracer::RadianceCacheTraining::kStatDepthHitBase + cacheDepthBin, 1u);
+                                    cacheStat(PathTracer::RadianceCacheTraining::kStatDepthHitLumaFixedBase +
+                                                  cacheDepthBin,
+                                              PathTracer::RadianceCacheTraining::StatLumaToFixed(luma));
+                                } else if (normalDot < 0.65f || roughnessDelta > 0.35f) {
+                                    cacheMissReason = 7u;
+                                } else if (!IsFinite(estimate)) {
+                                    cacheMissReason = 6u;
+                                } else if (biasRisk > 0.85f) {
+                                    cacheMissReason = 8u;
+                                } else {
+                                    cacheMissReason = 5u;
                                 }
                             }
                             if (!cacheHit) {
                                 radianceCacheMissCount.fetch_add(1u, std::memory_order_relaxed);
                                 radianceCacheFallbackCount.fetch_add(1u, std::memory_order_relaxed);
-                            }
-
-                            if (!cacheHit &&
-                                (s % std::max(settings.radianceCacheTrainingInterval, 1u)) == 0u) {
-                                const simd::float3 trainingRadiance =
-                                    simd::max(bsdfSample.weight,
-                                              simd_make_float3(0.0f, 0.0f, 0.0f));
-                                const float luma = Luminance(trainingRadiance);
-                                const float maxRadiance =
-                                    std::max(settings.radianceCacheMaxRadiance, 1.0e-4f);
-                                if (!IsFinite(trainingRadiance) ||
-                                    !std::isfinite(luma) ||
-                                    trainingRadiance.x > maxRadiance ||
-                                    trainingRadiance.y > maxRadiance ||
-                                    trainingRadiance.z > maxRadiance ||
-                                    luma > maxRadiance) {
-                                    radianceCacheInvalidCount.fetch_add(1u, std::memory_order_relaxed);
-                                } else if (luma > 0.0f) {
-                                    if (!cell.valid ||
-                                        cell.invalidated ||
-                                        cell.domainKey != domainKey ||
-                                        cell.materialType != materialType ||
-                                        cell.lobeType != 0u) {
-                                        if (cell.sampleCount > 0u && cell.domainKey != domainKey) {
-                                            radianceCacheInvalidCount.fetch_add(1u, std::memory_order_relaxed);
-                                        }
-                                        cell = CpuRadianceCacheCell{};
-                                        cell.valid = true;
-                                        cell.domainKey = domainKey;
-                                        cell.materialType = materialType;
-                                        cell.lobeType = 0u;
-                                    }
-                                    if (cell.sampleCount >= 1024u) {
-                                        radianceCacheFallbackCount.fetch_add(1u, std::memory_order_relaxed);
-                                    } else {
-                                        cell.sampleCount += 1u;
-                                        cell.radianceSum += trainingRadiance;
-                                        cell.lumaMomentSum += luma * luma;
-                                        const float samples =
-                                            static_cast<float>(std::max(cell.sampleCount, 1u));
-                                        cell.position = hit.position;
-                                        cell.normal = simd::normalize(shadingNormal);
-                                        cell.roughness = MaterialRoughness(material);
-                                        cell.storedVariance =
-                                            samples > 1.0f ? (luma * luma) / samples : 1.0f;
-                                        cell.confidence =
-                                            std::clamp(std::log2(samples + 1.0f) / 6.0f,
-                                                       0.0f,
-                                                       1.0f);
-                                        cell.frameTag = s;
-                                        radianceCacheTrainCount.fetch_add(1u, std::memory_order_relaxed);
-                                    }
-                                }
+                                cacheStat(PathTracer::RadianceCacheTraining::kStatFallbackReasonBase + cacheMissReason,
+                                          1u);
                             }
                         }
                     }
@@ -7142,23 +8881,11 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                         break;
                     }
 
-                    bool causticCandidate = (!surfaceIsDelta) && (specularDepth > 0);
                     uint32_t nextSpecularDepth = bsdfSample.isDelta ? (specularDepth + 1u) : 0u;
-                    bool didTransmission = false;
-                    if (bsdfSample.isDelta &&
-                        type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric)) {
-                        float side = hit.frontFace ? 1.0f : -1.0f;
-                        didTransmission = (simd::dot(shadingNormal, bsdfSample.direction) * side) < 0.0f;
-                    }
-                    if (didTransmission) {
-                        hadTransmission = true;
-                    }
                     specularDepth = nextSpecularDepth;
-                    (void)causticCandidate;
-                    (void)hadTransmission;
 
-                    bool useMnee = settings.enableMnee;
-                    bool specNeeEnabled = settings.enableSpecularNee;
+                    bool useMnee = settings.enableMnee && !settings.sourceTransport;  // Metal's wavefront has no bounce MNEE
+                    bool specNeeEnabled = settings.enableSpecularNee && !settings.sourceTransport;  // off under source transport, as Metal
                     float dirLenSq = simd::dot(bsdfSample.direction, bsdfSample.direction);
                     bool specDirectionValid = (dirLenSq > 0.0f) && IsFinite(bsdfSample.direction);
                     bool mneeEligible = useMnee &&
@@ -7166,11 +8893,16 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                         specDirectionValid &&
                                         type == static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::Dielectric) &&
                                         nextSpecularDepth == 1u;
+                    // As on Metal, no specular NEE along a refraction into a medium.
                     bool specNeeEligible = specNeeEnabled &&
                                            bsdfSample.isDelta &&
+                                           bsdfSample.mediumEvent <= 0 &&
                                            specDirectionValid &&
                                            !mneeEligible;
 
+                    // The four delta-direction visibility rays below pass no shadow exclusion. After a transmission
+                    // Metal excludes the shaded mesh without its triangle, which skips at most a hit within kEpsilon
+                    // (1e-3) of the origin, and its 1e-3 minimum distance leaves no such hit.
                     if (specNeeEligible && envSampling) {
                         simd::float3 neeDir = simd::normalize(bsdfSample.direction);
                         Ray neeVisibilityRay;
@@ -7183,12 +8915,12 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                          materials,
                                                          materialCount,
                                                          settings.debugNormalStrengthScale,
+                                                         ShadowExclusion{},
                                                          neeVisibilityHit)) {
                             float envPdf = std::max(EnvironmentPdf(*envPtr,
                                                                    settings.environmentRotation,
                                                                    neeDir),
                                                     kSpecularNeePdfFloor);
-                            float invEnvPdf = std::min(1.0f / envPdf, kSpecularNeeInvPdfClamp);
                             float bsdfPdf = std::max(bsdfSample.pdf, kSpecularNeePdfFloor);
                             float denom = envPdf + bsdfPdf;
                             float misWeight = denom > 0.0f ? (envPdf / denom) : 0.0f;
@@ -7197,8 +8929,11 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                       neeDir,
                                                                       settings.environmentRotation,
                                                                       settings.environmentIntensity);
-                            simd::float3 neeContribution = bsdfSample.weight * envColor *
-                                                           (misWeight * invEnvPdf);
+                            // The delta sample fixed this direction; it was not drawn from the
+                            // environment, so there is no 1/envPdf. This connection takes the
+                            // light strategy's MIS share and the continuation's environment miss
+                            // takes bsdfPdf / (bsdfPdf + envPdf), so the two sum to one.
+                            simd::float3 neeContribution = bsdfSample.weight * envColor * misWeight;
                             addContribution(neeContribution);
                         }
                     }
@@ -7215,6 +8950,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                         materials,
                                                         materialCount,
                                                         settings.debugNormalStrengthScale,
+                                                        ShadowExclusion{},
                                                         lightHit)) {
                             RectLightHit rectHit;
                             if (RectLightHitInfo(rectLightIndexByRect,
@@ -7227,13 +8963,13 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                  neeRay.origin,
                                                  rectHit)) {
                                 float lightPdf = std::max(rectHit.pdf, kSpecularNeePdfFloor);
-                                float invLightPdf = std::min(1.0f / lightPdf, kSpecularNeeInvPdfClamp);
                                 float bsdfPdf = std::max(bsdfSample.pdf, kSpecularNeePdfFloor);
                                 float denom = lightPdf + bsdfPdf;
                                 float misWeight = denom > 0.0f ? (lightPdf / denom) : 0.0f;
                                 misWeight = std::clamp(misWeight, kMisWeightClampMin, kMisWeightClampMax);
-                                simd::float3 neeContribution = bsdfSample.weight * rectHit.emission *
-                                                               (misWeight * invLightPdf);
+                                // Delta direction, not a light sample: MIS share only, no 1/lightPdf
+                                // (the continuation's emitter hit takes the complement).
+                                simd::float3 neeContribution = bsdfSample.weight * rectHit.emission * misWeight;
                                 addContribution(neeContribution);
                             }
                         }
@@ -7252,12 +8988,12 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
 	                                                         materials,
 	                                                         materialCount,
 	                                                         settings.debugNormalStrengthScale,
+	                                                         ShadowExclusion{},
 	                                                         mneeVisibilityHit)) {
                             float envPdf = std::max(EnvironmentPdf(*envPtr,
                                                                    settings.environmentRotation,
                                                                    mneeDir),
                                                     kSpecularNeePdfFloor);
-                            float invEnvPdf = std::min(1.0f / envPdf, kSpecularNeeInvPdfClamp);
                             float bsdfPdf = std::max(bsdfSample.pdf, kSpecularNeePdfFloor);
                             float denom = envPdf + bsdfPdf;
                             float misWeight = denom > 0.0f ? (envPdf / denom) : 0.0f;
@@ -7266,8 +9002,9 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                                       mneeDir,
                                                                       settings.environmentRotation,
                                                                       settings.environmentIntensity);
-                            simd::float3 mneeContribution = bsdfSample.weight * envColor *
-                                                            (misWeight * invEnvPdf);
+                            // Delta direction, not an environment sample: MIS share only, no
+                            // 1/envPdf (the continuation's environment miss takes the complement).
+                            simd::float3 mneeContribution = bsdfSample.weight * envColor * misWeight;
                             addContribution(mneeContribution);
                         }
                     }
@@ -7285,6 +9022,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                         materials,
                                                         materialCount,
                                                         settings.debugNormalStrengthScale,
+                                                        ShadowExclusion{},
                                                         lightHit)) {
                             RectLightHit rectHit;
                             if (RectLightHitInfo(rectLightIndexByRect,
@@ -7297,140 +9035,14 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                  mneeRay.origin,
                                                  rectHit)) {
                                 float lightPdf = std::max(rectHit.pdf, kSpecularNeePdfFloor);
-                                float invLightPdf = std::min(1.0f / lightPdf, kSpecularNeeInvPdfClamp);
                                 float bsdfPdf = std::max(bsdfSample.pdf, kSpecularNeePdfFloor);
                                 float denom = lightPdf + bsdfPdf;
                                 float misWeight = denom > 0.0f ? (lightPdf / denom) : 0.0f;
                                 misWeight = std::clamp(misWeight, kMisWeightClampMin, kMisWeightClampMax);
-                                simd::float3 mneeContribution = bsdfSample.weight * rectHit.emission *
-                                                                (misWeight * invLightPdf);
+                                // Delta direction, not a light sample: MIS share only, no 1/lightPdf
+                                // (the continuation's emitter hit takes the complement).
+                                simd::float3 mneeContribution = bsdfSample.weight * rectHit.emission * misWeight;
                                 addContribution(mneeContribution);
-                            }
-                        }
-                    }
-
-                    if (mneeEligible && settings.enableMneeSecondary) {
-                        simd::float3 chainDir = simd::normalize(bsdfSample.direction);
-                        Ray chainRay;
-                        chainRay.origin = OffsetRayOrigin(hit, chainDir);
-                        chainRay.direction = chainDir;
-                        HitInfo chainHit;
-                        if (IntersectSceneSkippingAlpha(sceneData,
-                                                        chainRay,
-                                                        std::numeric_limits<float>::infinity(),
-                                                        materials,
-                                                        materialCount,
-                                                        settings.debugNormalStrengthScale,
-                                                        chainHit)) {
-                            bool chainHitIsLight = false;
-                            if (rectLightCount > 0) {
-                                RectLightHit chainLightHit;
-                                if (RectLightHitInfo(rectLightIndexByRect,
-                                                     rectLights,
-                                                     rectangles,
-                                                     rectangleCount,
-                                                     envPtr,
-                                                     settings,
-                                                     chainHit,
-                                                     chainRay.origin,
-                                                     chainLightHit)) {
-                                    chainHitIsLight = true;
-                                }
-                            }
-                            if (!chainHitIsLight) {
-                                uint32_t chainMatIndex = std::min(chainHit.materialIndex, materialCount - 1);
-                                const auto& chainMaterial = materials[chainMatIndex];
-                                if (MaterialIsDelta(chainMaterial)) {
-                                    simd::float3 chainNormal = chainHit.normal;
-                                    if (simd::dot(chainNormal, chainNormal) <= 0.0f) {
-                                        chainNormal = {0.0f, 1.0f, 0.0f};
-                                    }
-                                    chainNormal = simd::normalize(chainNormal);
-                                    simd::float3 chainIncident = simd::normalize(chainRay.direction);
-                                    simd::float3 chainWo = -chainIncident;
-                                    Rng chainRng = rng;
-                                    BsdfSample chainSample = SampleBsdf(chainMaterial,
-                                                                        chainHit.position,
-                                                                        chainNormal,
-                                                                        chainWo,
-                                                                        chainIncident,
-                                                                        chainHit.frontFace,
-                                                                        chainRng,
-                                                                        clampParams);
-                                    if (chainSample.pdf > 0.0f &&
-                                        chainSample.isDelta &&
-                                        simd::dot(chainSample.direction, chainSample.direction) > 0.0f &&
-                                        IsFinite(chainSample.weight)) {
-                                        simd::float3 secondDir = simd::normalize(chainSample.direction);
-                                        Ray secondRay;
-                                        secondRay.origin = OffsetRayOrigin(chainHit, secondDir);
-                                        secondRay.direction = secondDir;
-                                        simd::float3 combinedWeight = bsdfSample.weight * chainSample.weight;
-                                        float bsdfPdf = std::max(bsdfSample.pdf * chainSample.pdf, kSpecularNeePdfFloor);
-                                        if (envSampling) {
-                                            ++tileShadowRayCount;
-	                                            HitInfo secondVisibilityHit;
-	                                            if (!IntersectSceneSkippingAlpha(sceneData,
-	                                                                             secondRay,
-	                                                                             std::numeric_limits<float>::infinity(),
-	                                                                             materials,
-	                                                                             materialCount,
-	                                                                             settings.debugNormalStrengthScale,
-	                                                                             secondVisibilityHit)) {
-                                                float envPdf = std::max(EnvironmentPdf(*envPtr,
-                                                                                       settings.environmentRotation,
-                                                                                       secondDir),
-                                                                        kSpecularNeePdfFloor);
-                                                float invEnvPdf = std::min(1.0f / envPdf, kSpecularNeeInvPdfClamp);
-                                                float denom = envPdf + bsdfPdf;
-                                                float misWeight = denom > 0.0f ? (envPdf / denom) : 0.0f;
-                                                misWeight = std::clamp(misWeight,
-                                                                       kMisWeightClampMin,
-                                                                       kMisWeightClampMax);
-                                                simd::float3 envColor = SampleEnvironment(*envPtr,
-                                                                                          secondDir,
-                                                                                          settings.environmentRotation,
-                                                                                          settings.environmentIntensity);
-                                                simd::float3 contribution = combinedWeight * envColor *
-                                                                            (misWeight * invEnvPdf);
-                                                addContribution(contribution);
-                                            }
-                                        }
-                                        if (rectLightCount > 0) {
-                                            HitInfo lightHit;
-                                            ++tileShadowRayCount;
-                                            if (IntersectSceneSkippingAlpha(sceneData,
-                                                                            secondRay,
-                                                                            std::numeric_limits<float>::infinity(),
-                                                                            materials,
-                                                                            materialCount,
-                                                                            settings.debugNormalStrengthScale,
-                                                                            lightHit)) {
-                                                RectLightHit rectHit;
-                                                if (RectLightHitInfo(rectLightIndexByRect,
-                                                                     rectLights,
-                                                                     rectangles,
-                                                                     rectangleCount,
-                                                                     envPtr,
-                                                                     settings,
-                                                                     lightHit,
-                                                                     secondRay.origin,
-                                                                     rectHit)) {
-                                                    float lightPdf = std::max(rectHit.pdf, kSpecularNeePdfFloor);
-                                                    float invLightPdf = std::min(1.0f / lightPdf, kSpecularNeeInvPdfClamp);
-                                                    float denom = lightPdf + bsdfPdf;
-                                                    float misWeight = denom > 0.0f ? (lightPdf / denom) : 0.0f;
-                                                    misWeight = std::clamp(misWeight,
-                                                                           kMisWeightClampMin,
-                                                                           kMisWeightClampMax);
-                                                    simd::float3 contribution = combinedWeight * rectHit.emission *
-                                                                                (misWeight * invLightPdf);
-                                                    addContribution(contribution);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         }
                     }
@@ -7461,17 +9073,7 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                             break;
                         }
 
-                        bool nextEnvLodActive = false;
-                        float nextEnvLod = 0.0f;
-                        if (bsdfSample.lobeType == 1u && !bsdfSample.isDelta && envPtr &&
-                            EnvironmentMaxMip(*envPtr) > 0.0f) {
-                            nextEnvLod = EnvironmentLodFromRoughness(bsdfSample.lobeRoughness, *envPtr);
-                            nextEnvLodActive = true;
-                        }
-                        envLodActive = nextEnvLodActive;
-                        envLod = nextEnvLod;
-
-                        rayCone.width = RayConeWidthAtDistance(rayCone, hit.t);
+                        rayCone.width = RayConeWidthAtDistance(rayCone, coneHitDistance);
                         rayCone.spread = std::min(rayCone.spread +
                                                       BsdfConeSpreadIncrement(bsdfSample.lobeType,
                                                                               bsdfSample.lobeRoughness,
@@ -7479,8 +9081,41 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                                                   1.5f);
 
                         lastBsdfPdf = bsdfSample.pdf > 0.0f ? bsdfSample.pdf : lastBsdfPdf;
+                        // Metal's mesh_emitter_nee_covers_direction (baseline): this vertex's mesh NEE could have
+                        // produced the scattered direction only where its direct-light cosine is positive.
+                        previousMeshNeeEligible = meshNeeBaseline && !surfaceIsDelta && !bsdfSample.isDelta &&
+                            ReferenceDirectCos(material, hit, shadingNormal, bsdfSample.direction) > 0.0f;
+                        // ReSTIR DI shades every non-light primary surface with a non-delta BSDF where its target's
+                        // cosine is positive (Metal's mesh_emitter_nee_covers_direction, direct_light_target_cos). A
+                        // subsurface walk's exit point is an ordinary surface vertex here, as Metal's
+                        // (!isBssrdf || subsurfaceExitVertex).
+                        previousRestirDiCovered = restirDirectMode && !primaryVertexScattered && !meshLights.empty() &&
+                            type != static_cast<uint32_t>(PathTracerShaderTypes::MaterialType::DiffuseLight) &&
+                            !surfaceIsDelta && !bsdfSample.isDelta &&
+                            ReferenceDirectCos(material, hit, shadingNormal, bsdfSample.direction) > 0.0f;
+                        primaryVertexScattered = true;
                         lastScatterWasDelta = bsdfSample.isDelta;
+                        lastDeltaUnpaired = bsdfSample.isDelta && !(specNeeEligible || mneeEligible);
 
+                        // Metal pushes the dielectric's absorption when the path refracts in and pops it when the
+                        // path refracts out.
+                        // Metal's interface_select_medium (visibility.metal) comes first: an explicit interior selects the
+                        // medium by the outgoing side of the outward (unfaced) normal; an inheriting interface keeps the
+                        // current medium.
+                        if (pt_shared::source_material_flag(material, PathTracerShaderTypes::kMaterialFlagExplicitInterior)) {
+                            const bool inside = simd::dot(bsdfSample.direction, hit.normal) < 0.0f;
+                            mediumSigmaStack[0] = inside ? DielectricSigmaA(material) : simd_make_float3(0.0f, 0.0f, 0.0f);
+                            mediumDepth = inside ? 1u : 0u;
+                        } else if (pt_shared::source_material_flag(material, PathTracerShaderTypes::kMaterialFlagMediumInherit)) {
+                        } else if (bsdfSample.mediumEvent == 1) {
+                            mediumSigmaStack[std::min(mediumDepth, kMaxMediumStack - 1u)] = DielectricSigmaA(material);
+                            mediumDepth = std::min(mediumDepth + 1u, kMaxMediumStack);
+                        } else if (bsdfSample.mediumEvent == -1 && mediumDepth > 0u) {
+                            --mediumDepth;
+                        }
+
+                        legacyRaySpawn = false;
+                        holeMisOriginValid = false;
                         ray.origin = OffsetRayOrigin(hit, bsdfSample.direction);
                         ray.direction = bsdfSample.direction;
 
@@ -7493,6 +9128,11 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
                         }
                     }
 
+                    for (uint32_t slot = 0u; slot < PathTracer::RadianceCacheTraining::kTrainRecordCount; ++slot) {
+                        if ((cacheTrainValidMask & (1u << slot)) != 0u) {
+                            trainRadianceCache(cacheTrainRecords[slot], radiance, s);
+                        }
+                    }
                     pixelRadiance += radiance;
                 }
 
@@ -7591,36 +9231,23 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
     out.avgMsPerSample = (targetSamples > 0)
                              ? ((out.totalSeconds * 1000.0) / targetSamples)
                              : 0.0;
-    out.performance.restirDiInitializeDispatchCount = restirDirectMode ? 1u : 0u;
-    out.performance.restirDiInitialCandidateDispatchCount = restirDiInitialCandidateDispatchCount;
-    out.performance.restirDiTemporalReuseDispatchCount = restirDiTemporalReuseDispatchCount;
-    out.performance.restirDiSpatialReuseDispatchCount = restirDiSpatialReuseDispatchCount;
-    out.performance.restirDiVisibilityDispatchCount = restirDiVisibilityDispatchCount;
-    out.performance.restirDiApplyLightingDispatchCount = restirDiApplyLightingDispatchCount;
+    // ReSTIR DI runs inside the path loop, as on Metal's fused path, which dispatches no screen-space passes.
     out.performance.integrationDispatchCount = targetSamples;
-    out.performance.totalComputeDispatchCount =
-        out.performance.restirDiInitializeDispatchCount +
-        out.performance.restirDiInitialCandidateDispatchCount +
-        out.performance.restirDiTemporalReuseDispatchCount +
-        out.performance.restirDiSpatialReuseDispatchCount +
-        out.performance.restirDiVisibilityDispatchCount +
-        out.performance.restirDiApplyLightingDispatchCount +
-        out.performance.integrationDispatchCount;
-    out.performance.restirDiReservoirBytesEach =
-        restirDirectMode
-            ? static_cast<uint64_t>(width) * static_cast<uint64_t>(height) *
-                  sizeof(CpuRestirDiReservoirState)
-            : 0u;
-    out.performance.restirDiVisibilityBytes =
-        restirDirectMode
-            ? static_cast<uint64_t>(width) * static_cast<uint64_t>(height) *
-                  sizeof(CpuRestirDiVisibilityState)
-            : 0u;
-    out.performance.restirDiResourceBytesTotal =
-        restirDirectMode
-            ? out.performance.restirDiReservoirBytesEach * 4u +
-                  out.performance.restirDiVisibilityBytes
-            : 0u;
+    out.performance.totalComputeDispatchCount = out.performance.integrationDispatchCount;
+    out.performance.sssMaxSteps = settings.sssMaxSteps;
+    for (uint32_t m = 0; m < PathTracerShaderTypes::kMaxMaterials; ++m) {
+        const size_t base = static_cast<size_t>(m) * PathTracerShaderTypes::kSssWalkStatCount;
+        if (sssWalkStats.counts[base + PathTracerShaderTypes::kSssWalkStatWalks].load() == 0u) {
+            continue;
+        }
+        HeadlessRenderOutput::PerformanceSummary::SssWalkMaterialStats entry;
+        entry.material = m < materialCount ? scene.resources->materialName(m) : std::string();
+        for (uint32_t k = 0; k < PathTracerShaderTypes::kSssWalkStatCount; ++k) {
+            entry.stats[k] = sssWalkStats.counts[base + k].load();
+            out.performance.sssWalkStats[k] += entry.stats[k];
+        }
+        out.performance.sssWalkMaterials.push_back(std::move(entry));
+    }
     out.pbrMetrics.available = true;
     out.pbrMetrics.throughputNanInfCount = throughputNanInfCount;
     out.pbrMetrics.radianceNanInfCount = radianceNanInfCount;
@@ -7668,6 +9295,9 @@ bool EmbreeHeadlessRenderer::render(const HeadlessScene& scene,
         radianceCacheFallbackCount.load(std::memory_order_relaxed);
     out.pbrMetrics.radianceCacheInvalidCount =
         radianceCacheInvalidCount.load(std::memory_order_relaxed);
+    for (uint32_t i = 0u; i < PathTracer::RadianceCacheTraining::kStatCount; ++i) {
+        out.pbrMetrics.radianceCacheStats[i] = radianceCacheStats[i].load(std::memory_order_relaxed);
+    }
     out.pbrMetrics.maxThroughputByBounce = std::move(maxThroughputByBounce);
     out.materialMrDebug = materialMrDebug;
     out.directLightAudit = directLightAudit;

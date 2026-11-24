@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <simd/simd.h>
+#ifndef __METAL_VERSION__
+#include <cstddef>
+#endif
 
 #ifdef __METAL_VERSION__
 #include <metal_atomic>
@@ -11,6 +14,11 @@ using PathtraceStatsAtomic = uint32_t;
 #endif
 
 namespace PathTracerShaderTypes {
+
+constexpr uint32_t kReconstructionAovContractVersion = 2u;
+constexpr const char* kReconstructionAovContractChannels =
+    "radiance,albedo,normal,geometric_normal,roughness,specular,depth,motion,emission,"
+    "direct,indirect,sample_count,variance,confidence,disocclusion";
 
 constexpr uint32_t kMaxSpheres = 512;
 constexpr uint32_t kMaxMaterials = 512;
@@ -26,13 +34,59 @@ constexpr uint32_t kMaterialResourceRestirPtStateIndex =
     kMaterialResourcePathGuidingStateIndex + 1u;
 constexpr uint32_t kMaterialResourceRadianceCacheStateIndex =
     kMaterialResourceRestirPtStateIndex + 1u;
+constexpr uint32_t kMaterialResourceRadianceCacheQueryItemIndex =
+    kMaterialResourceRadianceCacheStateIndex + 1u;
+constexpr uint32_t kMaterialResourceRadianceCacheTrainRecordIndex =
+    kMaterialResourceRadianceCacheQueryItemIndex + 1u;
+constexpr uint32_t kMaterialResourceCausticEyeVertexIndex =
+    kMaterialResourceRadianceCacheTrainRecordIndex + 1u;
+constexpr uint32_t kMaterialResourceCausticLightVertexIndex =
+    kMaterialResourceCausticEyeVertexIndex + 1u;
+constexpr uint32_t kMaterialResourceCausticConnectionIndex =
+    kMaterialResourceCausticLightVertexIndex + 1u;
+constexpr uint32_t kMaterialResourceCausticConnectionResultIndex =
+    kMaterialResourceCausticConnectionIndex + 1u;
 constexpr uint32_t kWavefrontShadowCapacityMultiplier = 4;
 constexpr uint32_t kRestirPathReservoirDepthCount = 8;
+constexpr uint32_t kRestirPtEnhancedFeaturePairedSpatialReuse = 1u << 0;
+constexpr uint32_t kRestirPtEnhancedFeatureFootprintReconnection = 1u << 1;
+constexpr uint32_t kRestirPtEnhancedFeatureDuplicationDecorrelation = 1u << 2;
+constexpr uint32_t kRestirPtEnhancedFeatureUnifiedDiGi = 1u << 3;
+constexpr uint32_t kRestirPtEnhancedFeatureVectorShadingWeights = 1u << 4;
+constexpr uint32_t kRestirPtEnhancedFeatureDualMotionVectors = 1u << 5;
+constexpr uint32_t kRestirPtEnhancedFeatureReplayCompaction = 1u << 6;
 constexpr uint32_t kMaterialFlagDisableOrm = 1u << 0;
 constexpr uint32_t kMaterialFlagForceBaseColorMip0 = 1u << 1;
 constexpr uint32_t kMaterialFlagBlackKeyAlphaFromRgb = 1u << 2;
 constexpr uint32_t kMaterialFlagCameraVisibleEmissionTint = 1u << 3;
+constexpr uint32_t kMaterialFlagThinFoliageShadow = 1u << 4;
+constexpr uint32_t kMaterialFlagFoliageBeautyLift = 1u << 5;
+constexpr uint32_t kMaterialFlagAlphaCutoutContinuation = 1u << 6;  // Mask holes preserve path depth; never clear later blockers.
+constexpr uint32_t kMaterialFlagDielectricTransmissionTint = 1u << 8;
+constexpr uint32_t kMaterialFlagSingleScatterSpecular = 1u << 10;
+constexpr uint32_t kMaterialFlagRegularizedDielectric = 1u << 11;
+constexpr uint32_t kMaterialFlagReferenceDielectricContinuation = 1u << 12;
+constexpr uint32_t kMaterialFlagTexturedEmissionNee = 1u << 13;
+constexpr uint32_t kMaterialFlagBlackBackFace = 1u << 14;  // Single-sided: back-face hits absorb the path.
+// Bit 15 is reserved.
+constexpr uint32_t kMaterialFlagFalcorStandardBsdf = 1u << 16;  // PBR as Falcor: Frostbite diffuse, single-scatter GGX.
+constexpr uint32_t kMaterialFlagSourceNormalGreen = 1u << 17;  // Restore source G for an imported tangent frame.
+constexpr uint32_t kMaterialFlagThinWalledTransmission = 1u << 18;  // glTF transmission without volume: no refraction.
+// Source-interface transport is opt-in; keep these high bits separate from closure flags.
+constexpr uint32_t kMaterialFlagSourceFeatures = 1u << 19;
+// Shader-local (never set by the host): exit point of a coated subsurface walk, see shaders/common.metal.
+constexpr uint32_t kMaterialFlagSubsurfaceExit = 1u << 20;
+// Set only on an integrator's local copy (shaders/shared/source_closures.h, source_mark_closure_side).
+constexpr uint32_t kMaterialFlagSourceClosureBackSide = 1u << 21;
+constexpr uint32_t kMaterialFlagInterfacePrecision = 1u << 28;
+constexpr uint32_t kMaterialFlagExplicitInterior = 1u << 29;
+constexpr uint32_t kMaterialFlagMediumInherit = 1u << 30;
+constexpr uint32_t kMaterialFlagAuthoredDielectricNormal = 1u << 31;
+
 constexpr uint32_t kLightPrimitiveFlagDirectional = 1u << 0;
+constexpr uint32_t kLightPrimitiveFlagRectangle = 1u << 1;
+constexpr uint32_t kLightPrimitiveFlagTwoSided = 1u << 2;
+constexpr uint32_t kLightPrimitiveFlagTexturedEmission = 1u << 3;
 
 enum class IntersectionMode : uint32_t {
     SoftwareBVH = 0,
@@ -111,6 +165,7 @@ struct MaterialClosureMetadata {
 enum class AreaPrimitiveShape : uint32_t {
     Rectangle = 0,
     Disk = 1,
+    ReferencePoint = 2,  // Invisible jittered punctual light used by reference scenes.
 };
 
 struct SphereData {
@@ -119,8 +174,8 @@ struct SphereData {
 };
 
 struct RectData {
-    simd::float4 corner;          // rectangle: xyz = corner; disk: xyz = center
-    simd::float4 edgeU;           // rectangle: edge vector; disk: scaled tangent/radius axis
+    simd::float4 corner;          // rectangle: corner; disk: center; reference point: xyz position, w radius
+    simd::float4 edgeU;           // rectangle: edge vector; disk: radius axis; reference point w: custom legacy minDistance^2 (0 means default 1m)
     simd::float4 edgeV;           // rectangle: edge vector; disk: scaled bitangent/radius axis
     simd::float4 normalAndPlane;  // xyz = normalized normal, w = plane constant
     simd::uint4 materialTwoSided; // x = material index, y = two-sided flag, z = AreaPrimitiveShape
@@ -140,7 +195,7 @@ struct MaterialData {
     simd::float4 sssSigmaS;           // xyz = sigma_s, w = anisotropy g
     simd::float4 sssParams;           // x = mean free path, y = method, z = coat enabled flag, w unused
     simd::float4 carpaintBaseParams;  // x = base metallic, y = base roughness, z = flake scale, w = flake reflectance scale
-    simd::float4 carpaintFlakeParams; // x = flake sample weight, y = flake roughness, z = flake anisotropy, w = flake normal strength
+    simd::float4 carpaintFlakeParams; // x = flake coverage (CarPaint under-layer), y = flake roughness, z = flake anisotropy, w = flake normal strength
     simd::float4 carpaintBaseEta;     // xyz = carpaint base eta, w = flag (>0 when valid)
     simd::float4 carpaintBaseK;       // xyz = carpaint base k, w = flag (>0 when valid)
     simd::float4 carpaintBaseTint;    // xyz = conductor tint multiplier, w unused
@@ -150,7 +205,7 @@ struct MaterialData {
     uint32_t interiorMediumId;        // 0 = vacuum; front-face transmission enters this medium
     uint32_t exteriorMediumId;        // 0 = vacuum; back-face transmission exits to this medium
     uint32_t materialPad2;
-    simd::float4 spectralParams;      // x = dispersion scale, y = spectral absorption scale, z/w reserved
+    simd::float4 spectralParams;      // x = dispersion scale, y = absorption scale, z = material spectral policy, w = texture policy
     simd::float4 pbrParams;           // x = metallic, y = roughness, z = occlusion strength, w = normal scale
     simd::float4 pbrExtras;           // x = alpha factor, y = alpha cutoff, z = transmission factor, w = alpha mode
     simd::uint4 textureUvSet0;        // x = baseColor, y = metallicRoughness, z = normal, w = occlusion
@@ -167,6 +222,11 @@ struct MaterialData {
     simd::float4 textureTransform9;   // emissive: row1
     simd::float4 textureTransform10;  // transmission: row0
     simd::float4 textureTransform11;  // transmission: row1
+    // Opt-in Tungsten closures; zero model preserves the legacy closure.
+    simd::float4 sourceParams;       // model, distribution (1 Beckmann/2 GGX), alpha, nonlinear
+    simd::float4 sourceReflectance;  // RGB multiplier, legacy conductor compensation enabled
+    simd::float4 sourceFresnel;      // internal diffuse Fresnel, avg transmittance, base-color multiplier, authored IOR
+    simd::float4 textureControl;      // x opacity, y opacity enabled, z Tungsten bump scale, w reserved
 };
 
 struct EnvironmentAliasEntry {
@@ -213,7 +273,7 @@ struct PathtraceUniforms {
     uint32_t wavefrontDebugStageFailures = 0;
 
     simd::float3 cameraOrigin = {0.0f, 0.0f, 0.0f};
-    float cameraPad0 = 0.0f;
+    float textureLodBias = 0.0f;  // Former float padding; keeps the uniform ABI.
     simd::float3 lowerLeftCorner = {0.0f, 0.0f, -1.0f};
     float cameraPad1 = 0.0f;
     simd::float3 horizontal = {1.0f, 0.0f, 0.0f};
@@ -253,11 +313,9 @@ struct PathtraceUniforms {
     float fireflyClampFactor = 0.0f;
     float fireflyClampFloor = 0.0f;
     float throughputClamp = 0.0f;
-    float specularTailClampBase = 0.0f;
-    float specularTailClampRoughnessScale = 0.0f;
     float minSpecularPdf = 0.0f;
     float fireflyClampMaxContribution = 0.0f;
-    float paddingFirefly = 0.0f;
+    float environmentBackgroundScaleOffset = 0.0f;  // Scale minus one; keeps old zeroed uniforms unchanged
     uint32_t sssMode = 0;
     uint32_t sssMaxSteps = 0;
     uint32_t directLightMode = 0;
@@ -283,7 +341,7 @@ struct PathtraceUniforms {
     uint32_t radianceCacheTrainingInterval = 1;
     float radianceCacheMaxRadiance = 16.0f;
     uint32_t radianceCacheDebug = 0;
-    uint32_t radianceCachePadding0 = 0;
+    uint32_t referencePointExactNee = 0;
     uint32_t causticTransportMode = 0;
     uint32_t causticMaxVertices = 4096;
     uint32_t volumeTransportMode = 0;
@@ -295,11 +353,15 @@ struct PathtraceUniforms {
     uint32_t volumeDebug = 0;
     uint32_t spectralRenderingMode = 0;
     uint32_t spectralTexturePolicy = 0;
+    // x = min nm, y = max nm, z = dispersion strength, w = white balance R (0 when spectral mode is off).
     simd::float4 spectralWavelengthRange = {380.0f, 720.0f, 0.012f, 0.0f};
     uint32_t spectralDebug = 0;
-    uint32_t spectralPadding0 = 0;
-    uint32_t spectralPadding1 = 0;
-    uint32_t spectralPadding2 = 0;
+    // White balance G and B: former padding words spectralPadding0/1 (0 when spectral mode is off).
+    float spectralWhiteBalanceG = 0.0f;
+    float spectralWhiteBalanceB = 0.0f;
+    // Tungsten ray epsilon in world units for source-transport rays (0 = 1 um precise spawning). Former
+    // padding word (spectralPadding2); the uniform ABI is unchanged.
+    float sourceRayEpsilon = 0.0f;
     uint32_t restirDebugEnabled = 0;
     uint32_t restirDebugView = 0;
     uint32_t restirDebugCounters = 0;
@@ -314,7 +376,7 @@ struct PathtraceUniforms {
     uint32_t enableHardwareMissFallback = 0;
     uint32_t enableHardwareFirstHitFromSoftware = 0;
     uint32_t enableHardwareForceSoftware = 0;
-    uint32_t paddingHardware1 = 0;
+    uint32_t referencePointNeeShadowExtra = 0;
     uint32_t parityAssertEnabled = 0;
     uint32_t parityAssertMode = 0;
     uint32_t parityPixelX = 0;
@@ -322,14 +384,16 @@ struct PathtraceUniforms {
     uint32_t parityOncePerFrame = 1;
     uint32_t parityPadding0 = 0;
     uint32_t explicitRestirDiLightingStage = 0;
-    uint32_t parityPadding2 = 0;
+    uint32_t sourceOpacityPresent = 0;
     uint32_t forcePureHWRTForGlass = 0;
     // When non-zero, shadow rays treat near-origin hits found only via the
     // tMin=0 retry (t < kEpsilon, different mesh) as false-positive occlusion
     // and skip them — matching SWRT behaviour.
     uint32_t enableHardwareShadowNearRetryReject = 0;
-    uint32_t parityPadding4 = 0;
-    uint32_t parityPadding5 = 0;
+    uint32_t sourceTransport = 0;
+    // Bit 0: OIDN guide accumulation allowed; bit 1: follow source mirror guides.
+    // Reuses the former padding word; shader uniform layout remains unchanged.
+    uint32_t oidnDeltaGuidesAllowed = 0;
     uint32_t debugViewMode = 0;
     uint32_t debugDisableAO = 0;
     uint32_t debugAoIndirectOnly = 1;
@@ -347,8 +411,37 @@ struct PathtraceUniforms {
     float debugVisorOverrideRoughness = 0.15f;
     float debugVisorOverrideF0 = 0.04f;
     uint32_t debugEnvNearest = 0;
-    uint32_t debugPadding0 = 0;
+    // Former padding word: zero preserves normal-variance filtering and the ABI.
+    uint32_t disableNormalVarianceRoughness = 0;
 };
+
+// Radiance cache diagnostics: one 64-bit counter as (lo, hi) 32-bit words; the shader carries into hi.
+// Layout and indices: include/renderer/RadianceCacheTraining.h (RadianceCacheStat), mirrored in shaders/common.metal.
+constexpr uint32_t kRadianceCacheStatCount = 48u;
+// PathtraceStats::sssWalkStats layout (shaders/common.metal), per material: walks started, then one count per way
+// a walk ends.
+constexpr uint32_t kSssWalkStatWalks = 0u;
+constexpr uint32_t kSssWalkStatExits = 1u;
+constexpr uint32_t kSssWalkStatAbsorbed = 2u;
+constexpr uint32_t kSssWalkStatOpenMesh = 3u;
+constexpr uint32_t kSssWalkStatStepLimit = 4u;
+constexpr uint32_t kSssWalkStatCount = 5u;
+struct RadianceCacheStatCounter {
+    PathtraceStatsAtomic lo;
+    PathtraceStatsAtomic hi;
+};
+
+#ifndef __METAL_VERSION__
+// PathtraceUniforms is mirrored field for field in shaders/common.metal, which also asserts these values.
+// The spectral words are pinned because spectral transport packs its state into existing slots.
+static_assert(sizeof(PathtraceUniforms) == 768,
+              "PathtraceUniforms must stay layout-compatible with shaders/common.metal");
+static_assert(offsetof(PathtraceUniforms, spectralRenderingMode) == 536, "spectral uniform layout");
+static_assert(offsetof(PathtraceUniforms, spectralWavelengthRange) == 544, "spectral uniform layout");
+static_assert(offsetof(PathtraceUniforms, spectralWhiteBalanceG) == 564, "spectral uniform layout");
+static_assert(offsetof(PathtraceUniforms, spectralWhiteBalanceB) == 568, "spectral uniform layout");
+static_assert(offsetof(PathtraceUniforms, sourceRayEpsilon) == 572, "spectral uniform layout");
+#endif
 
 struct PathtraceStats {
     PathtraceStatsAtomic primaryRayCount;
@@ -411,6 +504,9 @@ struct PathtraceStats {
     PathtraceStatsAtomic throughputNanInfCount;
     PathtraceStatsAtomic radianceNanInfCount;
     PathtraceStatsAtomic clampEventCount;
+    PathtraceStatsAtomic restirDiRegirCandidateCount;
+    PathtraceStatsAtomic restirDiRegirAcceptedCount;
+    PathtraceStatsAtomic restirDiRegirFallbackCount;
     PathtraceStatsAtomic restirGiCandidateCount;
     PathtraceStatsAtomic restirGiReservoirUpdateCount;
     PathtraceStatsAtomic restirGiAcceptCount;
@@ -429,6 +525,27 @@ struct PathtraceStats {
     PathtraceStatsAtomic restirPtReuseAppliedCount;
     PathtraceStatsAtomic restirPtReuseRejectedInvalidCount;
     PathtraceStatsAtomic restirPtReuseFallbackCount;
+    PathtraceStatsAtomic restirPtEnhancedCandidateCount;
+    PathtraceStatsAtomic restirPtEnhancedInitialSelectedCount;
+    PathtraceStatsAtomic restirPtEnhancedTemporalAcceptedCount;
+    PathtraceStatsAtomic restirPtEnhancedTemporalRejectedCount;
+    PathtraceStatsAtomic restirPtEnhancedSpatialAcceptedCount;
+    PathtraceStatsAtomic restirPtEnhancedSpatialRejectedCount;
+    PathtraceStatsAtomic restirPtEnhancedInvalidShiftGeometryCount;
+    PathtraceStatsAtomic restirPtEnhancedInvalidShiftMaterialCount;
+    PathtraceStatsAtomic restirPtEnhancedInvalidShiftPdfCount;
+    PathtraceStatsAtomic restirPtEnhancedInvalidShiftVisibilityCount;
+    PathtraceStatsAtomic restirPtEnhancedInvalidShiftInvertibilityCount;
+    PathtraceStatsAtomic restirPtEnhancedInvalidShiftUnsupportedCount;
+    PathtraceStatsAtomic restirPtEnhancedDuplicateScoreSum;
+    PathtraceStatsAtomic restirPtEnhancedBiasedCCapApplicationCount;
+    PathtraceStatsAtomic restirPtEnhancedVectorWeightUseCount;
+    PathtraceStatsAtomic restirPtEnhancedReplayCompactionInputCount;
+    PathtraceStatsAtomic restirPtEnhancedReplayCompactionOutputCount;
+    PathtraceStatsAtomic restirPtEnhancedFallbackCount;
+    PathtraceStatsAtomic restirPtEnhancedCanonicalSampleCount;
+    PathtraceStatsAtomic restirPtEnhancedPathLengthHistogram[kRestirPathReservoirDepthCount];
+    PathtraceStatsAtomic restirPtEnhancedReconnectionDepthHistogram[kRestirPathReservoirDepthCount];
     PathtraceStatsAtomic radianceCacheQueryCount;
     PathtraceStatsAtomic radianceCacheHitCount;
     PathtraceStatsAtomic radianceCacheMissCount;
@@ -475,6 +592,18 @@ struct PathtraceStats {
     PathtraceStatsAtomic wavefrontShadowProcessedCount;
     PathtraceStatsAtomic wavefrontNextRayEnqueueCount;
     PathtraceStatsAtomic wavefrontShadowRayEnqueueCount;
+    // Spectral transport: collapses to the hero wavelength, and wavelength samples taken (C per path).
+    PathtraceStatsAtomic spectralCollapseCount;
+    PathtraceStatsAtomic spectralWavelengthChannelSampleCount;
+    // Dispatches of the default-features hardware megakernel that saw a research or debug gate
+    // on (host and shader gate lists drifted apart). Must stay 0; logged as an error.
+    PathtraceStatsAtomic defaultFeatureGateViolationCount;
+    // Not cleared each frame: RenderLoop clears the per-frame counters above this field only, and clears these
+    // on a history reset, so they accumulate over a whole render.
+    RadianceCacheStatCounter radianceCacheStats[kRadianceCacheStatCount];
+    // Whole-render as well: random-walk subsurface walks and their outcomes, per material
+    // (index material * kSssWalkStatCount + stat).
+    RadianceCacheStatCounter sssWalkStats[kMaxMaterials * kSssWalkStatCount];
 };
 
 constexpr uint32_t kWavefrontMediumStackSize = 8u;
@@ -486,6 +615,7 @@ struct WavefrontRay {
     simd::float4 rayDiffDOdy = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 rayDiffDDdx = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 rayDiffDDdy = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::uint4 mediumState = {0u, 0u, 0u, 0u}; // medium id, stack depth, volume scatter depth, phase
     simd::float2 cone = {0.0f, 0.0f};  // x = width, y = spread
     uint32_t excludeMeshIndex = 0;
     uint32_t excludePrimitiveIndex = 0;
@@ -501,26 +631,40 @@ struct WavefrontRay {
 struct PathState {
     simd::float4 throughput = {1.0f, 1.0f, 1.0f, 0.0f};
     simd::float4 radiance = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::float4 directRadiance = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::float4 indirectRadiance = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 firstHitAlbedo = {0.0f, 0.0f, 0.0f, 0.0f};  // w = valid
     simd::float4 firstHitNormal = {0.0f, 0.0f, 0.0f, 0.0f};  // xyz in [-1, 1]
     simd::float4 firstHitPosition = {0.0f, 0.0f, 0.0f, 0.0f}; // xyz = world position, w = valid
     simd::float4 firstHitMaterial = {0.0f, 0.0f, 0.0f, 0.0f}; // roughness, transmission, specular luma, material type
-    float envLod = 0.0f;
+    float reconstructionConfidence = 0.0f;
+    float reconstructionVariance = 0.0f;
+    float reconstructionBiasRisk = 0.0f;
+    float pathMaxRoughness = 0.0f; // Reuses padding; tagged material profiles consume it.
     float lastBsdfPdf = 1.0f;
     uint32_t rngState = 0;
     uint32_t mediumDepth = 0;
     uint32_t alive = 0;
-    uint32_t flags = 0;  // bit0: envLodActive, bit1: lastScatterWasDelta
+    uint32_t flags = 0;  // bit1: lastScatterWasDelta
     uint32_t reserved0 = 0;
     uint32_t reserved1 = 0;
     uint32_t currentMediumId = 0;
     uint32_t volumeScatteringDepth = 0;
     float spectralWavelengthNm = 0.0f;
     uint32_t spectralSampleIndex = 0;
-    uint32_t spectralPadding0 = 0;
+    uint32_t spectralFlags = 0;  // bit 0: collapsed to the hero wavelength; former spectralPadding0
     uint32_t spectralPadding1 = 0;
     simd::float4 mediumStack[kWavefrontMediumStackSize] = {};
+    simd::float4 sourceNullOrigin = {0.0f, 0.0f, 0.0f, 0.0f}; // xyz previous scatter origin, w null chain active
 };
+
+#ifndef __METAL_VERSION__
+// One PathState per wavefront path; the buffer is sized with sizeof(PathState) (RenderLoop.mm).
+static_assert(sizeof(PathState) == 352, "PathState must stay layout-compatible with shaders/common.metal");
+static_assert(offsetof(PathState, spectralWavelengthNm) == 180, "spectral PathState layout");
+static_assert(offsetof(PathState, spectralFlags) == 188, "spectral PathState layout");
+static_assert(offsetof(PathState, spectralPadding1) == 192, "spectral PathState layout");
+#endif
 
 struct PathGuidingReservoirState {
     simd::float4 directionConfidence = {0.0f, 1.0f, 0.0f, 0.0f}; // xyz = bin mean direction, w = confidence
@@ -536,11 +680,27 @@ struct RestirPtReservoirState {
     simd::float4 normalDepth = {0.0f, 1.0f, 0.0f, 0.0f};          // xyz = normal, w = path depth
     simd::float4 directionWeight = {0.0f, 1.0f, 0.0f, 0.0f};      // xyz = sampled direction, w = sample luma
     simd::float4 throughputLuma = {0.0f, 0.0f, 0.0f, 0.0f};       // xyz = throughput, w = throughput luma
+    simd::float4 reconnectionVertexSourcePdf = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::float4 targetJacobianMis = {0.0f, 1.0f, 1.0f, 0.0f};
+    simd::float4 vectorContributionScalar = {0.0f, 0.0f, 0.0f, 0.0f};
     uint32_t materialType = 0;
     uint32_t lobeType = 0;
     uint32_t frameTag = 0;
     uint32_t flags = 0;                                           // bit0 = valid
+    uint32_t replaySeed = 0;
+    uint32_t pathLength = 0;
+    uint32_t techniqueIndex = 0;
+    uint32_t validityFlags = 0;
+    uint32_t materialLobeMetadata = 0;
+    uint32_t duplicateScoreQ = 0;
+    uint32_t cCapQ = 0;
+    uint32_t enhancedModeFlags = 0;
 };
+
+#ifndef __METAL_VERSION__
+static_assert(sizeof(RestirPtReservoirState) == 160,
+              "RestirPtReservoirState must stay layout-compatible with shaders/common.metal");
+#endif
 
 struct RadianceQuery {
     simd::float4 positionRoughness = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -572,11 +732,32 @@ struct RadianceCacheState {
     uint32_t invalidationState = 0;
 };
 
+struct RadianceCacheWorkItem {
+    RadianceQuery query;
+    simd::float4 radianceConfidence = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::float4 varianceBiasRisk = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::uint4 pathPixelDepthFlags = {0u, 0u, 0u, 0u};
+};
+
+// Deferred radiance cache training (shaders/cache/radiance_cache.metal; include/renderer/RadianceCacheTraining.h
+// holds the same constants for Embree). Only the wavefront keeps records in device memory.
+constexpr uint32_t kRadianceCacheTrainRecordCount = 6u;
+constexpr uint32_t kRadianceCacheTrainingPathStride = 8u;
+struct RadianceCacheTrainRecord {
+    simd::float4 positionKey = {0.0f, 0.0f, 0.0f, 0.0f};       // xyz vertex position, w: cell key bits
+    simd::float4 throughputNormal = {0.0f, 0.0f, 0.0f, 0.0f};  // xyz throughput at the query, w: packed normal
+    simd::float4 baselineMeta = {0.0f, 0.0f, 0.0f, 0.0f};      // xyz accumulated radiance, w: metadata, bit 31 valid
+};
+static_assert(sizeof(RadianceCacheTrainRecord) == 48, "RadianceCacheTrainRecord must match shaders/common.metal");
+
 struct PathVertex {
     simd::float4 positionPdfFwd = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 normalPdfRev = {0.0f, 1.0f, 0.0f, 0.0f};
     simd::float4 throughputEta = {1.0f, 1.0f, 1.0f, 1.0f};
+    simd::float4 directionDepth = {0.0f, 0.0f, 1.0f, 0.0f};
+    simd::float4 geometricNormalMedium = {0.0f, 1.0f, 0.0f, 0.0f};
     simd::uint4 metadata = {0u, 0u, 0u, 0u}; // closure flags, depth, connectable, material type
+    simd::uint4 transport = {0u, 0u, 0u, 0u}; // lobe type, path class, medium state, reserved
 };
 
 struct EyeSubpathVertex {
@@ -603,6 +784,7 @@ struct RestirDIReservoirState {
     simd::float4 normalTargetPdf = {0.0f, 1.0f, 0.0f, 0.0f};      // xyz = selected normal, w = target pdf
     simd::float4 emissionWeight = {0.0f, 0.0f, 0.0f, 0.0f};       // xyz = emission, w = reservoir W
     simd::uint4 sampleMeta = {0u, 0u, 0u, 0u};                    // primitive/light id, kind, flags, frame tag
+    simd::uint4 surfaceMeta = {0u, 0u, 0u, 0u};                   // surface primitive, material, packed normal, depth bits
     uint32_t candidateCount = 0;
     uint32_t temporalAccepted = 0;
     uint32_t spatialAccepted = 0;
@@ -628,7 +810,20 @@ struct WavefrontHitRecord {
     simd::uint4 ids = {0u, 0u, 0u, 0u};  // material, primitive index, mesh index, path index
     simd::float2 barycentric = {0.0f, 0.0f};
     uint32_t hit = 0;
-    uint32_t padding = 0;
+    uint32_t padding = 0;  // two-sided hit flag
+};
+
+struct WavefrontResolvedSurface {
+    WavefrontHitRecord hit;
+    simd::float4 materialBaseColorRoughness = {0.0f, 0.0f, 0.0f, 1.0f};
+    simd::float4 materialTypeEta = {0.0f, 1.5f, 0.0f, 0.0f};
+    simd::float4 materialEmission = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::float4 materialPbrParams = {0.0f, 1.0f, 1.0f, 1.0f};
+    simd::float4 materialPbrExtras = {1.0f, 0.5f, 0.0f, 0.0f};
+    simd::float4 firstHitNormalDiffuse = {0.0f, 1.0f, 0.0f, 1.0f};
+    simd::uint4 meta = {0u, 0u, 0u, 0u}; // valid, alpha discarded, material index, resolved rng state
+    simd::uint4 recExtra = {0u, 0u, 0u, 0u}; // two-sided, reserved
+    simd::float4 sourceForwardWeight = {1,1,1,0};
 };
 
 struct ShadowRay {
@@ -636,12 +831,16 @@ struct ShadowRay {
     simd::float4 direction = {0.0f, 1.0f, 0.0f, 0.0f};
     simd::float4 contribution = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 throughput = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::float4 environmentRadiance = {0.0f, 0.0f, 0.0f, 0.0f};
+    simd::uint4 mediumState = {0u, 0u, 0u, 0u}; // medium id, stack depth, volume scatter depth, phase
+    simd::float4 sourceSigma = {0,0,0,0};
+    simd::float4 sourceOrigin = {0,0,0,0};
     uint32_t pathIndex = 0;
     uint32_t lightId = 0;
     uint32_t flags = 0;
     uint32_t excludeMeshIndex = 0;
     uint32_t excludePrimitiveIndex = 0;
-    uint32_t padding = 0;
+    uint32_t depth = 0;
 };
 
 enum class WavefrontQueueType : uint32_t {
@@ -681,7 +880,7 @@ struct QueueCounters {
     PathtraceStatsAtomic terminatedCount;
     PathtraceStatsAtomic overflowFlag;
     PathtraceStatsAtomic iterationIndex;
-    uint32_t reserved0 = 0;
+    PathtraceStatsAtomic reserved0;
     uint32_t reserved1 = 0;
     WavefrontQueueHeader primaryRayQueue;
     WavefrontQueueHeader diffuseRayQueue;
@@ -810,7 +1009,7 @@ struct alignas(16) LightPrimitive {
     float cumulativePower = 0.0f;
     uint32_t reserved1 = 0u;
     simd::float3 edge1 = {0.0f, 0.0f, 0.0f};
-    float reserved2 = 0.0f;
+    float directionalCosDelta = 0.0f; // Directional cone: 1 - cos(angular radius); zero is delta.
     simd::float3 edge2 = {0.0f, 0.0f, 0.0f};
     float reserved3 = 0.0f;
 };
@@ -829,14 +1028,15 @@ struct SoftwareInstanceInfo {
 };
 
 struct DisplayUniforms {
-    uint32_t tonemapMode = 1;   // 1 = Linear, 2 = ACES, 3 = Reinhard, 4 = Hable
-    uint32_t acesVariant = 0;   // 0 = Fitted, 1 = Simple
+    uint32_t tonemapMode = 1;   // 1 = Linear, 2 = ACES, 3 = Reinhard, 4 = Hable, 5 = Exponential, 6 = Filmic (Tungsten)
+    uint32_t acesVariant = 0;   // 0 = Fitted, 1 = Simple, 2 = Falcor (0.6 pre-exposure, sRGB)
     float exposure = 0.0f;      // Exposure adjustment in stops
     float reinhardWhite = 1.5f; // White point for Reinhard operator
     uint32_t bloomEnabled = 0;  // 0 = off, 1 = on
     float bloomThreshold = 1.0f;
     float bloomIntensity = 0.12f;
     float bloomRadius = 1.5f;
+    uint32_t srgbEncode = 1;    // 1 = piecewise sRGB, 0 = gamma 2.2 (matches ImageWriter)
 };
 
 struct SvgfDenoiseUniforms {
@@ -848,6 +1048,10 @@ struct SvgfDenoiseUniforms {
     float albedoSigma = 16.0f;
     float luminanceSigma = 4.0f;
     uint32_t historyValid = 0;
+    uint32_t denoiseDirect = 1;
+    uint32_t denoiseIndirect = 1;
+    uint32_t reserved0 = 0;
+    uint32_t reserved1 = 0;
     simd::float4 currentCameraOrigin = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 previousCameraOrigin = {0.0f, 0.0f, 0.0f, 0.0f};
     simd::float4 previousLowerLeftCorner = {0.0f, 0.0f, -1.0f, 0.0f};

@@ -11,6 +11,7 @@ inline bool build_ris_reservoir_for_hit(constant PathtraceUniforms& uniforms,
                                         thread uint& state,
                                         thread Reservoir& reservoir) {
     reservoir = make_empty_reservoir();
+    constexpr float kRestirMinimumReservoirWeight = 1.0e-8f;
     uint risTargetM = max(candidateCount, 1u);
     for (uint i = 0u; i < risTargetM; ++i) {
         RISSamplePayload candidate;
@@ -26,19 +27,20 @@ inline bool build_ris_reservoir_for_hit(constant PathtraceUniforms& uniforms,
             continue;
         }
         float3 omegaL = ris_payload_omega_l(rec, candidate);
-        float cosThetaSurface = saturate(dot(shadingNormal, omegaL));
+        float cosThetaSurface = direct_light_target_cos(uniforms, material, rec, shadingNormal, omegaL);
         float cosThetaLight = ris_payload_is_directional(candidate)
             ? 1.0f
-            : saturate(dot(candidate.normal, -omegaL));
-        BsdfEvalResult bsdfEval = evaluate_bsdf(material,
-                                                rec.point,
-                                                shadingNormal,
-                                                wo,
-                                                omegaL,
-                                                clampParams,
-                                                uniforms.sssMode,
-                                                diffuseOcclusion,
-                                                specularOnly);
+            : saturate(emissive_light_cosine(candidate.flags, candidate.normal, -omegaL));
+        BsdfEvalResult bsdfEval = direct_light_target_bsdf(uniforms,
+                                                           material,
+                                                           rec,
+                                                           shadingNormal,
+                                                           wo,
+                                                           omegaL,
+                                                           clampParams,
+                                                           diffuseOcclusion,
+                                                           specularOnly,
+                                                           ris_payload_is_directional(candidate));
         if (bsdfEval.isDelta || bsdfEval.isBssrdf) {
             continue;
         }
@@ -51,16 +53,119 @@ inline bool build_ris_reservoir_for_hit(constant PathtraceUniforms& uniforms,
             continue;
         }
         float weight = phat / candidate.pdf;
+        if (!(weight > kRestirMinimumReservoirWeight) || !isfinite(weight)) {
+            continue;
+        }
         float u = (reservoir.M == 0u) ? 0.0f : rand_uniform(state);
         update_reservoir(reservoir, candidate, weight, u);
     }
+    // RIS normalizes by every candidate drawn; update_reservoir counts only the
+    // accepted ones, which inflated W whenever a draw had zero target weight.
+    if (reservoir.valid) {
+        reservoir.M = risTargetM;
+    }
     return reservoir.valid && reservoir.M > 0u && reservoir.wSum > 0.0f;
 }
+
+#if PT_DEBUG_TOOLS
+inline void record_ris_reservoir_candidate_audit(
+    thread const PathtraceDebugContext* debugCtx,
+    constant PathtraceUniforms& uniforms,
+    device const LightPrimitive* emissivePrimitives,
+    thread const HitRecord& rec,
+    const MaterialData material,
+    const float3 shadingNormal,
+    const float3 wo,
+    const FireflyClampParams clampParams,
+    const float diffuseOcclusion,
+    const bool specularOnly,
+    uint candidateCount,
+    uint initialState,
+    const uint depth,
+    const uint mediumDepth,
+    const uint materialIndex) {
+    if (!debugCtx || PT_DEFAULT_OFF(uniforms.debugDirectLightAudit) == 0u) {
+        return;
+    }
+
+    uint replayState = initialState;
+    Reservoir replayReservoir = make_empty_reservoir();
+    constexpr float kRestirMinimumReservoirWeight = 1.0e-8f;
+    uint risTargetM = max(candidateCount, 1u);
+    for (uint i = 0u; i < risTargetM; ++i) {
+        uint candidateStateBefore = replayState;
+        RISSamplePayload candidate;
+        bool valid = false;
+        float phat = 0.0f;
+        float weight = 0.0f;
+        if (sample_direct_light_baseline(uniforms,
+                                         emissivePrimitives,
+                                         rec,
+                                         replayState,
+                                         candidate)) {
+            float distSq = ris_payload_distance_sq(rec, candidate);
+            if (distSq > 0.0f && isfinite(distSq)) {
+                float3 omegaL = ris_payload_omega_l(rec, candidate);
+                float cosThetaSurface = direct_light_target_cos(uniforms, material, rec, shadingNormal, omegaL);
+                float cosThetaLight = ris_payload_is_directional(candidate)
+                    ? 1.0f
+                    : saturate(emissive_light_cosine(candidate.flags, candidate.normal, -omegaL));
+                BsdfEvalResult bsdfEval = direct_light_target_bsdf(uniforms,
+                                                                   material,
+                                                                   rec,
+                                                                   shadingNormal,
+                                                                   wo,
+                                                                   omegaL,
+                                                                   clampParams,
+                                                                   diffuseOcclusion,
+                                                                   specularOnly,
+                                                                   ris_payload_is_directional(candidate));
+                if (!bsdfEval.isDelta && !bsdfEval.isBssrdf) {
+                    phat = p_hat(candidate.emission,
+                                 bsdfEval.value,
+                                 cosThetaSurface,
+                                 cosThetaLight,
+                                 distSq);
+                    if (phat > 0.0f && candidate.pdf > 0.0f) {
+                        weight = phat / candidate.pdf;
+                        if (weight > kRestirMinimumReservoirWeight && isfinite(weight)) {
+                            float u = (replayReservoir.M == 0u) ? 0.0f : rand_uniform(replayState);
+                            update_reservoir(replayReservoir, candidate, weight, u);
+                            valid = true;
+                        }
+                    }
+                }
+            }
+        }
+        record_debug_event(*debugCtx,
+                           kDebugEventRisAuditCandidate,
+                           depth,
+                           mediumDepth,
+                           mediumDepth,
+                           /*mediumEvent=*/0,
+                           rec.frontFace,
+                           materialIndex,
+                           false,
+                           float3(phat, weight, candidate.pdf),
+                           float4(float(i),
+                                  float(candidate.primitiveIndex),
+                                  valid ? 1.0f : 0.0f,
+                                  as_type<float>(candidateStateBefore)),
+                           float3(as_type<float>(replayState),
+                                  float(replayReservoir.M),
+                                  replayReservoir.wSum));
+    }
+}
+#endif
 
 constant uint kRestirDILightProviderEmissive = 1u << 0u;
 constant uint kRestirDILightProviderAnalytic = 1u << 1u;
 constant uint kRestirDILightProviderEnvironment = 1u << 2u;
 constant uint kRestirDILightProviderRegir = 1u << 3u;
+constant uint kRestirDIReservoirFlagValid = 1u;
+constant uint kRestirDIReservoirFlagTemporal = 2u;
+constant uint kRestirDIReservoirFlagSpatial = 4u;
+constant uint kRestirDIReservoirFlagRegirHybrid = 8u;
 
 struct RestirDILightCandidateProviderSet {
     uint providerMask;
@@ -75,25 +180,12 @@ inline RestirDILightCandidateProviderSet restir_di_make_provider_set(
     RestirDILightCandidateProviderSet providers;
     providers.providerMask = 0u;
     providers.providerCount = 0u;
-    providers.rectLightCount =
-        (rectangles && materials && uniforms.rectangleCount > 0u && uniforms.materialCount > 0u)
-            ? count_rect_lights(uniforms, rectangles, materials)
-            : 0u;
+    // Analytic lights and the environment keep their own NEE, whose MIS weights pair
+    // with BSDF hits/misses; this unweighted reservoir counted them a second time.
+    providers.rectLightCount = 0u;
     if (uniforms.emissivePrimitiveCount > 0u) {
         providers.providerMask |= kRestirDILightProviderEmissive;
         providers.providerCount += 1u;
-    }
-    if (providers.rectLightCount > 0u) {
-        providers.providerMask |= kRestirDILightProviderAnalytic;
-        providers.providerCount += 1u;
-    }
-    if (uniforms.environmentAliasCount > 0u &&
-        uniforms.environmentMapWidth > 0u &&
-        uniforms.environmentMapHeight > 0u) {
-        providers.providerMask |= kRestirDILightProviderEnvironment;
-    }
-    if (uniforms.directLightMode == kDirectLightModeRestirDiRegirHybrid) {
-        providers.providerMask |= kRestirDILightProviderRegir;
     }
     return providers;
 }
@@ -133,7 +225,7 @@ inline bool restir_di_provider_sample_analytic_rect(
         return false;
     }
     outSample.primitiveIndex = rectSample.rectIndex;
-    outSample.flags = 0u;
+    outSample.flags = kLightPrimitiveFlagRectangle;
     outSample.bary = float2(0.0f);
     outSample.position = rec.point + rectSample.direction * rectSample.distance;
     outSample.normal = (rectSample.rectIndex < uniforms.rectangleCount)
@@ -144,7 +236,15 @@ inline bool restir_di_provider_sample_analytic_rect(
     return outSample.pdf > 0.0f && isfinite(outSample.pdf);
 }
 
-inline bool restir_di_provider_sample_environment(thread RISSamplePayload& outSample) {
+inline bool restir_di_provider_sample_environment(
+    constant PathtraceUniforms& uniforms,
+    texture2d<float, access::sample> environmentTexture,
+    device const EnvironmentAliasEntry* environmentConditionalAlias,
+    device const EnvironmentAliasEntry* environmentMarginalAlias,
+    device const float* environmentPdf,
+    thread uint& state,
+    float providerPdf,
+    thread RISSamplePayload& outSample) {
     outSample.primitiveIndex = kInvalidIndex;
     outSample.flags = kLightPrimitiveFlagDirectional;
     outSample.bary = float2(0.0f);
@@ -152,18 +252,32 @@ inline bool restir_di_provider_sample_environment(thread RISSamplePayload& outSa
     outSample.normal = float3(0.0f, -1.0f, 0.0f);
     outSample.emission = float3(0.0f);
     outSample.pdf = 0.0f;
-    return false;
-}
 
-inline bool restir_di_provider_sample_regir(thread RISSamplePayload& outSample) {
-    outSample.primitiveIndex = kInvalidIndex;
-    outSample.flags = 0u;
-    outSample.bary = float2(0.0f);
-    outSample.position = float3(0.0f);
-    outSample.normal = float3(0.0f, 1.0f, 0.0f);
-    outSample.emission = float3(0.0f);
-    outSample.pdf = 0.0f;
-    return false;
+    EnvironmentSample envSample;
+    if (uniforms.environmentIntensity <= 0.0f ||
+        !sample_environment(uniforms,
+                            environmentTexture,
+                            environmentConditionalAlias,
+                            environmentMarginalAlias,
+                            environmentPdf,
+                            state,
+                            envSample)) {
+        return false;
+    }
+    if (!all(isfinite(envSample.direction)) ||
+        dot(envSample.direction, envSample.direction) <= 0.0f ||
+        !all(isfinite(envSample.radiance)) ||
+        dot(envSample.radiance, kLuminanceWeights) <= 0.0f ||
+        !(envSample.pdf > 0.0f) ||
+        !isfinite(envSample.pdf)) {
+        return false;
+    }
+
+    outSample.position = envSample.direction;
+    outSample.normal = -envSample.direction;
+    outSample.emission = max(envSample.radiance, float3(0.0f));
+    outSample.pdf = envSample.pdf * providerPdf;
+    return outSample.pdf > 0.0f && isfinite(outSample.pdf);
 }
 
 inline bool restir_di_sample_light_candidate(
@@ -172,6 +286,9 @@ inline bool restir_di_sample_light_candidate(
     device const RectData* rectangles,
     device const MaterialData* materials,
     texture2d<float, access::sample> environmentTexture,
+    device const EnvironmentAliasEntry* environmentConditionalAlias,
+    device const EnvironmentAliasEntry* environmentMarginalAlias,
+    device const float* environmentPdf,
     thread const HitRecord& rec,
     thread uint& state,
     const RestirDILightCandidateProviderSet providers,
@@ -210,22 +327,38 @@ inline bool restir_di_sample_light_candidate(
     }
     if ((providers.providerMask & kRestirDILightProviderEnvironment) != 0u &&
         selected == ordinal) {
-        return restir_di_provider_sample_environment(outSample);
+        return restir_di_provider_sample_environment(uniforms,
+                                                     environmentTexture,
+                                                     environmentConditionalAlias,
+                                                     environmentMarginalAlias,
+                                                     environmentPdf,
+                                                     state,
+                                                     providerPdf,
+                                                     outSample);
     }
-    return restir_di_provider_sample_regir(outSample);
+    return false;
 }
 
+// The target is the one the shading side evaluates for the winner (phatW): the vertex's diffuse occlusion and
+// specular-only flag, as in build_ris_reservoir_for_hit. Built with occlusion 1 and specular-only off, it differed
+// from the phatW that W divides by, which scaled each estimate by the ratio of the two targets: the hybrid ignored
+// occlusion and the specular-only view.
 inline bool build_restir_di_provider_reservoir_for_hit(
     constant PathtraceUniforms& uniforms,
     device const LightPrimitive* emissivePrimitives,
     device const RectData* rectangles,
     device const MaterialData* materials,
     texture2d<float, access::sample> environmentTexture,
+    device const EnvironmentAliasEntry* environmentConditionalAlias,
+    device const EnvironmentAliasEntry* environmentMarginalAlias,
+    device const float* environmentPdf,
     thread const HitRecord& rec,
     const MaterialData material,
     const float3 shadingNormal,
     const float3 wo,
     const FireflyClampParams clampParams,
+    const float diffuseOcclusion,
+    const bool specularOnly,
     const uint candidateCount,
     thread uint& state,
     thread Reservoir& reservoir) {
@@ -236,6 +369,7 @@ inline bool build_restir_di_provider_reservoir_for_hit(
         return false;
     }
 
+    constexpr float kRestirMinimumReservoirWeight = 1.0e-8f;
     const uint risTargetM = max(candidateCount, 1u);
     for (uint i = 0u; i < risTargetM; ++i) {
         RISSamplePayload candidate;
@@ -244,6 +378,9 @@ inline bool build_restir_di_provider_reservoir_for_hit(
                                               rectangles,
                                               materials,
                                               environmentTexture,
+                                              environmentConditionalAlias,
+                                              environmentMarginalAlias,
+                                              environmentPdf,
                                               rec,
                                               state,
                                               providers,
@@ -255,19 +392,20 @@ inline bool build_restir_di_provider_reservoir_for_hit(
             continue;
         }
         float3 omegaL = ris_payload_omega_l(rec, candidate);
-        float cosThetaSurface = saturate(dot(shadingNormal, omegaL));
+        float cosThetaSurface = direct_light_target_cos(uniforms, material, rec, shadingNormal, omegaL);
         float cosThetaLight = ris_payload_is_directional(candidate)
             ? 1.0f
-            : saturate(dot(candidate.normal, -omegaL));
-        BsdfEvalResult bsdfEval = evaluate_bsdf(material,
-                                                rec.point,
-                                                shadingNormal,
-                                                wo,
-                                                omegaL,
-                                                clampParams,
-                                                uniforms.sssMode,
-                                                1.0f,
-                                                false);
+            : saturate(emissive_light_cosine(candidate.flags, candidate.normal, -omegaL));
+        BsdfEvalResult bsdfEval = direct_light_target_bsdf(uniforms,
+                                                           material,
+                                                           rec,
+                                                           shadingNormal,
+                                                           wo,
+                                                           omegaL,
+                                                           clampParams,
+                                                           diffuseOcclusion,
+                                                           specularOnly,
+                                                           ris_payload_is_directional(candidate));
         if (bsdfEval.isDelta || bsdfEval.isBssrdf) {
             continue;
         }
@@ -280,10 +418,36 @@ inline bool build_restir_di_provider_reservoir_for_hit(
             continue;
         }
         float weight = phat / candidate.pdf;
+        if (!(weight > kRestirMinimumReservoirWeight) || !isfinite(weight)) {
+            continue;
+        }
         float u = (reservoir.M == 0u) ? 0.0f : rand_uniform(state);
         update_reservoir(reservoir, candidate, weight, u);
     }
+    // RIS normalizes by every candidate drawn; update_reservoir counts only the
+    // accepted ones, which inflated W whenever a draw had zero target weight.
+    if (reservoir.valid) {
+        reservoir.M = risTargetM;
+    }
     return reservoir.valid && reservoir.M > 0u && reservoir.wSum > 0.0f;
+}
+
+// cos(theta_light) / d^2 at the shading point, the solid angle per unit light area there; 1 for a directional light,
+// whose candidate pdf does not depend on the point. Emissive-triangle candidate pdfs are solid-angle densities at the
+// point that built the reservoir (sample_direct_light_baseline), so reusing a winner at another point needs this ratio.
+inline float ris_payload_solid_angle_per_area(thread const HitRecord& rec,
+                                              const RISSamplePayload payload) {
+    if (ris_payload_is_directional(payload)) {
+        return 1.0f;
+    }
+    float distSq = ris_payload_distance_sq(rec, payload);
+    if (!(distSq > 0.0f) || !isfinite(distSq)) {
+        return 0.0f;
+    }
+    float3 omegaL = ris_payload_omega_l(rec, payload);
+    float cosThetaLight = saturate(emissive_light_cosine(payload.flags, payload.normal, -omegaL));
+    float g = cosThetaLight / distSq;
+    return isfinite(g) ? g : 0.0f;
 }
 
 inline float reservoir_winner_phat_for_hit(constant PathtraceUniforms& uniforms,
@@ -300,19 +464,20 @@ inline float reservoir_winner_phat_for_hit(constant PathtraceUniforms& uniforms,
         return 0.0f;
     }
     float3 omegaL = ris_payload_omega_l(rec, winner);
-    float cosThetaSurface = saturate(dot(shadingNormal, omegaL));
+    float cosThetaSurface = direct_light_target_cos(uniforms, material, rec, shadingNormal, omegaL);
     float cosThetaLight = ris_payload_is_directional(winner)
         ? 1.0f
-        : saturate(dot(winner.normal, -omegaL));
-    BsdfEvalResult bsdfEval = evaluate_bsdf(material,
-                                            rec.point,
-                                            shadingNormal,
-                                            wo,
-                                            omegaL,
-                                            clampParams,
-                                            uniforms.sssMode,
-                                            diffuseOcclusion,
-                                            specularOnly);
+        : saturate(emissive_light_cosine(winner.flags, winner.normal, -omegaL));
+    BsdfEvalResult bsdfEval = direct_light_target_bsdf(uniforms,
+                                                       material,
+                                                       rec,
+                                                       shadingNormal,
+                                                       wo,
+                                                       omegaL,
+                                                       clampParams,
+                                                       diffuseOcclusion,
+                                                       specularOnly,
+                                                       ris_payload_is_directional(winner));
     if (bsdfEval.isDelta || bsdfEval.isBssrdf) {
         return 0.0f;
     }
@@ -325,6 +490,7 @@ inline RestirDIReservoirState make_empty_restir_di_reservoir(uint frameTag) {
     reservoir.normalTargetPdf = float4(0.0f, 1.0f, 0.0f, 0.0f);
     reservoir.emissionWeight = float4(0.0f);
     reservoir.sampleMeta = uint4(0u, 0u, 0u, frameTag);
+    reservoir.surfaceMeta = uint4(kInvalidIndex, kInvalidIndex, 0u, 0u);
     reservoir.candidateCount = 0u;
     reservoir.temporalAccepted = 0u;
     reservoir.spatialAccepted = 0u;
@@ -340,13 +506,23 @@ inline RestirDIVisibilityState make_empty_restir_di_visibility(uint frameTag) {
 }
 
 inline bool restir_di_reservoir_state_valid(const RestirDIReservoirState reservoir) {
-    return (reservoir.sampleMeta.z & 1u) != 0u &&
+    return (reservoir.sampleMeta.z & kRestirDIReservoirFlagValid) != 0u &&
            reservoir.candidateCount > 0u &&
            reservoir.emissionWeight.w > 0.0f &&
            reservoir.positionPdf.w > 0.0f &&
            all(isfinite(reservoir.positionPdf)) &&
            all(isfinite(reservoir.normalTargetPdf)) &&
            all(isfinite(reservoir.emissionWeight));
+}
+
+inline uint restir_di_pack_normal_10_10_10(const float3 normal) {
+    const float3 n = clamp(safe_normalize(normal) * 0.5f + 0.5f,
+                           float3(0.0f),
+                           float3(1.0f));
+    const uint x = min(static_cast<uint>(round(n.x * 1023.0f)), 1023u);
+    const uint y = min(static_cast<uint>(round(n.y * 1023.0f)), 1023u);
+    const uint z = min(static_cast<uint>(round(n.z * 1023.0f)), 1023u);
+    return x | (y << 10u) | (z << 20u);
 }
 
 inline bool restir_di_previous_history_valid(const RestirDIReservoirState currentReservoir,
@@ -361,6 +537,12 @@ inline bool restir_di_previous_history_valid(const RestirDIReservoirState curren
     }
     if (currentReservoir.sampleMeta.x != previousReservoir.sampleMeta.x ||
         currentReservoir.sampleMeta.y != previousReservoir.sampleMeta.y) {
+        return false;
+    }
+    if (currentReservoir.surfaceMeta.x != previousReservoir.surfaceMeta.x ||
+        currentReservoir.surfaceMeta.y != previousReservoir.surfaceMeta.y ||
+        currentReservoir.surfaceMeta.z != previousReservoir.surfaceMeta.z ||
+        currentReservoir.surfaceMeta.w != previousReservoir.surfaceMeta.w) {
         return false;
     }
     const float currentTarget = currentReservoir.normalTargetPdf.w;
@@ -379,7 +561,7 @@ inline RestirDIReservoirState restir_di_merge_temporal(const RestirDIReservoirSt
     RestirDIReservoirState outReservoir = currentReservoir;
     if (!restir_di_previous_history_valid(currentReservoir, previousReservoir, frameIndex)) {
         outReservoir.temporalAccepted = 0u;
-        outReservoir.sampleMeta.z &= ~2u;
+        outReservoir.sampleMeta.z &= ~kRestirDIReservoirFlagTemporal;
         return outReservoir;
     }
 
@@ -388,7 +570,7 @@ inline RestirDIReservoirState restir_di_merge_temporal(const RestirDIReservoirSt
     const float mergedWeight = currentWeight + previousWeight;
     if (!(mergedWeight > 0.0f) || !isfinite(mergedWeight)) {
         outReservoir.temporalAccepted = 0u;
-        outReservoir.sampleMeta.z &= ~2u;
+        outReservoir.sampleMeta.z &= ~kRestirDIReservoirFlagTemporal;
         return outReservoir;
     }
 
@@ -396,7 +578,7 @@ inline RestirDIReservoirState restir_di_merge_temporal(const RestirDIReservoirSt
     outReservoir.candidateCount =
         max(1u, currentReservoir.candidateCount + previousReservoir.candidateCount);
     outReservoir.temporalAccepted = 1u;
-    outReservoir.sampleMeta.z |= 2u;
+    outReservoir.sampleMeta.z |= kRestirDIReservoirFlagTemporal;
     outReservoir.sampleMeta.w = frameIndex;
     return outReservoir;
 }
@@ -411,7 +593,7 @@ inline RestirDIReservoirState restir_di_merge_spatial_neighbor(
     if (!restir_di_reservoir_state_valid(reservoir)) {
         reservoir = neighborReservoir;
         reservoir.spatialAccepted = 1u;
-        reservoir.sampleMeta.z |= 4u;
+        reservoir.sampleMeta.z |= kRestirDIReservoirFlagSpatial;
         reservoir.sampleMeta.w = frameIndex;
         return reservoir;
     }
@@ -436,7 +618,7 @@ inline RestirDIReservoirState restir_di_merge_spatial_neighbor(
     reservoir.candidateCount =
         max(1u, reservoir.candidateCount + neighborReservoir.candidateCount);
     reservoir.spatialAccepted += 1u;
-    reservoir.sampleMeta.z |= 4u;
+    reservoir.sampleMeta.z |= kRestirDIReservoirFlagSpatial;
     reservoir.sampleMeta.w = frameIndex;
     return reservoir;
 }
@@ -458,8 +640,165 @@ inline Ray restir_di_center_primary_ray_for_pixel(constant PathtraceUniforms& un
     float3 pixelPosition =
         uniforms.lowerLeftCorner + u * uniforms.horizontal + v * uniforms.vertical;
     ray.origin = uniforms.cameraOrigin;
-    ray.direction = pixelPosition - ray.origin;
+    ray.direction = normalize_camera_ray_direction(pixelPosition - ray.origin);
     return ray;
+}
+
+inline uint restir_di_augment_regir_hybrid_reservoir(
+    constant PathtraceUniforms& uniforms,
+    device const LightPrimitive* emissivePrimitives,
+    device const RectData* rectangles,
+    device const MaterialData* materials,
+    texture2d<float, access::sample> environmentTexture,
+    device const EnvironmentAliasEntry* environmentConditionalAlias,
+    device const EnvironmentAliasEntry* environmentMarginalAlias,
+    device const float* environmentPdf,
+    thread const HitRecord& rec,
+    const MaterialData material,
+    const float3 shadingNormal,
+    const float3 wo,
+    const FireflyClampParams clampParams,
+    const uint candidateCount,
+    thread uint& state,
+    device PathtraceStats* stats,
+    thread Reservoir& reservoir) {
+    if (uniforms.directLightMode != kDirectLightModeRestirDiRegirHybrid) {
+        return 0u;
+    }
+    if (rec.t <= 0.0f) {
+        if (stats) {
+            atomic_fetch_add_explicit(&stats->restirDiRegirFallbackCount,
+                                      1u,
+                                      memory_order_relaxed);
+        }
+        return 0u;
+    }
+
+    const int3 cacheCell = world_reuse_cell(rec.point, uniforms.worldReuseCellSize);
+    const uint cacheSourceFrameIndex =
+        uniforms.frameIndex > 1u ? uniforms.frameIndex - 2u : 0u;
+    Reservoir retainedReservoir0 = make_empty_reservoir();
+    Reservoir retainedReservoir1 = make_empty_reservoir();
+    float retainedMerge0 = 0.0f;
+    float retainedMerge1 = 0.0f;
+    float retainedScore0 = -1.0f;
+    float retainedScore1 = -1.0f;
+    uint retainedCount = 0u;
+    uint candidateAttempts = 0u;
+
+    for (uint cacheProbe = 0u; cacheProbe < 4u; ++cacheProbe) {
+        if (cacheProbe > cacheSourceFrameIndex) {
+            continue;
+        }
+        candidateAttempts += 1u;
+        const uint candidateSourceFrameIndex = cacheSourceFrameIndex - cacheProbe;
+        uint cacheState =
+            pcg_hash(uniforms.fixedRngSeed ^
+                     (uint(cacheCell.x) * 1664525u) ^
+                     (uint(cacheCell.y) * 1013904223u) ^
+                     (uint(cacheCell.z) * 747796405u) ^
+                     (candidateSourceFrameIndex * 9781u) ^
+                     (cacheProbe * 0x9E3779B9u) ^
+                     0xD1B54A35u);
+        Reservoir cachedReservoir = make_empty_reservoir();
+        if (!build_restir_di_provider_reservoir_for_hit(uniforms,
+                                                        emissivePrimitives,
+                                                        rectangles,
+                                                        materials,
+                                                        environmentTexture,
+                                                        environmentConditionalAlias,
+                                                        environmentMarginalAlias,
+                                                        environmentPdf,
+                                                        rec,
+                                                        material,
+                                                        shadingNormal,
+                                                        wo,
+                                                        clampParams,
+                                                        /*diffuseOcclusion=*/1.0f,
+                                                        /*specularOnly=*/false,
+                                                        candidateCount,
+                                                        cacheState,
+                                                        cachedReservoir) ||
+            !cachedReservoir.valid) {
+            continue;
+        }
+
+        float mergeWeight = cachedReservoir.wSum;
+        if (reservoir.valid) {
+            const float phatCurrentWinner = reservoir_winner_phat_for_hit(uniforms,
+                                                                          rec,
+                                                                          material,
+                                                                          shadingNormal,
+                                                                          wo,
+                                                                          clampParams,
+                                                                          1.0f,
+                                                                          false,
+                                                                          reservoir.winner);
+            const float phatCachedWinner = reservoir_winner_phat_for_hit(uniforms,
+                                                                         rec,
+                                                                         material,
+                                                                         shadingNormal,
+                                                                         wo,
+                                                                         clampParams,
+                                                                         1.0f,
+                                                                         false,
+                                                                         cachedReservoir.winner);
+            const float denom = phatCurrentWinner * float(max(reservoir.M, 1u)) +
+                                phatCachedWinner * float(max(cachedReservoir.M, 1u));
+            if (!(denom > 0.0f) || !isfinite(denom) || !(phatCachedWinner > 0.0f)) {
+                continue;
+            }
+            const float mis = phatCachedWinner / denom;
+            mergeWeight = mis * cachedReservoir.wSum;
+        }
+        if (!(mergeWeight > 0.0f) || !isfinite(mergeWeight)) {
+            continue;
+        }
+        if (mergeWeight > retainedScore0) {
+            if (retainedCount > 0u) {
+                retainedReservoir1 = retainedReservoir0;
+                retainedMerge1 = retainedMerge0;
+                retainedScore1 = retainedScore0;
+            }
+            retainedReservoir0 = cachedReservoir;
+            retainedMerge0 = mergeWeight;
+            retainedScore0 = mergeWeight;
+            retainedCount = min(retainedCount + 1u, 2u);
+        } else if (mergeWeight > retainedScore1) {
+            retainedReservoir1 = cachedReservoir;
+            retainedMerge1 = mergeWeight;
+            retainedScore1 = mergeWeight;
+            retainedCount = min(retainedCount + 1u, 2u);
+        }
+    }
+
+    if (stats && candidateAttempts > 0u) {
+        atomic_fetch_add_explicit(&stats->restirDiRegirCandidateCount,
+                                  candidateAttempts,
+                                  memory_order_relaxed);
+    }
+
+    uint accepted = 0u;
+    if (retainedCount > 0u && retainedReservoir0.valid) {
+        update_reservoir(reservoir, retainedReservoir0.winner, retainedMerge0, rand_uniform(state));
+        accepted += 1u;
+    }
+    if (retainedCount > 1u && retainedReservoir1.valid) {
+        update_reservoir(reservoir, retainedReservoir1.winner, retainedMerge1, rand_uniform(state));
+        accepted += 1u;
+    }
+    if (stats) {
+        if (accepted > 0u) {
+            atomic_fetch_add_explicit(&stats->restirDiRegirAcceptedCount,
+                                      accepted,
+                                      memory_order_relaxed);
+        } else {
+            atomic_fetch_add_explicit(&stats->restirDiRegirFallbackCount,
+                                      1u,
+                                      memory_order_relaxed);
+        }
+    }
+    return accepted;
 }
 
 inline RestirDIReservoirState restir_di_state_from_reservoir(
@@ -489,8 +828,12 @@ inline RestirDIReservoirState restir_di_state_from_reservoir(
     state.emissionWeight = float4(reservoir.winner.emission, reservoir.wSum);
     state.sampleMeta = uint4(reservoir.winner.primitiveIndex,
                              reservoir.winner.flags,
-                             1u,
+                             kRestirDIReservoirFlagValid,
                              uniforms.frameIndex);
+    state.surfaceMeta = uint4(rec.primitiveIndex,
+                              rec.materialIndex,
+                              restir_di_pack_normal_10_10_10(shadingNormal),
+                              as_type<uint>(rec.t));
     state.candidateCount = reservoir.M;
     state.temporalAccepted = 0u;
     state.spatialAccepted = 0u;
@@ -533,6 +876,9 @@ kernel void restirDiInitialCandidatesKernel(
     device const SoftwareInstanceInfo* instanceInfos [[buffer(12)]],
     device const LightPrimitive* emissivePrimitives [[buffer(13)]],
     device RestirDIReservoirState* currentReservoirs [[buffer(14)]],
+    device const EnvironmentAliasEntry* environmentConditionalAlias [[buffer(15)]],
+    device const EnvironmentAliasEntry* environmentMarginalAlias [[buffer(16)]],
+    device const float* environmentPdf [[buffer(17)]],
     texture2d<float, access::sample> environmentTexture [[texture(0)]],
     uint2 gid [[thread_position_in_grid]]) {
     constant PathtraceUniforms& uniforms = uniformsBuffer[0];
@@ -571,8 +917,7 @@ kernel void restirDiInitialCandidatesKernel(
     }
 
     MaterialData material = materials[rec.materialIndex];
-    const uint type = static_cast<uint>(material.typeEta.x);
-    if (type == 3u || type == 7u) {
+    if (!material_closure_direct_lighting_eligible(material)) {
         return;
     }
 
@@ -589,27 +934,57 @@ kernel void restirDiInitialCandidatesKernel(
                     (gid.y * 13007u) ^
                     0xD1B54A35u;
     Reservoir reservoir = make_empty_reservoir();
-    const uint candidateCount = max(uniforms.risCandidateCount, 1u);
+    const bool hybridMode = uniforms.directLightMode == kDirectLightModeRestirDiRegirHybrid;
+    const uint candidateCount =
+        hybridMode
+            ? max(uniforms.risCandidateCount * 2u, 1u)
+            : max(uniforms.risCandidateCount, 1u);
     build_restir_di_provider_reservoir_for_hit(uniforms,
                                                emissivePrimitives,
                                                rectangles,
                                                materials,
                                                environmentTexture,
+                                               environmentConditionalAlias,
+                                               environmentMarginalAlias,
+                                               environmentPdf,
                                                rec,
                                                material,
                                                shadingNormal,
                                                wo,
                                                clampParams,
+                                               /*diffuseOcclusion=*/1.0f,
+                                               /*specularOnly=*/false,
                                                candidateCount,
                                                rngState,
                                                reservoir);
-    currentReservoirs[pixelIndex] = restir_di_state_from_reservoir(uniforms,
-                                                                   rec,
-                                                                   material,
-                                                                   shadingNormal,
-                                                                   wo,
-                                                                   clampParams,
-                                                                   reservoir);
+    const uint hybridAccepted = restir_di_augment_regir_hybrid_reservoir(uniforms,
+                                                                         emissivePrimitives,
+                                                                         rectangles,
+                                                                         materials,
+                                                                         environmentTexture,
+                                                                         environmentConditionalAlias,
+                                                                         environmentMarginalAlias,
+                                                                         environmentPdf,
+                                                                         rec,
+                                                                         material,
+                                                                         shadingNormal,
+                                                                         wo,
+                                                                         clampParams,
+                                                                         candidateCount,
+                                                                         rngState,
+                                                                         stats,
+                                                                         reservoir);
+    RestirDIReservoirState state = restir_di_state_from_reservoir(uniforms,
+                                                                  rec,
+                                                                  material,
+                                                                  shadingNormal,
+                                                                  wo,
+                                                                  clampParams,
+                                                                  reservoir);
+    if (hybridAccepted > 0u && restir_di_reservoir_state_valid(state)) {
+        state.sampleMeta.z |= kRestirDIReservoirFlagRegirHybrid;
+    }
+    currentReservoirs[pixelIndex] = state;
 }
 
 #if __METAL_VERSION__ >= 310
@@ -629,6 +1004,9 @@ kernel void restirDiInitialCandidatesHardwareKernel(
     device const uint* primitiveIndices [[buffer(12)]],
     device const LightPrimitive* emissivePrimitives [[buffer(13)]],
     device RestirDIReservoirState* currentReservoirs [[buffer(14)]],
+    device const EnvironmentAliasEntry* environmentConditionalAlias [[buffer(15)]],
+    device const EnvironmentAliasEntry* environmentMarginalAlias [[buffer(16)]],
+    device const float* environmentPdf [[buffer(17)]],
     texture2d<float, access::sample> environmentTexture [[texture(0)]],
     uint2 gid [[thread_position_in_grid]]) {
     constant PathtraceUniforms& uniforms = uniformsBuffer[0];
@@ -668,8 +1046,7 @@ kernel void restirDiInitialCandidatesHardwareKernel(
     }
 
     MaterialData material = materials[rec.materialIndex];
-    const uint type = static_cast<uint>(material.typeEta.x);
-    if (type == 3u || type == 7u) {
+    if (!material_closure_direct_lighting_eligible(material)) {
         return;
     }
 
@@ -686,27 +1063,57 @@ kernel void restirDiInitialCandidatesHardwareKernel(
                     (gid.y * 13007u) ^
                     0xD1B54A35u;
     Reservoir reservoir = make_empty_reservoir();
-    const uint candidateCount = max(uniforms.risCandidateCount, 1u);
+    const bool hybridMode = uniforms.directLightMode == kDirectLightModeRestirDiRegirHybrid;
+    const uint candidateCount =
+        hybridMode
+            ? max(uniforms.risCandidateCount * 2u, 1u)
+            : max(uniforms.risCandidateCount, 1u);
     build_restir_di_provider_reservoir_for_hit(uniforms,
                                                emissivePrimitives,
                                                rectangles,
                                                materials,
                                                environmentTexture,
+                                               environmentConditionalAlias,
+                                               environmentMarginalAlias,
+                                               environmentPdf,
                                                rec,
                                                material,
                                                shadingNormal,
                                                wo,
                                                clampParams,
+                                               /*diffuseOcclusion=*/1.0f,
+                                               /*specularOnly=*/false,
                                                candidateCount,
                                                rngState,
                                                reservoir);
-    currentReservoirs[pixelIndex] = restir_di_state_from_reservoir(uniforms,
-                                                                   rec,
-                                                                   material,
-                                                                   shadingNormal,
-                                                                   wo,
-                                                                   clampParams,
-                                                                   reservoir);
+    const uint hybridAccepted = restir_di_augment_regir_hybrid_reservoir(uniforms,
+                                                                         emissivePrimitives,
+                                                                         rectangles,
+                                                                         materials,
+                                                                         environmentTexture,
+                                                                         environmentConditionalAlias,
+                                                                         environmentMarginalAlias,
+                                                                         environmentPdf,
+                                                                         rec,
+                                                                         material,
+                                                                         shadingNormal,
+                                                                         wo,
+                                                                         clampParams,
+                                                                         candidateCount,
+                                                                         rngState,
+                                                                         stats,
+                                                                         reservoir);
+    RestirDIReservoirState state = restir_di_state_from_reservoir(uniforms,
+                                                                  rec,
+                                                                  material,
+                                                                  shadingNormal,
+                                                                  wo,
+                                                                  clampParams,
+                                                                  reservoir);
+    if (hybridAccepted > 0u && restir_di_reservoir_state_valid(state)) {
+        state.sampleMeta.z |= kRestirDIReservoirFlagRegirHybrid;
+    }
+    currentReservoirs[pixelIndex] = state;
 }
 #endif
 
@@ -834,22 +1241,23 @@ kernel void restirDiVisibilityKernel(
     winner.pdf = reservoir.positionPdf.w;
 
     const float3 omegaL = ris_payload_omega_l(rec, winner);
-    const float cosThetaSurface = saturate(dot(shadingNormal, omegaL));
+    const float cosThetaSurface = direct_light_target_cos(uniforms, material, rec, shadingNormal, omegaL);
     const float distSq = ris_payload_distance_sq(rec, winner);
     if (!(cosThetaSurface > 0.0f) || !(distSq > 0.0f)) {
         return;
     }
 
     FireflyClampParams clampParams = make_firefly_params(uniforms);
-    BsdfEvalResult bsdfEval = evaluate_bsdf(material,
-                                            rec.point,
-                                            shadingNormal,
-                                            safe_normalize(-ray.direction),
-                                            omegaL,
-                                            clampParams,
-                                            uniforms.sssMode,
-                                            1.0f,
-                                            false);
+    BsdfEvalResult bsdfEval = direct_light_target_bsdf(uniforms,
+                                                       material,
+                                                       rec,
+                                                       shadingNormal,
+                                                       safe_normalize(-ray.direction),
+                                                       omegaL,
+                                                       clampParams,
+                                                       1.0f,
+                                                       false,
+                                                       directional);
     if (bsdfEval.isDelta || bsdfEval.isBssrdf) {
         return;
     }
@@ -882,6 +1290,13 @@ kernel void restirDiVisibilityKernel(
     if (!directional &&
         occluded &&
         shadowRec.primitiveType == kPrimitiveTypeTriangle &&
+        shadowRec.primitiveIndex == winner.primitiveIndex) {
+        occluded = false;
+    }
+    if (!directional &&
+        (winner.flags & kLightPrimitiveFlagRectangle) != 0u &&
+        occluded &&
+        shadowRec.primitiveType == kPrimitiveTypeRectangle &&
         shadowRec.primitiveIndex == winner.primitiveIndex) {
         occluded = false;
     }
@@ -925,6 +1340,11 @@ kernel void restirDiVisibilityHardwareKernel(
     device const RestirDIReservoirState* spatialReservoirs [[buffer(13)]],
     device RestirDIVisibilityState* visibilityStates [[buffer(14)]],
     device RestirDIReservoirState* previousReservoirs [[buffer(15)]],
+    device const BvhNode* tlasNodes [[buffer(16)]],
+    device const uint* tlasPrimIndices [[buffer(17)]],
+    device const BvhNode* blasNodes [[buffer(18)]],
+    device const uint* blasPrimIndices [[buffer(19)]],
+    device const SoftwareInstanceInfo* instanceInfos [[buffer(20)]],
     uint2 gid [[thread_position_in_grid]]) {
     constant PathtraceUniforms& uniforms = uniformsBuffer[0];
     if (gid.x >= uniforms.width || gid.y >= uniforms.height) {
@@ -982,22 +1402,23 @@ kernel void restirDiVisibilityHardwareKernel(
     winner.pdf = reservoir.positionPdf.w;
 
     const float3 omegaL = ris_payload_omega_l(rec, winner);
-    const float cosThetaSurface = saturate(dot(shadingNormal, omegaL));
+    const float cosThetaSurface = direct_light_target_cos(uniforms, material, rec, shadingNormal, omegaL);
     const float distSq = ris_payload_distance_sq(rec, winner);
     if (!(cosThetaSurface > 0.0f) || !(distSq > 0.0f)) {
         return;
     }
 
     FireflyClampParams clampParams = make_firefly_params(uniforms);
-    BsdfEvalResult bsdfEval = evaluate_bsdf(material,
-                                            rec.point,
-                                            shadingNormal,
-                                            safe_normalize(-ray.direction),
-                                            omegaL,
-                                            clampParams,
-                                            uniforms.sssMode,
-                                            1.0f,
-                                            false);
+    BsdfEvalResult bsdfEval = direct_light_target_bsdf(uniforms,
+                                                       material,
+                                                       rec,
+                                                       shadingNormal,
+                                                       safe_normalize(-ray.direction),
+                                                       omegaL,
+                                                       clampParams,
+                                                       1.0f,
+                                                       false,
+                                                       directional);
     if (bsdfEval.isDelta || bsdfEval.isBssrdf) {
         return;
     }
@@ -1009,6 +1430,9 @@ kernel void restirDiVisibilityHardwareKernel(
     const float shadowMax = directional
         ? 1.0e20f
         : max(length(winner.position - rec.point) - kEpsilon, kEpsilon);
+    uint shadowExcludeMesh;
+    uint shadowExcludePrim;
+    compute_exclusion_indices(rec, shadowExcludeMesh, shadowExcludePrim);
     bool occluded = trace_scene_hardware(uniforms,
                                          accel,
                                          meshInfos,
@@ -1025,14 +1449,52 @@ kernel void restirDiVisibilityHardwareKernel(
                                          kEpsilon,
                                          shadowMax,
                                          /*anyHitOnly=*/true,
-                                         kInvalidIndex,
-                                         kInvalidIndex,
+                                         shadowExcludeMesh,
+                                         shadowExcludePrim,
                                          shadowRec);
     if (!directional &&
         occluded &&
         shadowRec.primitiveType == kPrimitiveTypeTriangle &&
         shadowRec.primitiveIndex == winner.primitiveIndex) {
         occluded = false;
+    }
+    if (!directional &&
+        (winner.flags & kLightPrimitiveFlagRectangle) != 0u &&
+        occluded &&
+        shadowRec.primitiveType == kPrimitiveTypeRectangle &&
+        shadowRec.primitiveIndex == winner.primitiveIndex) {
+        occluded = false;
+    }
+    if (!occluded) {
+        HitRecord swShadowRec = make_empty_hit_record();
+        bool swOccluded = trace_scene_software(uniforms,
+                                               spheres,
+                                               rectangles,
+                                               triangleData,
+                                               tlasNodes,
+                                               tlasPrimIndices,
+                                               instanceInfos,
+                                               blasNodes,
+                                               blasPrimIndices,
+                                               nodes,
+                                               primitiveIndices,
+                                               /*stats=*/nullptr,
+                                               shadowRay,
+                                               kEpsilon,
+                                               shadowMax,
+                                               /*anyHitOnly=*/true,
+                                               /*includeTriangles=*/true,
+                                               swShadowRec);
+        if (swOccluded &&
+            (directional ||
+             !((swShadowRec.primitiveType == kPrimitiveTypeTriangle &&
+                swShadowRec.primitiveIndex == winner.primitiveIndex) ||
+               ((winner.flags & kLightPrimitiveFlagRectangle) != 0u &&
+                swShadowRec.primitiveType == kPrimitiveTypeRectangle &&
+                swShadowRec.primitiveIndex == winner.primitiveIndex)))) {
+            occluded = true;
+            shadowRec = swShadowRec;
+        }
     }
 
     const float targetPdf = max(reservoir.normalTargetPdf.w, 1.0e-6f);

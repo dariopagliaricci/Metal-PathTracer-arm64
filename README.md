@@ -7,11 +7,9 @@ Metal PathTracer is a research-grade production renderer with multiple transport
 backends, large-scene asset onboarding, deterministic headless rendering,
 runtime diagnostics, and explicitly gated experimental systems.
 
-The current public release line is `v3.0.0`. This release includes the renderer
-scalability foundation, Bistro-class large-scene support, ReSTIR/RIS/ReGIR
-research paths, wavefront execution work, Embree reference rendering,
-importer/texture conversion tooling, and production metadata/debug-bundle
-support.
+The current public release line is `v3.2.1`. This release includes the renderer
+scalability foundation, Bistro large-scene pilot support, Embree reference
+rendering, and importer/texture conversion tooling.
 
 ## Current Status
 
@@ -32,17 +30,24 @@ Production-ready or primary paths:
   structure builds.
 - Headless render profiles, metadata sidecars, settings JSON, debug bundles,
   checkpoint manifests, tiled render manifests, PBR metrics, and deterministic
-  render queue item JSON.
+  render queue item/batch JSON. JSON/text sidecars and report manifests publish
+  through temp files plus atomic rename, while settings JSON is scoped to the
+  documented headless product contract rather than every private renderer
+  setting.
 - Intel Open Image Denoise CPU postprocess when the vendored native libraries are
-  present, plus Metal SVGF-style denoise as a gated research path.
+  present, plus the production Metal SVGF reconstruction path with split
+  direct/indirect controls.
 - `PathTracerImport`, an importer-only Assimp pipeline that converts static FBX,
   OBJ, and other supported source formats into deterministic glTF/GLB output.
 
 Gated research paths that are present but opt-in:
 
 - RIS-family direct lighting, ReGIR world reuse, ReSTIR DI, and DI+ReGIR hybrid.
-- Bounded ReSTIR GI prototype and ReSTIR PT research/experimental path reuse.
-- Path guiding and radiance cache prototypes.
+- Production ReSTIR GI diffuse reuse and ReSTIR PT reservoir capture/path reuse.
+- Gated production path guiding.
+- A prototype non-neural radiance cache that learns the radiance paths gather
+  after a cached vertex and returns it in place of the rest of the path. It is
+  biased by design; see the radiance cache notes under the headless examples.
 - Path-space caustic transport, homogeneous volume transport, and
   hero-wavelength spectral transport.
 - ReSTIR debug inspector views and counters.
@@ -52,6 +57,26 @@ Gated research paths that are present but opt-in:
 Embree is maintained as a selectable CPU reference renderer for visual-output
 parity checks, asset validation, and backend comparison. Metal remains the
 primary GPU renderer.
+
+## Render Modes
+
+Headless rendering separates user-facing render modes from backend, render
+profile, and Metal execution controls.
+
+- `metal_final_frame` selects the controlled Metal final-frame/headless contract.
+  It preserves expert controls such as `--renderProfile`, `--executionMode`,
+  `--wavefront-policy`, and feature flags. It does not claim original exact
+  shade active-count indirect closure; production wavefront shade remains
+  explicitly reported as direct-grid/platform-limited where applicable.
+- `cpu_reference_headless` selects the Embree CPU reference/offline contract.
+  It is not GUI viewport IPR and does not prove CPU tiled final rendering.
+
+Use `--renderMode=<metal_final_frame|cpu_reference_headless>` to select the
+render intention directly. If omitted, the mode is inferred from `--backend`.
+Contradictory combinations, such as `--renderMode=cpu_reference_headless
+--backend=metal`, are rejected. Generated settings, queue item, checkpoint,
+metadata, PBR metrics, and debug reports record render mode, mode maturity,
+mode context, backend, profile, and execution mode where applicable.
 
 ## Repository Map
 
@@ -234,10 +259,16 @@ CPU reference renders from `Images/Embree-Renders`.
 - Environment map importance sampling and MIS.
 - Specular NEE and MNEE caustics.
 - Optional firefly clamp modes for production output control.
-- Path-space caustic transport prototype.
-- Homogeneous volume transport prototype with isotropic or Henyey-Greenstein
-  phase.
-- Hero-wavelength spectral transport prototype with dielectric dispersion.
+- Path-space caustic connection transport.
+- Gated production homogeneous/global volume transport with isotropic or
+  Henyey-Greenstein phase, rect-light volume NEE, debug metadata, and explicit
+  fallbacks for non-medium-aware providers. Heterogeneous volumes remain future
+  work.
+- Gated hero-wavelength spectral transport: three wavelengths per path, a
+  collapse to the hero wavelength at dispersive vertices, a host-computed white
+  balance, explicit sampled-triplet material policy, RGB approximation fallback
+  metadata, and dielectric dispersion. See
+  [Hero-Wavelength Spectral Mode](#hero-wavelength-spectral-mode).
 
 ### Materials and Assets
 
@@ -256,10 +287,13 @@ CPU reference renders from `Images/Embree-Renders`.
   `ris_temporal`, `ris_world`, `ris_regir`, `restir_di`, and
   `restir_di_regir_hybrid`.
 - ReSTIR DI explicit pass graph path for headless and opt-in GUI profiling.
-- ReSTIR GI diffuse prototype.
-- ReSTIR PT research and experimental path reuse modes.
+- ReSTIR GI production diffuse reuse.
+- ReSTIR PT production reservoir capture and path reuse modes.
 - ReGIR/world-space candidate reuse.
-- Path guiding and radiance cache prototypes.
+- Gated production path guiding.
+- A prototype non-neural radiance cache that learns the radiance paths gather
+  after a cached vertex and returns it in place of the rest of the path. It is
+  biased by design; see the radiance cache notes under the headless examples.
 - ReSTIR debug AOVs for candidate source, reservoir confidence, ReGIR cell ID,
   path-guiding mask, ReSTIR PT reuse mask, SVGF variance, NaN/Inf mask, queue
   failures, and radiance cache diagnostics.
@@ -304,9 +338,8 @@ the same as total unified memory.
 For practical interactive GUI expectations across Apple Silicon memory tiers,
 see [GUI Hardware Expectations](docs/GUI_HARDWARE_EXPECTATIONS.md). In short,
 16 GB unified memory is not enough to guarantee that every asset-pack scene can
-load in the GUI; 32 GB is the first broadly useful large-scene GUI tier, 36 GB
-to 48 GB is the more realistic current Pro/Max-class baseline, and 64 GB or more
-is recommended for comfortable large-scene GUI work.
+load in the GUI; 32 GB to 36 GB is the practical large-scene baseline, and
+64 GB or more is recommended for comfortable large-scene GUI work.
 
 ## Building
 
@@ -399,11 +432,10 @@ Debug launch:
 ./build/PathTracer.app/Contents/MacOS/PathTracer
 ```
 
-Large-scene / ReSTIR DI interactive profiling launch:
+Large-scene interactive launch:
 
 ```bash
 PT_HWRT_BUILD_POLICY=compact_memory \
-PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI=1 \
 ./build-metal/PathTracer.app/Contents/MacOS/PathTracer --scene=bistro_full
 ```
 
@@ -443,9 +475,13 @@ Useful interactive runtime environment flags:
 | Variable | Values | Purpose |
 | --- | --- | --- |
 | `PT_HWRT_BUILD_POLICY` | `fast_build`, `fast_trace`, `compact_memory`, `dynamic_update` | Overrides the Metal hardware acceleration-structure build policy. Use `compact_memory` for large static scenes when memory footprint matters. |
-| `PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI` | `1` / `0` | Enables the explicit ReSTIR DI pass graph in the interactive GUI when `restir_di` or `restir_di_regir_hybrid` direct lighting is selected. Without it, the GUI keeps the lower-overhead fused path for responsiveness. |
+| `PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI` | `1` / `0` | Requests the explicit ReSTIR DI pass graph in the interactive GUI. Plain `restir_di` and `restir_di_regir_hybrid` use the explicit path when this is set; otherwise the GUI keeps the fused/default path. This is orthogonal to `PT_HWRT_BUILD_POLICY`: one selects the ReSTIR DI pass graph, the other selects acceleration-structure build policy. Use this for profiling, debugging, or validating the explicit pass graph rather than as the default large-scene launch. |
 | `PT_SCENE_LOAD_DIAGNOSTICS` | `1` / `0` | Prints scene-loading, asset-resolution, and staged-load diagnostics. |
 | `PT_SCENE_LOAD_DIAGNOSTICS_VERBOSE` | `1` / `0` | Adds verbose scene-load diagnostics; requires `PT_SCENE_LOAD_DIAGNOSTICS=1`. |
+| `PT_INTERACTIVE_STATS` | `1` / `0` | Enables interactive GUI terminal telemetry and writes a per-scene JSON session summary on shutdown. |
+| `PT_INTERACTIVE_STATS_INTERVAL` | Floating-point seconds | Live terminal telemetry interval. Defaults to `1`. |
+| `PT_INTERACTIVE_STATS_SUMMARY_INTERVAL` | Floating-point seconds | Rolling summary interval. Defaults to `60`; set `0` to disable summary lines. |
+| `PT_INTERACTIVE_STATS_JSON` | File path | Optional explicit JSON output path. If unset, the GUI writes `benchmarks/interactive_stats_session_YYYYMMDD_HHMMSS.json`. |
 | `PT_HWRT_KEEP_TRIANGLE_BUFFER` | `1` / `0` | Keeps CPU triangle data available after hardware acceleration setup for debugging and parity inspection. |
 | `PT_CAPTURE_DELAY_SECONDS` | Floating-point seconds | Delays automated capture/export flows that need the first frames to settle. |
 
@@ -460,6 +496,71 @@ Low-level dispatch isolation/debug variables:
 
 Environment flags can be prefixed on the launch command, as above, or exported
 once in the shell before starting `PathTracer.app`.
+
+### Interactive Benchmark Telemetry
+
+For GUI benchmark runs, prefer terminal telemetry over screenshot-only overlay
+readings. The interactive logger separates app/UI pacing from path-trace GPU
+work and writes a per-scene JSON report when the GUI closes.
+
+Recommended large-scene benchmark launch:
+
+```bash
+PT_INTERACTIVE_STATS=1 \
+PT_INTERACTIVE_STATS_INTERVAL=1 \
+PT_INTERACTIVE_STATS_SUMMARY_INTERVAL=60 \
+PT_HWRT_BUILD_POLICY=compact_memory \
+./build-metal/PathTracer.app/Contents/MacOS/PathTracer --scene=bistro_full
+```
+
+Explicit ReSTIR DI GUI profiling launch:
+
+```bash
+PT_HWRT_BUILD_POLICY=compact_memory \
+PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI=1 \
+./build-metal/PathTracer.app/Contents/MacOS/PathTracer --scene=assets/bistro_full_sun_restir_alt.scene
+```
+
+The GUI accepts `--scene`, but direct-light mode is selected in the UI. Use the
+explicit launch above only when profiling or validating the explicit `restir_di`
+or `restir_di_regir_hybrid` graph; omit `PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI`
+for the normal fused/default interactive path. When `restir_di_regir_hybrid` is
+selected in explicit mode, the ReSTIR overlay and PBR metrics report
+`restir_di_regir_candidate_count`, `restir_di_regir_accepted_count`, and
+`restir_di_regir_fallback_count` so selected hybrid mode can be distinguished
+from actual hybrid ReGIR candidate activity.
+
+To choose the JSON report path explicitly:
+
+```bash
+PT_INTERACTIVE_STATS=1 \
+PT_INTERACTIVE_STATS_JSON=benchmarks/bistro_session.json \
+PT_HWRT_BUILD_POLICY=compact_memory \
+./build-metal/PathTracer.app/Contents/MacOS/PathTracer --scene=bistro_full
+```
+
+If `PT_INTERACTIVE_STATS_JSON` is unset, the default output is timestamped:
+
+```text
+benchmarks/interactive_stats_session_YYYYMMDD_HHMMSS.json
+```
+
+Live terminal lines use these key fields:
+
+```text
+[InteractiveStats] scene="bistro_full" resolution=1280x720 scale=0.50 backend=Metal-HWRT execution=Wavefront wavefrontPolicy=Research wavefrontCompaction=on restir="di=on,explicitDI=on,gi=off,pt=off" appFrameMs=1940.367 appFps=0.5 spp=9 samplesPerFrame=1 appSppPerMin=4151.1 appSppPerSec=69.2 pathSppPerSec=0.5 triangles=3846586 pathGpuMs=1915.611 cpuEncodeMs=0.039 drawableWaitMs=3.295 raysThisFrame=123456789 raysPerSec=64446954 denoiser=off
+```
+
+`appFrameMs` / `appFps` describe the interactive application update cadence.
+`pathGpuMs`, `pathSppPerSec`, and `raysPerSec` describe the completed
+path-tracing GPU work for the sampled frame. Missing counters are printed as
+`unavailable` rather than estimated. The shutdown JSON report uses schema
+`metal-pathtracer.interactiveStats.v2`; each scene contains one or more
+`segments`, where a segment is a stable renderer configuration
+(resolution, render scale, backend, execution mode, Wavefront policy, ReSTIR
+state, denoiser state, and samples per frame). This keeps scene-load stalls,
+mode switches, and denoiser toggles from being averaged into a single
+misleading number.
 
 ## Headless Rendering
 
@@ -504,6 +605,80 @@ build-embree/PathTracerHeadless \
   --output=renders/plastic_embree.png
 ```
 
+Metal SVGF preview denoise:
+
+```bash
+build/PathTracerHeadless \
+  --backend=metal \
+  --scene=assets/ajax.scene \
+  --width=1280 \
+  --height=720 \
+  --sppTotal=64 \
+  --seed=42 \
+  --svgfDenoise=1 \
+  --svgf-atrous-iterations=2 \
+  --output=renders/ajax_svgf_preview.exr \
+  --format=exr \
+  --outputMetadata=1 \
+  --debugBundleDir=renders/ajax_svgf_preview_bundle
+```
+
+Smoother SVGF pass after the camera has settled:
+
+```bash
+build/PathTracerHeadless \
+  --backend=metal \
+  --scene=assets/ajax.scene \
+  --width=1280 \
+  --height=720 \
+  --sppTotal=128 \
+  --seed=42 \
+  --svgfDenoise=1 \
+  --svgf-atrous-iterations=3 \
+  --output=renders/ajax_svgf_smooth.exr \
+  --format=exr \
+  --outputMetadata=1 \
+  --debugBundleDir=renders/ajax_svgf_smooth_bundle
+```
+
+SVGF direct/indirect component controls:
+
+```bash
+# Denoise direct lighting only; leave indirect raw.
+build/PathTracerHeadless \
+  --backend=metal \
+  --scene=assets/ajax.scene \
+  --width=1280 \
+  --height=720 \
+  --sppTotal=64 \
+  --seed=42 \
+  --svgfDenoise=1 \
+  --svgf-denoise-direct=1 \
+  --svgf-denoise-indirect=0 \
+  --svgf-atrous-iterations=2 \
+  --output=renders/ajax_svgf_direct_only.exr \
+  --format=exr
+
+# Denoise indirect lighting only; leave direct raw.
+build/PathTracerHeadless \
+  --backend=metal \
+  --scene=assets/ajax.scene \
+  --width=1280 \
+  --height=720 \
+  --sppTotal=64 \
+  --seed=42 \
+  --svgfDenoise=1 \
+  --svgf-denoise-direct=0 \
+  --svgf-denoise-indirect=1 \
+  --svgf-atrous-iterations=2 \
+  --output=renders/ajax_svgf_indirect_only.exr \
+  --format=exr
+```
+
+SVGF is a Metal reconstruction path. `--svgf-atrous-iterations=2` is the
+recommended interactive preview setting; `3` is smoother but softer. Use OIDN
+with `--denoise=1` for CPU postprocess denoising.
+
 Render profiles:
 
 | Profile | Defaults |
@@ -528,17 +703,27 @@ Important headless flag groups:
   `--world-reuse-cell-size`, `--restirGiMode`, `--restirPtMode`,
   `--pathGuidingMode`, `--radianceCacheMode`.
 - Advanced transport: `--causticTransportMode`, `--volumeTransportMode`,
-  `--spectralMode`, plus their related tuning flags.
+  `--spectralMode`, `--spectralWavelengthsPerPath`, plus their related tuning
+  flags.
 - Large scenes: `--stats`, `--budget-policy=strict|warn|ignore`,
   `--pilot-mode=geo_only|albedo_only|full_clamped`, `--texture-max-dim`,
   `--max-texture-bytes`.
 - Output quality: `--tonemap`, `--exposure`, `--firefly-clamp-mode`,
-  `--firefly-clamp-value`, `--denoise`, OIDN guide flags, `--svgfDenoise`.
+  `--firefly-clamp-value`, `--denoise`, OIDN guide flags, `--svgfDenoise`,
+  `--svgf-denoise-direct`, `--svgf-denoise-indirect`,
+  `--svgf-atrous-iterations`, `--svgf-normal-sigma`,
+  `--svgf-albedo-sigma`, `--svgf-luminance-sigma`.
 - Production metadata: `--pbrMetrics`, `--pbrMetricsJson`,
   `--outputMetadata`, `--outputMetadataJson`, `--settingsJson`,
   `--renderQueueItemJson`, `--runRenderQueueItemJson`, `--debugBundleDir`,
   `--checkpointManifestJson`, `--resumeCheckpointJson`, `--tileManifestJson`,
   `--tileSize`.
+  `--runRenderQueueItemJson` accepts a single queue item, a root JSON array, or
+  a `{ "queue_items": [...] }` batch and writes a per-item batch summary.
+  Checkpoint manifests are completed-frame rerender manifests; tile manifests
+  are deterministic full-frame tile plans. Debug bundles record the completed
+  render artifact set and the explicit failure-context policy for early setup
+  aborts.
 - Debug/audit: `--materialMrDebugJson`, `--directLightAuditJson`,
   `--restirDebug`, `--restirDebugView`, `--restirDebugCounters`,
   `--restirDebugMetricsJson`, `--cameraSearchReport`, `--debugPath`,
@@ -547,11 +732,11 @@ Important headless flag groups:
 
 Run `build/PathTracerHeadless --help` for the complete current CLI surface.
 
-### Gated Research Mode Examples
+### Gated Production And Research Mode Examples
 
-The advanced transport systems are explicit opt-in paths. They are intended for
-renderer research, parity work, and controlled production experiments where the
-selected mode is recorded in metadata/debug output.
+The advanced transport systems are explicit opt-in paths. ReSTIR modes are
+production transport paths with their selected mode recorded in metadata/debug
+output; unrelated research systems remain gated separately.
 
 ReSTIR DI plus ReGIR hybrid on the Metal wavefront path:
 
@@ -566,18 +751,18 @@ build/PathTracerHeadless \
   --out=renders/bistro_restir_regir.exr
 ```
 
-ReSTIR GI diffuse reuse:
+ReSTIR GI production diffuse reuse:
 
 ```bash
 build/PathTracerHeadless \
   --scene=living_room \
   --renderProfile=lookdev \
-  --restirGiMode=restir_gi_diffuse \
+  --restirGiMode=restir_gi_production \
   --directLightMode=restir_di \
   --out=renders/living_room_restir_gi.exr
 ```
 
-Path guiding and radiance cache prototypes:
+Gated path guiding and radiance cache providers:
 
 ```bash
 build/PathTracerHeadless \
@@ -590,7 +775,59 @@ build/PathTracerHeadless \
   --out=renders/sponza_guiding_cache.exr
 ```
 
-Path-space caustics, homogeneous volumes, and hero-wavelength spectral transport:
+Radiance cache notes: the cache is a prototype and is biased by design. For
+each world-space cell it stores the mean radiance that training paths (one
+pixel in eight per frame) gather after a vertex in that cell, divided by the
+path throughput at that vertex. A path that reaches a confident cell adds the
+cached value and stops. Measured at 320x180 with 4096 samples per pixel against
+cache-off references (seed 42, default cache settings), the full-frame mean
+luminance differs from the reference by +0.01% on `living_room`, 0.00% on
+`sponza` and +0.03% on `emerald_square_day`, and no named test region differs
+by more than 0.15%. The low bias comes with little reuse: a cache hit ends about
+0.01% of query attempts on `living_room` and about 15% on `sponza` and
+`emerald_square_day`, and at equal render time the cache does not reduce error
+on `living_room` or `sponza`. The cache is refused, with a warning and a
+metadata reason, when ReSTIR GI or a ReSTIR PT path-reuse mode is enabled, and
+the headless renderer refuses to run spectral hero-wavelength mode with the
+cache on.
+
+Why the cache gives no equal-time gain. These were measured in November 2026
+at 320x180 on the hardware megakernel. Costs per sample come from alternating
+exclusive runs. Errors are RMSE against cache-off references of 11k to 385k
+samples per pixel.
+
+- Cost. Turning the cache on makes the megakernel use its general pipeline,
+  where every research and debug gate is live.
+  - Per sample, cache on costs 2.76x cache off on `living_room`, 2.23x on
+    `sponza` and 1.38x on `emerald_square_day` (at 64 spp).
+  - With no cache queries or training (`--radianceCacheMinDepth=64`), it still
+    costs 2.47x and 2.18x.
+  - A diagnostic shader build that folds every other gate out of that pipeline
+    brings cache on down to 1.18x and 1.15x (1.10x and 1.09x with no queries).
+  - The cache's diagnostic counters cost about 1%.
+- Gate. The gate refuses a cell when one sample's relative variance exceeds
+  0.85. On `living_room` it passes 0.07% of the loads that reach it:
+  - 98% of those loads find a cell holding 1024 samples;
+  - 80% of them find a relative variance above 16;
+  - so RMSE at equal samples is that of cache off: 0.04398 against 0.04401 at
+    256 spp.
+- Other gates, all on `living_room`:
+  - Opening the gate, with cells also keyed by the dominant axis of the normal,
+    cuts RMSE at equal samples by 12%. But it moves the full-frame mean by
+    -0.28% and the left sofa by -1.4%.
+  - With the gate open, a training clamp of 256 instead of 16, a cell size of
+    0.25 instead of 1, or both, still leave the frame 0.25% to 0.34% off.
+  - Gates on the variance of the cell mean move the frame by -0.17% to +1.37%.
+    They refuse when var / (n mean^2) exceeds 0.01 or 0.04, with or without
+    the normal key. They pass the cells whose mean came out high or low.
+  - Keying cells by the normal under the current gate moves the frame by
+    -0.05% and reduces RMSE at equal samples by 0.4%.
+
+None of these gates reduces error at equal render time while staying within
+0.03% of the frame. Folding the general pipeline would make the cache cheap,
+but with the current gate it would still reduce no error.
+
+Path-space caustics and homogeneous volumes:
 
 ```bash
 build/PathTracerHeadless \
@@ -600,9 +837,39 @@ build/PathTracerHeadless \
   --volumeTransportMode=homogeneous \
   --volumeSigmaA=0.02,0.02,0.02 \
   --volumeSigmaS=0.04,0.04,0.04 \
-  --spectralMode=hero_wavelength \
-  --spectralDispersionStrength=0.012 \
   --out=renders/suzanne_research_transport.exr
+```
+
+ReSTIR DI reservoirs carry no medium state, so with
+`--volumeTransportMode=homogeneous` the Metal backend does not run `restir_di`
+or `restir_di_regir_hybrid`: it renders `baseline_emissive` instead. The log
+says so, and the render metadata field `volume_direct_light_fallback` names the
+mode that ran. On Metal, ReSTIR GI, ReSTIR PT, path guiding and the radiance
+cache are also off with volumes, as the metrics JSON fallback report records.
+Volume NEE at scatter points samples rect lights only. Surface NEE to a light
+with a position (mesh emitters, rect lights, point lights) is attenuated by the
+medium's transmittance over the shadow segment in every direct-light mode, on
+the megakernels and the wavefront; suns and the environment are not attenuated,
+as escaped paths are not. The `volume_transmittance_query_count` metric counts
+those queries too. Embree ignores volumes and runs every requested mode without
+them.
+
+Hero-wavelength spectral transport with path-space caustics. Spectral mode
+refuses specular NEE, MNEE and volumes (see
+[Hero-Wavelength Spectral Mode](#hero-wavelength-spectral-mode)), so the scene's
+`enableSpecularNee=1 enableMnee=1` are turned off here:
+
+```bash
+build/PathTracerHeadless \
+  --scene=suzanne_caustics \
+  --renderProfile=lookdev \
+  --causticTransportMode=path_space \
+  --enableSpecularNee=0 \
+  --enableMnee=0 \
+  --spectralMode=hero_wavelength \
+  --spectralWavelengthsPerPath=3 \
+  --spectralDispersionStrength=0.012 \
+  --out=renders/suzanne_spectral.exr
 ```
 
 Notes:
@@ -610,9 +877,87 @@ Notes:
 - HDR outputs (`exr`, `pfm`) are written in linear space.
 - Embree uses the same `--format` output surface as Metal. EXR/PFM are linear
   HDR outputs; PNG/PPM are tonemapped visual outputs.
-- `--denoise=1` writes a second file with `_denoised` before the extension.
+- `--denoise=1` writes `<stem>_raw.<ext>` and `<stem>_denoised.<ext>` in place of the requested unsuffixed filename.
+- Viewport bloom (`bloomEnabled`/`bloom`, `bloomThreshold`, `bloomIntensity`,
+  `bloomRadius`) affects only the interactive display. The separate scene
+  setting `referenceBloom` applies reference bloom before tonemapping to saved
+  PNG/PPM images; neither bloom path affects saved linear EXR/PFM output.
 - Metal backend logs and large-scene reports are diagnostics, not progress
   indicators. Use `--verbose` for progress with percentage and ETA.
+
+### Hero-Wavelength Spectral Mode
+
+`--spectralMode=hero_wavelength` replaces RGB transport with transport over
+wavelengths sampled uniformly between `--spectralMinNm` and `--spectralMaxNm`
+(default 380-720 nm). It is a gated mode of the Metal backend; the Embree
+backend ignores it with a warning and renders RGB.
+
+- **Wavelengths per path.** Each path samples a hero wavelength and carries
+  C wavelengths in its three throughput channels,
+  `lambda_j = min + (max - min) * frac(u + j / C)`, so the channels are spread
+  evenly over the range and each one is uniformly distributed.
+  `--spectralWavelengthsPerPath=3` (default) carries three; `=1` carries the
+  hero wavelength only and is kept as a baseline for comparisons. The queue
+  JSON key is `spectral_wavelengths_per_path`.
+- **Conversion.** RGB reflectance, emission and light radiance become one value
+  per carried wavelength where they enter the path: materials at each hit,
+  lights at emission, background/environment and NEE. RGB textures use the
+  `rgb_reflectance_d65` approximation and are counted as spectral fallbacks.
+  Scene `spectral*` triplets (450/550/650 nm) are evaluated at each carried
+  wavelength.
+- **Sensor and white balance.** When a path ends, the radiance of each
+  wavelength is weighted by a fixed RGB sensor (three Gaussians centred at
+  610, 545 and 455 nm, widths 48, 42 and 36 nm) and averaged over the C
+  wavelengths, once per path. The host multiplies the result by a white balance
+  `W_c = 1 / E[s_c]` over the sampled range, so a spectrally flat input of 1
+  renders as RGB (1, 1, 1). For 380-720 nm, W = (1.9228, 2.7271, 2.5664); the
+  output sidecar records it as `spectral_white_balance`.
+- **Collapse at dispersive vertices.** A vertex is dispersive when its material
+  is transmissive and its dispersion strength (material `spectralParams` or
+  `--spectralDispersionStrength`, default 0.012) is nonzero, so by default every
+  glass surface is dispersive. The sampled direction there is valid for the hero
+  wavelength only: the path keeps the hero channel, scaled by C, and drops the
+  others. Light gathered before that vertex keeps all wavelengths; after it the
+  path is a single-wavelength path.
+- **Clamps and guides.** The luminance-mode firefly and throughput clamps
+  measure brightness as the mean over the wavelength channels; max-component
+  mode is unchanged. Denoiser guides (albedo, normal, material features) stay
+  RGB.
+- **Metadata.** The output sidecar records `spectral_wavelengths_per_path`,
+  `spectral_sampling_strategy`, `spectral_white_balance` and
+  `spectral_last_frame_stats` (wavelength samples, channel samples, collapses
+  and dispersion events of the last frame; the stats buffer is cleared every
+  frame). `--pbrMetrics=1` adds the same counters to the metrics JSON.
+
+Support matrix (headless Metal backend):
+
+| Supported | Refused |
+| --- | --- |
+| `--directLightMode=legacy`, `baseline_emissive` | RIS, ReGIR, ReSTIR DI and the DI+ReGIR hybrid |
+| Megakernel and wavefront execution | `--restirGiMode`, `--restirPtMode` other than `off` |
+| Path-space caustics (`--causticTransportMode=path_space`) | Path guiding, radiance cache |
+| OIDN denoising with RGB guides | Homogeneous volumes |
+| `--spectralWavelengthsPerPath=1` or `3` | Specular NEE (on by default: pass `--enableSpecularNee=0`), MNEE |
+| | SVGF, ML reconstruction |
+| | Tungsten source closures and `sourceTransport` |
+| | Debug views (`--debugShow*`, `--restirDebugView` other than `beauty`) |
+
+A refused combination prints `spectral mode does not support <combination>`,
+writes a sidecar with `"status": "refused"` and
+`spectral_refused_combination`, and exits with status 2 without rendering.
+
+Limits:
+
+- The sensor is three Gaussians, not the CIE color-matching functions, and RGB
+  inputs are converted linearly onto it, so saturated RGB colors come out less
+  saturated: RGB (1, 0, 0) comes out as about (0.766, 0.309, 0.021).
+- There is no spectral MIS: the carried wavelengths share the hero wavelength's
+  sampled directions with equal weights, and after a collapse only the hero
+  wavelength contributes.
+- An emitter given as explicit spectral triplets is converted slightly
+  differently when a path hits it than when NEE samples it, and
+  environment-modulated emission converts the emission and the environment
+  separately on a hit but their product in NEE.
 
 ## Import Pipeline
 
@@ -637,7 +982,21 @@ Importer flags:
 `--textures=convert` supports Bistro's validated DDS set (`DXT1`/BC1,
 `DXT5`/BC3, `ATI2`/BC5) plus common raster image formats. The importer emits a
 deterministic output directory containing the scene, textures, and
-`import_manifest.json` with schema/version metadata.
+`import_manifest.json` with schema/version metadata, support-matrix entries,
+texture policy, stable geometry/material/texture IDs, output hashes, and
+diagnostics for omitted static-import features.
+
+Runtime glTF/GLB and `.scene` loads expose the same production asset contract in
+`--outputMetadataJson` and `--pbrMetricsJson` under `asset_pipeline`. The report
+includes support boundaries, stable resource IDs, material override records,
+texture color-space decisions, texture residency/mip/compression/budget policy,
+and diagnostics for unsupported lights, animation, skinning, morph targets,
+USD, and MaterialX. The current pipeline is static-scene production scope:
+glTF/GLB geometry, transforms, cameras, textures, PBR-compatible materials,
+alpha/transmission/emission mappings, KTX2/DDS/raster texture handling, and
+Assimp conversion are supported; animation, skinning, morph evaluation,
+KHR punctual-light conversion, USD, and MaterialX are reported rather than
+silently imported.
 
 If Assimp is not found, the executable still builds in stub mode and exits with
 an explicit diagnostic.
@@ -647,7 +1006,9 @@ an explicit diagnostic.
 Scene files live under `assets` and can also reference external asset files.
 The renderer accepts scene identifiers such as `sponza`, `bistro_full`,
 `bitterli_staircase`, `living_room`, `san_miguel_balcony_sun_restir`, or a path
-to a `.scene`, `.gltf`, or `.glb` file.
+to a `.scene`, `.gltf`, or `.glb` file. Direct `.gltf` and `.glb` paths are
+routed through the same glTF mesh loader and asset-pipeline report path used by
+scene-file `mesh path=...` directives.
 
 Example:
 
@@ -769,8 +1130,8 @@ Important scene IDs include:
   core rendering remains usable.
 - Embree is a selectable CPU reference renderer for visual-output parity,
   asset validation, and backend comparison.
-- Advanced transport systems are explicit opt-in research/production
-  experiments; use the commands in the gated research mode examples above.
+- Advanced transport systems are explicit opt-in production/research paths; use
+  the commands in the gated mode examples above.
 - Wavefront execution is selectable through `--executionMode=wavefront`, with
   scheduling controlled by `--wavefront-policy`.
 - GUI EXR export intentionally writes timestamped captures to

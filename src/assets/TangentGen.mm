@@ -135,7 +135,7 @@ void MikkGetPosition(const SMikkTSpaceContext* context,
                      const int iFace,
                      const int iVert) {
     auto* data = static_cast<MikkMeshContext*>(context->m_pUserData);
-    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + iVert];
+    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + static_cast<size_t>(iVert)];
     const auto& v = (*data->vertices)[index];
     posOut[0] = v.position.x;
     posOut[1] = v.position.y;
@@ -147,7 +147,7 @@ void MikkGetNormal(const SMikkTSpaceContext* context,
                    const int iFace,
                    const int iVert) {
     auto* data = static_cast<MikkMeshContext*>(context->m_pUserData);
-    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + iVert];
+    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + static_cast<size_t>(iVert)];
     simd::float3 n = NormalizeSafe((*data->vertices)[index].normal);
     normOut[0] = n.x;
     normOut[1] = n.y;
@@ -159,7 +159,7 @@ void MikkGetTexCoord(const SMikkTSpaceContext* context,
                      const int iFace,
                      const int iVert) {
     auto* data = static_cast<MikkMeshContext*>(context->m_pUserData);
-    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + iVert];
+    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + static_cast<size_t>(iVert)];
     const auto& v = (*data->vertices)[index];
     texOut[0] = v.uv.x;
     texOut[1] = v.uv.y;
@@ -171,7 +171,7 @@ void MikkSetTSpaceBasic(const SMikkTSpaceContext* context,
                         const int iFace,
                         const int iVert) {
     auto* data = static_cast<MikkMeshContext*>(context->m_pUserData);
-    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + iVert];
+    uint32_t index = (*data->indices)[static_cast<size_t>(iFace) * 3 + static_cast<size_t>(iVert)];
     auto& v = (*data->vertices)[index];
     v.tangent = simd_make_float4(tangent[0], tangent[1], tangent[2], sign);
 }

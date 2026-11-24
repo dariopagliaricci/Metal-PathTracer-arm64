@@ -8,6 +8,7 @@
 @protocol CAMetalDrawable;
 @protocol MTLCounterSet;
 @protocol MTLCounterSampleBuffer;
+@protocol MTLBinaryArchive;
 
 using MTLDeviceHandle = id<MTLDevice>;
 using MTLCommandQueueHandle = id<MTLCommandQueue>;
@@ -23,6 +24,7 @@ using MTLTextureHandle = id<MTLTexture>;
 using MTLSamplerStateHandle = id<MTLSamplerState>;
 using MTLCounterSetHandle = id<MTLCounterSet>;
 using MTLCounterSampleBufferHandle = id<MTLCounterSampleBuffer>;
+using MTLBinaryArchiveHandle = id<MTLBinaryArchive>;
 using MTLRenderPassDescriptorHandle = MTLRenderPassDescriptor*;
 using MTLCAMetalDrawableHandle = id<CAMetalDrawable>;
 using MTKViewHandle = MTKView*;
@@ -53,6 +55,7 @@ using MTLTextureHandle = void*;
 using MTLSamplerStateHandle = void*;
 using MTLCounterSetHandle = void*;
 using MTLCounterSampleBufferHandle = void*;
+using MTLBinaryArchiveHandle = void*;
 using MTLRenderPassDescriptorHandle = void*;
 using MTLCAMetalDrawableHandle = void*;
 using MTKViewHandle = MTKView*;

@@ -113,6 +113,10 @@ int main(int argc, const char* argv[]) {
                     break;
                 }
                 options.importMode = *parsed;
+            } else if (arg == "--allow-obj-material-mismatch") {
+                options.allowObjMaterialMismatch = true;
+            } else if (arg == "--no-obj-mtllib-hoist") {
+                options.objHoistMaterialLibraries = false;
             } else {
                 error = "Unknown argument: " + arg;
                 break;

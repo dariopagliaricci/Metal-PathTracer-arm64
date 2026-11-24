@@ -2,6 +2,7 @@
 #import <dispatch/dispatch.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
+#import <objc/runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -12,8 +13,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <memory>
@@ -44,10 +47,15 @@
 #include "renderer/RenderLoop.h"
 #include "renderer/RenderSettings.h"
 #include "renderer/SettingsUtils.h"
+#include "renderer/TraversalService.h"
 #include "renderer/UIOverlay.h"
 
 #ifndef PATH_TRACER_ENABLE_OIDN
 #define PATH_TRACER_ENABLE_OIDN 0
+#endif
+
+#ifndef PATH_TRACER_GIT_HASH
+#define PATH_TRACER_GIT_HASH "unknown"
 #endif
 
 // ImGui is only needed for windowed mode (not headless)
@@ -60,6 +68,8 @@
 #else
 #define HAS_IMGUI 0
 #endif
+
+static char kPathTracerCenteredTitleLabelKey;
 
 namespace {
 constexpr float kMinRenderScale = 0.5f;
@@ -101,6 +111,174 @@ inline std::string FormatMiB(uint64_t bytes) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << BytesToMiB(bytes) << " MiB";
     return out.str();
+}
+
+inline NSString* ToNSString(const std::string& value) {
+    return [NSString stringWithUTF8String:value.c_str()];
+}
+
+const char* ViewportQualityPresetName(PathTracer::RenderSettings::ViewportQualityPreset preset) {
+    using ViewportQualityPreset = PathTracer::RenderSettings::ViewportQualityPreset;
+    switch (preset) {
+        case ViewportQualityPreset::Interactive:
+            return "viewport_metal_interactive";
+        case ViewportQualityPreset::Balanced:
+            return "viewport_metal_balanced";
+        case ViewportQualityPreset::FinalPreview:
+            return "viewport_metal_final_preview";
+        case ViewportQualityPreset::Custom:
+        default:
+            return "custom";
+    }
+}
+
+const char* ViewportQualityPresetMaturity(PathTracer::RenderSettings::ViewportQualityPreset preset) {
+    using ViewportQualityPreset = PathTracer::RenderSettings::ViewportQualityPreset;
+    switch (preset) {
+        case ViewportQualityPreset::Interactive:
+            return "current/foundation";
+        case ViewportQualityPreset::Balanced:
+            return "planned/near-term";
+        case ViewportQualityPreset::FinalPreview:
+            return "planned/high-quality-preview";
+        case ViewportQualityPreset::Custom:
+        default:
+            return "custom-override";
+    }
+}
+
+NSView* TitlebarContainerForWindow(NSWindow* window) {
+    NSButton* closeButton = [window standardWindowButton:NSWindowCloseButton];
+    if (closeButton.superview) {
+        return closeButton.superview;
+    }
+    return window.contentView.superview;
+}
+
+NSTextField* ExistingCenteredTitleLabel(NSWindow* window) {
+    id existing = objc_getAssociatedObject(window, &kPathTracerCenteredTitleLabelKey);
+    if ([existing isKindOfClass:[NSTextField class]]) {
+        return (NSTextField*)existing;
+    }
+    return nil;
+}
+
+void ConfigureCenteredWindowTitle(NSWindow* window, const std::string& title) {
+    if (!window) {
+        return;
+    }
+
+    NSString* nsTitle = ToNSString(title);
+    [window setTitle:nsTitle];
+
+    if ((window.styleMask & NSWindowStyleMaskTitled) == 0) {
+        return;
+    }
+
+    NSView* titlebarContainer = TitlebarContainerForWindow(window);
+    NSButton* closeButton = [window standardWindowButton:NSWindowCloseButton];
+    if (!titlebarContainer || !closeButton) {
+        return;
+    }
+
+    window.titleVisibility = NSWindowTitleHidden;
+
+    NSTextField* label = ExistingCenteredTitleLabel(window);
+    if (!label) {
+        label = [NSTextField labelWithString:nsTitle];
+        label.alignment = NSTextAlignmentCenter;
+        label.lineBreakMode = NSLineBreakByTruncatingTail;
+        label.font = [NSFont systemFontOfSize:[NSFont systemFontSize]
+                                        weight:NSFontWeightSemibold];
+        label.translatesAutoresizingMaskIntoConstraints = NO;
+        objc_setAssociatedObject(window,
+                                 &kPathTracerCenteredTitleLabelKey,
+                                 label,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        label.stringValue = nsTitle;
+    }
+
+    if (label.superview != titlebarContainer) {
+        [label removeFromSuperview];
+        [titlebarContainer addSubview:label];
+        [NSLayoutConstraint activateConstraints:@[
+            [label.centerXAnchor constraintEqualToAnchor:titlebarContainer.centerXAnchor],
+            [label.centerYAnchor constraintEqualToAnchor:closeButton.centerYAnchor],
+            [label.leadingAnchor constraintGreaterThanOrEqualToAnchor:closeButton.trailingAnchor
+                                                             constant:12.0],
+            [label.widthAnchor constraintLessThanOrEqualToAnchor:titlebarContainer.widthAnchor
+                                                        constant:-240.0]
+        ]];
+    }
+}
+
+void SuspendCenteredWindowTitle(NSWindow* window) {
+    if (!window) {
+        return;
+    }
+    NSTextField* label = ExistingCenteredTitleLabel(window);
+    if (label) {
+        [label removeFromSuperview];
+        objc_setAssociatedObject(window,
+                                 &kPathTracerCenteredTitleLabelKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+inline std::string TraversalCoverageEntry(const char* label,
+                                          const PathTracer::TraversalServiceDecision& decision,
+                                          const char* scope = nullptr) {
+    std::string entry = label;
+    entry += "=";
+    entry += decision.usesHardware ? "hwrt" : "swrt";
+    if (scope && *scope) {
+        entry += "(";
+        entry += scope;
+        entry += ")";
+    }
+    if (!decision.usesHardware && !decision.fallbackReason.empty()) {
+        entry += "[";
+        entry += decision.fallbackReason;
+        entry += "]";
+    }
+    return entry;
+}
+
+inline std::string JoinTraversalCoverage(std::initializer_list<std::string> entries) {
+    std::string joined;
+    for (const std::string& entry : entries) {
+        if (!joined.empty()) {
+            joined += "; ";
+        }
+        joined += entry;
+    }
+    return joined;
+}
+
+inline const char* TextureBudgetPolicyLabel(PathTracer::TextureBudgetPolicy policy) {
+    switch (policy) {
+        case PathTracer::TextureBudgetPolicy::Strict:
+            return "strict";
+        case PathTracer::TextureBudgetPolicy::Warn:
+            return "warn";
+        case PathTracer::TextureBudgetPolicy::Ignore:
+            return "ignore";
+    }
+    return "unknown";
+}
+
+inline const char* PilotModeLabel(PathTracer::PilotMode mode) {
+    switch (mode) {
+        case PathTracer::PilotMode::FullClamped:
+            return "full_clamped";
+        case PathTracer::PilotMode::GeoOnly:
+            return "geo_only";
+        case PathTracer::PilotMode::AlbedoOnly:
+            return "albedo_only";
+    }
+    return "unknown";
 }
 
 inline uint64_t SaturatingAdd(uint64_t a, uint64_t b) {
@@ -157,6 +335,19 @@ inline bool EnvFlagEnabled(const char* name) {
            std::strcmp(value, "NO") != 0;
 }
 
+inline double EnvDoubleOrDefault(const char* name, double defaultValue) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return defaultValue;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end == value || !std::isfinite(parsed)) {
+        return defaultValue;
+    }
+    return parsed;
+}
+
 inline bool SceneLoadDiagnosticsEnabled() {
     static const bool enabled = EnvFlagEnabled("PT_SCENE_LOAD_DIAGNOSTICS");
     return enabled;
@@ -165,6 +356,144 @@ inline bool SceneLoadDiagnosticsEnabled() {
 inline bool InteractiveExplicitRestirDiEnabled() {
     static const bool enabled = EnvFlagEnabled("PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI");
     return enabled;
+}
+
+inline bool InteractiveStatsEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_INTERACTIVE_STATS");
+    return enabled;
+}
+
+inline bool WavefrontShadeIndirectEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_INDIRECT");
+    return enabled;
+}
+
+inline bool WavefrontShadeIndirectProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_INDIRECT_PROBE");
+    return enabled;
+}
+
+inline bool WavefrontShadeSurfaceProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_SURFACE_PROBE");
+    return enabled;
+}
+
+inline bool WavefrontShadeMetadataProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_METADATA_PROBE");
+    return enabled;
+}
+
+inline bool WavefrontShadeScalarProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_SCALAR_PROBE");
+    return enabled;
+}
+
+inline bool WavefrontShadeBsdfProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_BSDF_PROBE");
+    return enabled;
+}
+
+inline bool WavefrontShadeClosureProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_CLOSURE_PROBE");
+    return enabled;
+}
+
+inline bool WavefrontShadowIndirectEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADOW_INDIRECT");
+    return enabled;
+}
+
+inline double InteractiveStatsIntervalSeconds() {
+    static const double interval =
+        std::max(0.1, EnvDoubleOrDefault("PT_INTERACTIVE_STATS_INTERVAL", 1.0));
+    return interval;
+}
+
+inline double InteractiveStatsSummaryIntervalSeconds() {
+    static const double interval =
+        std::max(0.0, EnvDoubleOrDefault("PT_INTERACTIVE_STATS_SUMMARY_INTERVAL", 60.0));
+    return interval;
+}
+
+inline std::string EnvStringOrDefault(const char* name, const std::string& defaultValue) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return defaultValue;
+    }
+    return std::string(value);
+}
+
+inline std::string InteractiveStatsJsonPath() {
+    static const std::string path = []() {
+        const std::string explicitPath = EnvStringOrDefault("PT_INTERACTIVE_STATS_JSON", "");
+        if (!explicitPath.empty()) {
+            return explicitPath;
+        }
+
+        std::time_t now = std::time(nullptr);
+        std::tm localTime{};
+        if (localtime_r(&now, &localTime) == nullptr) {
+            return std::string();
+        }
+        std::ostringstream out;
+        out << "benchmarks/interactive_stats_session_"
+            << std::put_time(&localTime, "%Y%m%d_%H%M%S")
+            << ".json";
+        return out.str();
+    }();
+    return path;
+}
+
+inline std::string CurrentLocalTimestampString() {
+    std::time_t now = std::time(nullptr);
+    std::tm localTime{};
+    if (localtime_r(&now, &localTime) == nullptr) {
+        return std::string();
+    }
+    std::ostringstream out;
+    out << std::put_time(&localTime, "%Y-%m-%dT%H:%M:%S%z");
+    return out.str();
+}
+
+inline std::string JsonEscape(const std::string& value) {
+    std::ostringstream out;
+    for (const char rawCh : value) {
+        const unsigned char ch = static_cast<unsigned char>(rawCh);
+        switch (ch) {
+            case '\\':
+                out << "\\\\";
+                break;
+            case '"':
+                out << "\\\"";
+                break;
+            case '\b':
+                out << "\\b";
+                break;
+            case '\f':
+                out << "\\f";
+                break;
+            case '\n':
+                out << "\\n";
+                break;
+            case '\r':
+                out << "\\r";
+                break;
+            case '\t':
+                out << "\\t";
+                break;
+            default:
+                if (ch < 0x20) {
+                    out << "\\u"
+                        << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(ch)
+                        << std::dec << std::setfill(' ');
+                } else {
+                    out << static_cast<char>(ch);
+                }
+                break;
+        }
+    }
+    return out.str();
 }
 
 inline bool InteractiveTransportHeavySceneSwitch(const PathTracer::RenderSettings& settings) {
@@ -179,6 +508,36 @@ inline bool InteractiveTransportHeavySceneSwitch(const PathTracer::RenderSetting
            settings.svgfDenoiseEnabled;
 }
 
+inline void PreserveViewportQualityAfterInteractiveSceneLoad(
+    PathTracer::RenderSettings& loadedSettings,
+    const PathTracer::RenderSettings& viewportSettings) {
+    loadedSettings.viewportQualityPreset = viewportSettings.viewportQualityPreset;
+    loadedSettings.viewportQualityPresetOverridden = viewportSettings.viewportQualityPresetOverridden;
+    loadedSettings.samplesPerFrame = viewportSettings.samplesPerFrame;
+    loadedSettings.maxDepth = viewportSettings.maxDepth;
+    loadedSettings.renderScale = viewportSettings.renderScale;
+    // Wavefront forced by the previous scene's source features is not the viewport's own execution mode.
+    loadedSettings.executionMode = viewportSettings.sourceForcedWavefront
+                                       ? PathTracer::RenderSettings::ExecutionMode::Megakernel
+                                       : viewportSettings.executionMode;
+    loadedSettings.sourceForcedWavefront = false;
+    loadedSettings.wavefrontSchedulingPolicy = viewportSettings.wavefrontSchedulingPolicy;
+    loadedSettings.wavefrontCompactionEnabled = viewportSettings.wavefrontCompactionEnabled;
+    loadedSettings.denoiseEnabled = viewportSettings.denoiseEnabled;
+    loadedSettings.denoiseFrequency = viewportSettings.denoiseFrequency;
+    loadedSettings.denoiseFilterType = viewportSettings.denoiseFilterType;
+    loadedSettings.denoiseUseAlbedo = viewportSettings.denoiseUseAlbedo;
+    loadedSettings.denoiseUseNormal = viewportSettings.denoiseUseNormal;
+    loadedSettings.denoiseHdr = viewportSettings.denoiseHdr;
+    loadedSettings.svgfDenoiseEnabled = viewportSettings.svgfDenoiseEnabled;
+    loadedSettings.svgfDenoiseDirect = viewportSettings.svgfDenoiseDirect;
+    loadedSettings.svgfDenoiseIndirect = viewportSettings.svgfDenoiseIndirect;
+    loadedSettings.svgfAtrousIterations = viewportSettings.svgfAtrousIterations;
+    loadedSettings.svgfNormalSigma = viewportSettings.svgfNormalSigma;
+    loadedSettings.svgfAlbedoSigma = viewportSettings.svgfAlbedoSigma;
+    loadedSettings.svgfLuminanceSigma = viewportSettings.svgfLuminanceSigma;
+}
+
 std::string ToLowerAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -191,6 +550,38 @@ bool TextContainsCaseInsensitive(const std::string& text, const char* needle) {
         return false;
     }
     return ToLowerAscii(text).find(ToLowerAscii(needle)) != std::string::npos;
+}
+
+PathTracer::HistoryResetReason HistoryResetReasonForDirtyReason(const std::string& reason) {
+    const std::string lower = ToLowerAscii(reason);
+    if (lower.find("resolution") != std::string::npos ||
+        lower.find("resize") != std::string::npos ||
+        lower.find("render_scale") != std::string::npos ||
+        lower.find("presentation") != std::string::npos) {
+        return PathTracer::HistoryResetReason::ResolutionChanged;
+    }
+    if (lower.find("camera") != std::string::npos) {
+        return PathTracer::HistoryResetReason::CameraCut;
+    }
+    if (lower.find("scene") != std::string::npos ||
+        lower.find("object_transform") != std::string::npos ||
+        lower.find("object_reset") != std::string::npos) {
+        return PathTracer::HistoryResetReason::SceneReloaded;
+    }
+    if (lower.find("material") != std::string::npos ||
+        lower.find("texture") != std::string::npos) {
+        return PathTracer::HistoryResetReason::MaterialTableChanged;
+    }
+    if (lower.find("light") != std::string::npos ||
+        lower.find("environment") != std::string::npos ||
+        lower.find("emissive") != std::string::npos) {
+        return PathTracer::HistoryResetReason::LightTableChanged;
+    }
+    if (lower.find("manual") != std::string::npos ||
+        lower.find("debug") != std::string::npos) {
+        return PathTracer::HistoryResetReason::ManualDebugReset;
+    }
+    return PathTracer::HistoryResetReason::FeatureToggleChanged;
 }
 
 std::string TrimAscii(std::string value) {
@@ -691,21 +1082,22 @@ inline const char* WorkingColorSpaceLabel(const PathTracer::RenderSettings& sett
         : "Linear sRGB";
 }
 
-float CpuGgxG1(float alpha, float cosTheta) {
+// The three Cpu* BRDF helpers are used only by the PT_DEBUG_TOOLS material dump.
+[[maybe_unused]] float CpuGgxG1(float alpha, float cosTheta) {
     float a2 = alpha * alpha;
     float c2 = cosTheta * cosTheta;
     return 2.0f * cosTheta /
            (cosTheta + std::sqrt(std::max(a2 + (1.0f - a2) * c2, 1.0e-6f)));
 }
 
-float CpuGgxDistribution(float alpha, float cosThetaH) {
+[[maybe_unused]] float CpuGgxDistribution(float alpha, float cosThetaH) {
     float a2 = alpha * alpha;
     float c2 = cosThetaH * cosThetaH;
     float denom = c2 * (a2 - 1.0f) + 1.0f;
     return a2 / (static_cast<float>(M_PI) * denom * denom + 1.0e-6f);
 }
 
-simd::float3 CpuSchlickFresnel(const simd::float3& f0, float cosTheta) {
+[[maybe_unused]] simd::float3 CpuSchlickFresnel(const simd::float3& f0, float cosTheta) {
     float m = std::clamp(1.0f - cosTheta, 0.0f, 1.0f);
     float m2 = m * m;
     float weight = m2 * m2 * m;
@@ -794,6 +1186,24 @@ private:
                                 CGSize renderSize,
                                 uint32_t finalSampleCount,
                                 const FrameResult& frameResult);
+    void recordInteractiveStatsSample(CFAbsoluteTime now);
+    void logInteractiveStatsIfNeeded(CFAbsoluteTime now);
+    void resetInteractiveStatsWindow(CFAbsoluteTime now);
+    void writeInteractiveStatsJson();
+    std::string interactiveStatsSegmentKey(const std::string& scene,
+                                           const std::string& backend,
+                                           const std::string& execution,
+                                           const std::string& wavefrontPolicy,
+                                           const std::string& restir,
+                                           const std::string& denoiser,
+                                           const std::string& viewportPreset,
+                                           const std::string& viewportMaturity,
+                                           bool viewportPresetOverridden) const;
+    static const char* executionModeLabel(uint32_t mode);
+    static const char* intersectionModeLabel(uint32_t mode);
+    static const char* wavefrontPolicyLabel(uint32_t policy);
+    const char* denoiserStateLabel() const;
+    std::string restirStateLabel() const;
     void handleCameraInput();
     void rebuildCameraCollisionCacheIfNeeded();
     bool traceCameraCollision(const simd::float3& origin,
@@ -853,6 +1263,14 @@ private:
 
     PathTracer::MetalContext m_context{};
     PathTracer::Pipelines m_pipelines{};
+    // Pipelines compiled with PT_SOURCE_FEATURES=1, built the first time a scene uses source features. The legacy
+    // m_pipelines compile none of that code and stay in use for every other scene.
+    std::unique_ptr<PathTracer::Pipelines> m_sourcePipelines;
+    MTLPixelFormat m_pipelineDisplayFormat = MTLPixelFormatBGRA8Unorm;
+    bool ensureSourcePipelines();
+    const PathTracer::Pipelines& activePipelines() const {
+        return (m_settings.sourceFeatures && m_sourcePipelines) ? *m_sourcePipelines : m_pipelines;
+    }
     PathTracer::Accumulation m_accumulation{};
     PathTracer::SceneResources m_sceneResources{};
     std::unique_ptr<PathTracer::SceneResources> m_loadedSceneResources;
@@ -864,6 +1282,7 @@ private:
     PathTracer::UIOverlay m_overlay{};
     PathTracer::PresentationSettings m_presentationSettings{};
     PathTracer::PerformanceStats m_performanceStats{};
+    bool m_lastCommandBufferCompleted = true;
     uint32_t m_lastDebugLogCount = 0;
     uint32_t m_lastParityLogCount = 0;
     std::string m_activeSceneId{};
@@ -926,12 +1345,70 @@ private:
     CGSize m_drawablePixelSize = CGSizeMake(1.0, 1.0);
     bool m_renderClampWarningLogged = false;
     bool m_renderPixelClampLogged = false;
+    std::string m_lastRenderSizeLog;
     bool m_verboseTiming = false;
     bool m_firstDispatchTimingLogged = false;
     bool m_firstStatsTimingLogged = false;
     bool m_mneeAccountingLogged = false;
     PbrMetricsSnapshot m_pbrMetricsSnapshot{};
+    // Random-walk losses are logged once per accumulation; the counters are cleared with the history.
+    uint64_t m_sssWalkLossLastWalks = 0;
+    bool m_sssWalkLossLogged = false;
     CFAbsoluteTime m_lastCommandBufferFailureLogTime = 0.0;
+    struct InteractiveStatsAggregate {
+        std::string scene;
+        uint64_t frameCount = 0;
+        uint64_t gpuTimedFrameCount = 0;
+        uint64_t rayTimedFrameCount = 0;
+        uint64_t samplesAccumulated = 0;
+        uint32_t lastSampleCount = 0;
+        bool hasLastSampleCount = false;
+        uint32_t lastRenderWidth = 0;
+        uint32_t lastRenderHeight = 0;
+        double lastRenderScale = 1.0;
+        uint32_t lastSamplesPerFrame = 0;
+        uint32_t lastTriangleCount = 0;
+        std::string lastBackend;
+        std::string lastExecution;
+        std::string lastWavefrontPolicy;
+        bool lastWavefrontCompactionEnabled = false;
+        std::string lastRestir;
+        std::string lastDenoiser;
+        std::string lastViewportPreset;
+        std::string lastViewportPresetMaturity;
+        bool lastViewportPresetOverridden = false;
+        double sumAppFrameMs = 0.0;
+        double sumPathGpuMs = 0.0;
+        double sumCpuEncodeMs = 0.0;
+        double sumDrawableWaitMs = 0.0;
+        double sumAppSppPerSec = 0.0;
+        double sumPathSppPerSec = 0.0;
+        double sumRaysPerSec = 0.0;
+        uint64_t sumRaysThisFrame = 0;
+        double minAppFrameMs = std::numeric_limits<double>::infinity();
+        double maxAppFrameMs = 0.0;
+        double minPathGpuMs = std::numeric_limits<double>::infinity();
+        double maxPathGpuMs = 0.0;
+        std::vector<double> appFrameTimesMs;
+        std::vector<double> pathGpuTimesMs;
+    };
+    CFAbsoluteTime m_lastInteractiveStatsLogTime = 0.0;
+    CFAbsoluteTime m_interactiveStatsWindowStartTime = 0.0;
+    CFAbsoluteTime m_lastInteractiveStatsSummaryTime = 0.0;
+    uint32_t m_interactiveStatsWindowStartSample = 0;
+    std::string m_interactiveStatsWindowSceneId;
+    std::vector<double> m_interactiveStatsWindowFrameTimes;
+    std::vector<double> m_interactiveStatsWindowGpuTimes;
+    uint64_t m_interactiveStatsWindowRays = 0;
+    double m_interactiveStatsWindowRaySeconds = 0.0;
+    uint64_t m_interactiveStatsWindowSamples = 0;
+    std::unordered_map<std::string, InteractiveStatsAggregate> m_interactiveStatsBySegment;
+    std::vector<std::string> m_interactiveStatsSegmentOrder;
+    CFAbsoluteTime m_interactiveStatsSessionStartTime = 0.0;
+    CFAbsoluteTime m_interactiveStatsSessionEndTime = 0.0;
+    std::string m_interactiveStatsStartedAt;
+    std::string m_interactiveStatsEndedAt;
+    bool m_interactiveStatsJsonWritten = false;
     std::atomic_bool m_pathTraceFrameInFlight{false};
     std::atomic_bool m_interactiveUiFrameInFlight{false};
     struct CameraCollisionMesh {
@@ -983,6 +1460,9 @@ private:
 
 bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOptions& options) {
     m_options = options;
+    if (!options.headless) {
+        m_settings.applyViewportQualityPreset(RenderSettings::ViewportQualityPreset::Interactive);
+    }
     m_settings.fixedRngSeed = options.fixedRngSeed;
     m_settings.enableSoftwareRayTracing = options.enableSoftwareRayTracing;
     m_verboseTiming = options.headless && options.verbose;
@@ -1088,6 +1568,7 @@ bool MetalRenderer::Impl::initialize(NSWindow* window, const MetalRendererOption
     if (!m_pipelines.initialize(m_context, displayFormat)) {
         return false;
     }
+    m_pipelineDisplayFormat = displayFormat;
 
 #if HAS_IMGUI
     if (!m_options.headless) {
@@ -1247,6 +1728,7 @@ void MetalRenderer::Impl::applyPresentationSettings(bool force) {
         }
 
         if (borderless) {
+            SuspendCenteredWindowTitle(window);
             [window setStyleMask:NSWindowStyleMaskBorderless];
             [window setLevel:NSMainMenuWindowLevel + 1];
             const NSApplicationPresentationOptions options =
@@ -1263,6 +1745,7 @@ void MetalRenderer::Impl::applyPresentationSettings(bool force) {
                                NSWindowStyleMaskResizable;
             }
             [window setStyleMask:restoredMask];
+            ConfigureCenteredWindowTitle(window, m_options.windowTitle);
             [window setLevel:m_presentationRestore.level];
             [NSApp setPresentationOptions:m_presentationRestore.appOptions];
         }
@@ -1338,6 +1821,7 @@ void MetalRenderer::Impl::applyPresentationSettings(bool force) {
     if (m_presentationActive && !settings.enabled) {
         if (m_presentationRestore.valid) {
             [window setStyleMask:m_presentationRestore.styleMask];
+            ConfigureCenteredWindowTitle(window, m_options.windowTitle);
             [window setLevel:m_presentationRestore.level];
             [NSApp setPresentationOptions:m_presentationRestore.appOptions];
             [window setFrame:m_presentationRestore.frame display:YES];
@@ -1466,7 +1950,7 @@ void MetalRenderer::Impl::drawFrame() {
         return;
     }
 
-    if (!m_pipelines.integrate() || !m_pipelines.present()) {
+    if (!m_pipelines.integrateAvailable() || !m_pipelines.present()) {
         return;
     }
 
@@ -1772,7 +2256,15 @@ void MetalRenderer::Impl::drawFrame() {
     serviceAccumulationReset();
 
     renderSize = targetRenderSize();
-    m_accumulation.ensureTextures(renderSize);
+    {
+        PathTracer::RenderPassGraphDesc allocationGraph =
+            PathTracer::BuildRenderPassGraph(m_settings,
+                                             m_accumulation.needsClear(),
+                                             activeSceneResources().isDirty(),
+                                             false,
+                                             true);
+        m_accumulation.ensureTextures(renderSize, allocationGraph);
+    }
 
     m_performanceStats.renderWidth = static_cast<uint32_t>(std::max<CGFloat>(renderSize.width, 0.0f));
     m_performanceStats.renderHeight = static_cast<uint32_t>(std::max<CGFloat>(renderSize.height, 0.0f));
@@ -1798,7 +2290,7 @@ void MetalRenderer::Impl::drawFrame() {
                                             renderPassDescriptor,
                                             drawable,
                                             m_accumulation,
-                                            m_pipelines,
+                                            activePipelines(),
                                             m_overlay,
                                             m_settings);
         if (drawable) {
@@ -1824,6 +2316,15 @@ void MetalRenderer::Impl::drawFrame() {
         (m_lastFrameTimeMs > 0.0) ? static_cast<float>(m_lastFrameTimeMs * 0.001) : (1.0f / 60.0f);
     updateCameraSmoothing(deltaSeconds);
 
+    std::string sourceDiagnostic;
+    PathTracer::ResolveSourceCapabilities(activeSceneResources(), m_settings, false, false, sourceDiagnostic);
+    if (!sourceDiagnostic.empty()) std::cerr << "[Source capabilities] " << sourceDiagnostic << std::endl;
+    // Legacy scenes keep the pipelines that compile no source code; a scene with source features switches to the
+    // source pipelines (built on first use) and back when a legacy scene is loaded again.
+    if (m_settings.sourceFeatures && !ensureSourcePipelines()) {
+        std::cerr << "[Pipelines] Failed to build the source-feature pipelines; frame skipped" << std::endl;
+        return;
+    }
     RenderSettings frameSettings = m_settings;
     frameSettings.cameraYaw = m_smoothYaw;
     frameSettings.cameraPitch = m_smoothPitch;
@@ -1851,7 +2352,7 @@ void MetalRenderer::Impl::drawFrame() {
         drawable,
         m_context,
         m_accumulation,
-        m_pipelines,
+        activePipelines(),
         activeSceneResources(),
         m_overlay,
         frameSettings);
@@ -1897,6 +2398,9 @@ void MetalRenderer::Impl::drawFrame() {
 
     if (!m_options.headless && drawable) {
         [commandBuffer presentDrawable:drawable];
+        // The integrate pipelines are built on first use. With a frame on screen, build the others in the
+        // background, so an executor or feature switch does not stall on a cold compile (starts once).
+        activePipelines().buildIntegrateVariantsInBackground();
     }
 
     if (logAllocatedSizeThisDispatch) {
@@ -1926,6 +2430,8 @@ void MetalRenderer::Impl::drawFrame() {
         CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
         [commandBuffer waitUntilCompleted];
         CFAbsoluteTime waitEnd = CFAbsoluteTimeGetCurrent();
+        m_lastCommandBufferCompleted =
+            (commandBuffer.status == MTLCommandBufferStatusCompleted);
         if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
             NSError* commandError = commandBuffer.error;
             if (commandError) {
@@ -1985,8 +2491,17 @@ CGSize MetalRenderer::Impl::targetRenderSize() {
     }
 #endif
 
-    CGFloat baseWidth = clampDimension(m_settings.renderWidth, fallbackWidth);
-    CGFloat baseHeight = clampDimension(m_settings.renderHeight, fallbackHeight);
+    // In the window the drawable is the base size for every scene, and the viewport quality scale multiplies it.
+    // A scene's renderer width/height is its headless output size: in the window the camera keeps the vertical
+    // field of view, so the window's aspect shows more of the scene sideways instead of stretching it. Headless
+    // runs and a locked presentation resolution keep the size they were given.
+    const bool explicitRenderSize = m_options.headless || m_presentationRenderLockApplied;
+    CGFloat baseWidth = fallbackWidth;
+    CGFloat baseHeight = fallbackHeight;
+    if (explicitRenderSize) {
+        baseWidth = clampDimension(m_settings.renderWidth, fallbackWidth);
+        baseHeight = clampDimension(m_settings.renderHeight, fallbackHeight);
+    }
 
 #if DEBUG_FIXED_RENDER_RESOLUTION
     baseWidth = clampDimension(static_cast<uint32_t>(kDebugRenderWidth), baseWidth);
@@ -2043,6 +2558,38 @@ CGSize MetalRenderer::Impl::targetRenderSize() {
     const float heightScale =
         baseHeight > 0.0f ? static_cast<float>(scaledHeight / baseHeight) : appliedScale;
     appliedScale = std::max(widthScale, heightScale);
+
+    if (!m_options.headless) {
+        // Log each change of the window's render size and what set its base. A scene's renderer width/height is
+        // named when the window does not use it, so the log shows it is only the headless size.
+#if DEBUG_FIXED_RENDER_RESOLUTION
+        const char* baseSource = "debug fixed size";
+#else
+        const char* baseSource = m_presentationRenderLockApplied ? "presentation lock" : "drawable";
+#endif
+        char line[256];
+        const int length = std::snprintf(line,
+                                         sizeof(line),
+                                         "[RenderSize] %.0f x %.0f = base %.0f x %.0f (%s) x scale %.3f",
+                                         static_cast<double>(scaledWidth),
+                                         static_cast<double>(scaledHeight),
+                                         static_cast<double>(baseWidth),
+                                         static_cast<double>(baseHeight),
+                                         baseSource,
+                                         static_cast<double>(appliedScale));
+        if (!explicitRenderSize && m_settings.renderWidth >= 8u && m_settings.renderHeight >= 8u &&
+            length > 0 && static_cast<size_t>(length) < sizeof(line)) {
+            std::snprintf(line + length,
+                          sizeof(line) - static_cast<size_t>(length),
+                          "; scene renderer %u x %u is its headless size",
+                          m_settings.renderWidth,
+                          m_settings.renderHeight);
+        }
+        if (m_lastRenderSizeLog != line) {
+            m_lastRenderSizeLog = line;
+            NSLog(@"%s", line);
+        }
+    }
 
     m_currentRenderScale = appliedScale;
     m_settings.renderScale = requestedScale;
@@ -2149,6 +2696,7 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
         frameResult.restirDiDebugAovDispatchCount;
     m_performanceStats.restirDiHardwareTraceActive =
         m_renderLoop.restirDiHardwareTraceActive();
+    m_performanceStats.restirDiPathStatus = m_renderLoop.restirDiPathStatus();
     m_performanceStats.integrationDispatchCount = frameResult.integrationDispatchCount;
     m_performanceStats.presentationDispatchCount = frameResult.presentationDispatchCount;
     m_performanceStats.wavefrontResetDispatchCount = frameResult.wavefrontResetDispatchCount;
@@ -2176,6 +2724,12 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
     m_performanceStats.transportMemoryBytesShared = m_renderLoop.transportMemoryBytesShared();
     m_performanceStats.transportMemoryBytesStaging = m_renderLoop.transportMemoryBytesStaging();
     m_performanceStats.transportMemoryRecordCount = m_renderLoop.transportMemoryRecordCount();
+    m_performanceStats.transportMemoryAllocatorBackedRecordCount =
+        m_renderLoop.transportMemoryAllocatorBackedRecordCount();
+    m_performanceStats.transportMemoryFrameGraphBackedRecordCount =
+        m_renderLoop.transportMemoryFrameGraphBackedRecordCount();
+    m_performanceStats.transportMemoryOwnershipGapRecordCount =
+        m_renderLoop.transportMemoryOwnershipGapRecordCount();
     m_performanceStats.transportMemoryInvalidatedRecordCount =
         m_renderLoop.transportMemoryInvalidatedRecordCount();
     m_performanceStats.transportMemoryLastInvalidationReason =
@@ -2274,6 +2828,12 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
             m_performanceStats.mneeContributionLumaSumFixed = mneeLumaSumFixed;
             m_performanceStats.hardwareSelfHitRejectedCount =
                 static_cast<uint64_t>(stats->hardwareSelfHitRejectedCount);
+            if (stats->defaultFeatureGateViolationCount != 0u) {
+                NSLog(@"[Megakernel] ERROR: the default-features pipeline ran %u dispatch(es) with a "
+                      "research or debug gate on. UniformBuilder::usesOnlyDefaultFeatures and "
+                      "default_feature_gates_off() in shaders/common.metal have drifted apart.",
+                      static_cast<unsigned>(stats->defaultFeatureGateViolationCount));
+            }
             for (int i = 0; i < 32; ++i) {
                 m_performanceStats.hardwareMissDistanceBins[i] =
                     static_cast<uint64_t>(stats->hardwareMissDistanceBins[i]);
@@ -2304,6 +2864,12 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->radianceNanInfCount);
             m_performanceStats.clampEventCount =
                 static_cast<uint64_t>(stats->clampEventCount);
+            m_performanceStats.restirDiRegirCandidateCount =
+                static_cast<uint64_t>(stats->restirDiRegirCandidateCount);
+            m_performanceStats.restirDiRegirAcceptedCount =
+                static_cast<uint64_t>(stats->restirDiRegirAcceptedCount);
+            m_performanceStats.restirDiRegirFallbackCount =
+                static_cast<uint64_t>(stats->restirDiRegirFallbackCount);
             m_performanceStats.restirGiCandidateCount =
                 static_cast<uint64_t>(stats->restirGiCandidateCount);
             m_performanceStats.restirGiReservoirUpdateCount =
@@ -2340,6 +2906,50 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->restirPtReuseRejectedInvalidCount);
             m_performanceStats.restirPtReuseFallbackCount =
                 static_cast<uint64_t>(stats->restirPtReuseFallbackCount);
+            m_performanceStats.restirPtEnhancedCandidateCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedCandidateCount);
+            m_performanceStats.restirPtEnhancedInitialSelectedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInitialSelectedCount);
+            m_performanceStats.restirPtEnhancedTemporalAcceptedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedTemporalAcceptedCount);
+            m_performanceStats.restirPtEnhancedTemporalRejectedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedTemporalRejectedCount);
+            m_performanceStats.restirPtEnhancedSpatialAcceptedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedSpatialAcceptedCount);
+            m_performanceStats.restirPtEnhancedSpatialRejectedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedSpatialRejectedCount);
+            m_performanceStats.restirPtEnhancedInvalidShiftGeometryCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftGeometryCount);
+            m_performanceStats.restirPtEnhancedInvalidShiftMaterialCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftMaterialCount);
+            m_performanceStats.restirPtEnhancedInvalidShiftPdfCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftPdfCount);
+            m_performanceStats.restirPtEnhancedInvalidShiftVisibilityCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftVisibilityCount);
+            m_performanceStats.restirPtEnhancedInvalidShiftInvertibilityCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftInvertibilityCount);
+            m_performanceStats.restirPtEnhancedInvalidShiftUnsupportedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftUnsupportedCount);
+            m_performanceStats.restirPtEnhancedDuplicateScoreSum =
+                static_cast<uint64_t>(stats->restirPtEnhancedDuplicateScoreSum);
+            m_performanceStats.restirPtEnhancedBiasedCCapApplicationCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedBiasedCCapApplicationCount);
+            m_performanceStats.restirPtEnhancedVectorWeightUseCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedVectorWeightUseCount);
+            m_performanceStats.restirPtEnhancedReplayCompactionInputCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedReplayCompactionInputCount);
+            m_performanceStats.restirPtEnhancedReplayCompactionOutputCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedReplayCompactionOutputCount);
+            m_performanceStats.restirPtEnhancedFallbackCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedFallbackCount);
+            m_performanceStats.restirPtEnhancedCanonicalSampleCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedCanonicalSampleCount);
+            for (uint32_t i = 0u; i < PathTracerShaderTypes::kRestirPathReservoirDepthCount; ++i) {
+                m_performanceStats.restirPtEnhancedPathLengthHistogram[i] =
+                    static_cast<uint64_t>(stats->restirPtEnhancedPathLengthHistogram[i]);
+                m_performanceStats.restirPtEnhancedReconnectionDepthHistogram[i] =
+                    static_cast<uint64_t>(stats->restirPtEnhancedReconnectionDepthHistogram[i]);
+            }
             m_performanceStats.radianceCacheQueryCount =
                 static_cast<uint64_t>(stats->radianceCacheQueryCount);
             m_performanceStats.radianceCacheHitCount =
@@ -2461,6 +3071,38 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                           stats->hardwareShadowNearForeignHitCount);
                 }
             }
+            {
+                // Random walks that ended with no light (step limit or a mesh that is not closed), per material.
+                namespace st = PathTracerShaderTypes;
+                const auto& sssScene = activeSceneResources();
+                const uint32_t materialCount = std::min(sssScene.materialCount(), st::kMaxMaterials);
+                auto count = [stats](uint32_t m, uint32_t i) {
+                    const auto& counter = stats->sssWalkStats[m * st::kSssWalkStatCount + i];
+                    return (static_cast<uint64_t>(counter.hi) << 32u) | static_cast<uint64_t>(counter.lo);
+                };
+                uint64_t walks = 0u;
+                uint64_t losses = 0u;
+                for (uint32_t m = 0u; m < materialCount; ++m) {
+                    walks += count(m, st::kSssWalkStatWalks);
+                    losses += count(m, st::kSssWalkStatOpenMesh) + count(m, st::kSssWalkStatStepLimit);
+                }
+                if (walks < m_sssWalkLossLastWalks) {
+                    m_sssWalkLossLogged = false;
+                }
+                m_sssWalkLossLastWalks = walks;
+                if (!m_sssWalkLossLogged && losses > 0u) {
+                    m_sssWalkLossLogged = true;
+                    for (uint32_t m = 0u; m < materialCount; ++m) {
+                        const std::string line = PathTracer::SubsurfaceWalkLossDiagnostic(
+                            sssScene.materialName(m), count(m, st::kSssWalkStatWalks),
+                            count(m, st::kSssWalkStatOpenMesh), count(m, st::kSssWalkStatStepLimit),
+                            m_settings.sssMaxSteps);
+                        if (!line.empty()) {
+                            NSLog(@"[SSS] %s", line.c_str());
+                        }
+                    }
+                }
+            }
             m_pbrMetricsSnapshot.available = true;
             m_pbrMetricsSnapshot.throughputNanInfCount =
                 static_cast<uint64_t>(stats->throughputNanInfCount);
@@ -2492,6 +3134,12 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->mneeRectAddedCount);
             m_pbrMetricsSnapshot.mneeContributionCount =
                 static_cast<uint64_t>(stats->mneeContributionCount);
+            m_pbrMetricsSnapshot.restirDiRegirCandidateCount =
+                static_cast<uint64_t>(stats->restirDiRegirCandidateCount);
+            m_pbrMetricsSnapshot.restirDiRegirAcceptedCount =
+                static_cast<uint64_t>(stats->restirDiRegirAcceptedCount);
+            m_pbrMetricsSnapshot.restirDiRegirFallbackCount =
+                static_cast<uint64_t>(stats->restirDiRegirFallbackCount);
             m_pbrMetricsSnapshot.restirGiCandidateCount =
                 static_cast<uint64_t>(stats->restirGiCandidateCount);
             m_pbrMetricsSnapshot.restirGiReservoirUpdateCount =
@@ -2528,6 +3176,50 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->restirPtReuseRejectedInvalidCount);
             m_pbrMetricsSnapshot.restirPtReuseFallbackCount =
                 static_cast<uint64_t>(stats->restirPtReuseFallbackCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedCandidateCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedCandidateCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInitialSelectedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInitialSelectedCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedTemporalAcceptedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedTemporalAcceptedCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedTemporalRejectedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedTemporalRejectedCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedSpatialAcceptedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedSpatialAcceptedCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedSpatialRejectedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedSpatialRejectedCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInvalidShiftGeometryCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftGeometryCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInvalidShiftMaterialCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftMaterialCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInvalidShiftPdfCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftPdfCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInvalidShiftVisibilityCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftVisibilityCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInvalidShiftInvertibilityCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftInvertibilityCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedInvalidShiftUnsupportedCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedInvalidShiftUnsupportedCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedDuplicateScoreSum =
+                static_cast<uint64_t>(stats->restirPtEnhancedDuplicateScoreSum);
+            m_pbrMetricsSnapshot.restirPtEnhancedBiasedCCapApplicationCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedBiasedCCapApplicationCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedVectorWeightUseCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedVectorWeightUseCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedReplayCompactionInputCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedReplayCompactionInputCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedReplayCompactionOutputCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedReplayCompactionOutputCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedFallbackCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedFallbackCount);
+            m_pbrMetricsSnapshot.restirPtEnhancedCanonicalSampleCount =
+                static_cast<uint64_t>(stats->restirPtEnhancedCanonicalSampleCount);
+            for (uint32_t i = 0u; i < PathTracerShaderTypes::kRestirPathReservoirDepthCount; ++i) {
+                m_pbrMetricsSnapshot.restirPtEnhancedPathLengthHistogram[i] =
+                    static_cast<uint64_t>(stats->restirPtEnhancedPathLengthHistogram[i]);
+                m_pbrMetricsSnapshot.restirPtEnhancedReconnectionDepthHistogram[i] =
+                    static_cast<uint64_t>(stats->restirPtEnhancedReconnectionDepthHistogram[i]);
+            }
             m_pbrMetricsSnapshot.radianceCacheQueryCount =
                 static_cast<uint64_t>(stats->radianceCacheQueryCount);
             m_pbrMetricsSnapshot.radianceCacheHitCount =
@@ -2540,6 +3232,14 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->radianceCacheFallbackCount);
             m_pbrMetricsSnapshot.radianceCacheInvalidCount =
                 static_cast<uint64_t>(stats->radianceCacheInvalidCount);
+            static_assert(PathTracerShaderTypes::kRadianceCacheStatCount ==
+                              PathTracer::RadianceCacheTraining::kStatCount,
+                          "radiance cache stat layout mismatch");
+            for (uint32_t i = 0u; i < PathTracer::RadianceCacheTraining::kStatCount; ++i) {
+                m_pbrMetricsSnapshot.radianceCacheStats[i] =
+                    (static_cast<uint64_t>(stats->radianceCacheStats[i].hi) << 32u) |
+                    static_cast<uint64_t>(stats->radianceCacheStats[i].lo);
+            }
             m_pbrMetricsSnapshot.causticEyeVertexCount =
                 static_cast<uint64_t>(stats->causticEyeVertexCount);
             m_pbrMetricsSnapshot.causticLightVertexCount =
@@ -2570,6 +3270,10 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
                 static_cast<uint64_t>(stats->spectralDispersionEventCount);
             m_pbrMetricsSnapshot.spectralFallbackCount =
                 static_cast<uint64_t>(stats->spectralFallbackCount);
+            m_pbrMetricsSnapshot.spectralCollapseCount =
+                static_cast<uint64_t>(stats->spectralCollapseCount);
+            m_pbrMetricsSnapshot.spectralWavelengthChannelSampleCount =
+                static_cast<uint64_t>(stats->spectralWavelengthChannelSampleCount);
             m_pbrMetricsSnapshot.maxThroughputByBounce.clear();
             m_performanceStats.hardwareLastResultType = stats->hardwareLastResultType;
             m_performanceStats.hardwareLastInstanceId = stats->hardwareLastInstanceId;
@@ -3246,6 +3950,607 @@ void MetalRenderer::Impl::updatePerformanceStats(MTLCommandBufferHandle commandB
         NSLog(@"[Timing] StatsReadbackMs=%.2f", statsMs);
         m_firstStatsTimingLogged = true;
     }
+
+    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    recordInteractiveStatsSample(now);
+    logInteractiveStatsIfNeeded(now);
+}
+
+const char* MetalRenderer::Impl::executionModeLabel(uint32_t mode) {
+    switch (static_cast<PathTracer::RenderSettings::ExecutionMode>(mode)) {
+        case PathTracer::RenderSettings::ExecutionMode::Megakernel:
+            return "Megakernel";
+        case PathTracer::RenderSettings::ExecutionMode::Wavefront:
+            return "Wavefront";
+    }
+    return "Unknown";
+}
+
+const char* MetalRenderer::Impl::intersectionModeLabel(uint32_t mode) {
+    switch (static_cast<PathTracerShaderTypes::IntersectionMode>(mode)) {
+        case PathTracerShaderTypes::IntersectionMode::SoftwareBVH:
+            return "Metal-SWRT";
+        case PathTracerShaderTypes::IntersectionMode::HardwareRayTracing:
+            return "Metal-HWRT";
+    }
+    return "Metal-Unknown";
+}
+
+const char* MetalRenderer::Impl::wavefrontPolicyLabel(uint32_t policy) {
+    switch (static_cast<PathTracer::RenderSettings::WavefrontSchedulingPolicy>(policy)) {
+        case PathTracer::RenderSettings::WavefrontSchedulingPolicy::Preview:
+            return "Preview";
+        case PathTracer::RenderSettings::WavefrontSchedulingPolicy::Final:
+            return "Final";
+        case PathTracer::RenderSettings::WavefrontSchedulingPolicy::Offline:
+            return "Offline";
+        case PathTracer::RenderSettings::WavefrontSchedulingPolicy::Research:
+            return "Research";
+    }
+    return "Unknown";
+}
+
+const char* MetalRenderer::Impl::denoiserStateLabel() const {
+    if (m_settings.denoiseEnabled && m_settings.svgfDenoiseEnabled) {
+        return "OIDN+SVGF";
+    }
+    if (m_settings.denoiseEnabled) {
+        return "OIDN";
+    }
+    if (m_settings.svgfDenoiseEnabled) {
+        return "SVGF";
+    }
+    return "off";
+}
+
+std::string MetalRenderer::Impl::restirStateLabel() const {
+    std::ostringstream out;
+    const bool restirDi =
+        m_settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDi ||
+        m_settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+    out << "di=" << (restirDi ? "on" : "off");
+    if (m_settings.directLightMode == PathTracer::RenderSettings::DirectLightMode::RestirDiRegirHybrid) {
+        out << "+regir";
+    }
+    out << ",restir_di_path=" << m_renderLoop.restirDiPathStatus();
+    out << ",explicitDIRequested=" << (InteractiveExplicitRestirDiEnabled() ? "on" : "off");
+    out << ",gi="
+        << (m_settings.restirGiMode == PathTracer::RenderSettings::RestirGiMode::Off ? "off" : "on");
+    out << ",pt="
+        << (m_settings.restirPtMode == PathTracer::RenderSettings::RestirPtMode::Off ? "off" : "on");
+    return out.str();
+}
+
+std::string MetalRenderer::Impl::interactiveStatsSegmentKey(
+    const std::string& scene,
+    const std::string& backend,
+    const std::string& execution,
+    const std::string& wavefrontPolicy,
+    const std::string& restir,
+    const std::string& denoiser,
+    const std::string& viewportPreset,
+    const std::string& viewportMaturity,
+    bool viewportPresetOverridden) const {
+    std::ostringstream key;
+    key << scene
+        << "|res=" << m_performanceStats.renderWidth << "x" << m_performanceStats.renderHeight
+        << "|scale=" << std::fixed << std::setprecision(3) << m_performanceStats.renderScale
+        << "|viewportPreset=" << viewportPreset
+        << "|viewportMaturity=" << viewportMaturity
+        << "|viewportOverride=" << (viewportPresetOverridden ? "custom" : "no")
+        << "|backend=" << backend
+        << "|execution=" << execution
+        << "|wavefront=" << wavefrontPolicy
+        << "|compaction=" << (m_performanceStats.wavefrontCompactionEnabled ? "on" : "off")
+        << "|restir=" << restir
+        << "|denoiser=" << denoiser
+        << "|samplesPerFrame=" << m_performanceStats.activeSamplesPerFrame;
+    return key.str();
+}
+
+void MetalRenderer::Impl::resetInteractiveStatsWindow(CFAbsoluteTime now) {
+    m_interactiveStatsWindowStartTime = now;
+    m_lastInteractiveStatsSummaryTime = now;
+    m_interactiveStatsWindowStartSample = m_performanceStats.sampleCount;
+    m_interactiveStatsWindowSceneId = m_activeSceneId;
+    m_interactiveStatsWindowFrameTimes.clear();
+    m_interactiveStatsWindowGpuTimes.clear();
+    m_interactiveStatsWindowRays = 0;
+    m_interactiveStatsWindowRaySeconds = 0.0;
+    m_interactiveStatsWindowSamples = 0;
+}
+
+void MetalRenderer::Impl::recordInteractiveStatsSample(CFAbsoluteTime now) {
+    if (m_options.headless || !InteractiveStatsEnabled()) {
+        return;
+    }
+
+    if (m_interactiveStatsSessionStartTime <= 0.0) {
+        m_interactiveStatsSessionStartTime = now;
+        m_interactiveStatsStartedAt = CurrentLocalTimestampString();
+    }
+    m_interactiveStatsSessionEndTime = now;
+
+    if (m_interactiveStatsWindowStartTime <= 0.0 ||
+        m_interactiveStatsWindowSceneId != m_activeSceneId ||
+        m_performanceStats.sampleCount < m_interactiveStatsWindowStartSample) {
+        resetInteractiveStatsWindow(now);
+    }
+
+    const std::string scene = m_activeSceneId.empty() ? "procedural" : m_activeSceneId;
+    const std::string restir = restirStateLabel();
+    const std::string backend = intersectionModeLabel(m_performanceStats.intersectionMode);
+    const std::string execution = executionModeLabel(m_performanceStats.renderExecutionMode);
+    const std::string wavefrontPolicy =
+        wavefrontPolicyLabel(m_performanceStats.wavefrontSchedulingPolicy);
+    const std::string denoiser = denoiserStateLabel();
+    const std::string viewportPreset =
+        ViewportQualityPresetName(m_settings.viewportQualityPreset);
+    const std::string viewportMaturity =
+        ViewportQualityPresetMaturity(m_settings.viewportQualityPreset);
+    const std::string segmentKey =
+        interactiveStatsSegmentKey(scene,
+                                   backend,
+                                   execution,
+                                   wavefrontPolicy,
+                                   restir,
+                                   denoiser,
+                                   viewportPreset,
+                                   viewportMaturity,
+                                   m_settings.viewportQualityPresetOverridden);
+    const bool rayCountersAvailable = m_performanceStats.tracedRayCount > 0u;
+    const bool gpuTimingAvailable = m_performanceStats.gpuTimeMs > 0.0;
+    const double pathGpuSeconds = gpuTimingAvailable ? (m_performanceStats.gpuTimeMs / 1000.0) : 0.0;
+    const double appSppPerSecond = m_performanceStats.samplesPerMinute / 60.0;
+    const double pathSppPerSecond =
+        pathGpuSeconds > 0.0
+            ? static_cast<double>(std::max<uint32_t>(m_performanceStats.activeSamplesPerFrame, 1u)) /
+                  pathGpuSeconds
+            : 0.0;
+    const double raysPerSecond =
+        (rayCountersAvailable && pathGpuSeconds > 0.0)
+            ? static_cast<double>(m_performanceStats.tracedRayCount) / pathGpuSeconds
+            : 0.0;
+    const uint32_t sampleDelta =
+        (m_performanceStats.sampleCount >= m_interactiveStatsWindowStartSample)
+            ? (m_performanceStats.sampleCount - m_interactiveStatsWindowStartSample)
+            : 0u;
+
+    m_interactiveStatsWindowFrameTimes.push_back(m_performanceStats.frameTimeMs);
+    if (gpuTimingAvailable) {
+        m_interactiveStatsWindowGpuTimes.push_back(m_performanceStats.gpuTimeMs);
+    }
+    if (rayCountersAvailable && pathGpuSeconds > 0.0) {
+        m_interactiveStatsWindowRays += m_performanceStats.tracedRayCount;
+        m_interactiveStatsWindowRaySeconds += pathGpuSeconds;
+    }
+    m_interactiveStatsWindowSamples = sampleDelta;
+
+    auto [it, inserted] = m_interactiveStatsBySegment.try_emplace(segmentKey);
+    InteractiveStatsAggregate& aggregate = it->second;
+    if (inserted) {
+        aggregate.scene = scene;
+        m_interactiveStatsSegmentOrder.push_back(segmentKey);
+    }
+    aggregate.frameCount += 1u;
+    aggregate.lastRenderWidth = m_performanceStats.renderWidth;
+    aggregate.lastRenderHeight = m_performanceStats.renderHeight;
+    aggregate.lastRenderScale = m_performanceStats.renderScale;
+    aggregate.lastSamplesPerFrame = m_performanceStats.activeSamplesPerFrame;
+    aggregate.lastTriangleCount = m_performanceStats.triangleCount;
+    aggregate.lastBackend = backend;
+    aggregate.lastExecution = execution;
+    aggregate.lastWavefrontPolicy = wavefrontPolicy;
+    aggregate.lastWavefrontCompactionEnabled = m_performanceStats.wavefrontCompactionEnabled;
+    aggregate.lastRestir = restir;
+    aggregate.lastDenoiser = denoiser;
+    aggregate.lastViewportPreset = viewportPreset;
+    aggregate.lastViewportPresetMaturity = viewportMaturity;
+    aggregate.lastViewportPresetOverridden = m_settings.viewportQualityPresetOverridden;
+    aggregate.sumAppFrameMs += m_performanceStats.frameTimeMs;
+    aggregate.sumCpuEncodeMs += m_performanceStats.cpuEncodeMs;
+    aggregate.sumDrawableWaitMs += m_performanceStats.drawableWaitMs;
+    aggregate.sumAppSppPerSec += appSppPerSecond;
+    aggregate.minAppFrameMs = std::min(aggregate.minAppFrameMs, m_performanceStats.frameTimeMs);
+    aggregate.maxAppFrameMs = std::max(aggregate.maxAppFrameMs, m_performanceStats.frameTimeMs);
+    aggregate.appFrameTimesMs.push_back(m_performanceStats.frameTimeMs);
+    if (aggregate.hasLastSampleCount) {
+        if (m_performanceStats.sampleCount >= aggregate.lastSampleCount) {
+            aggregate.samplesAccumulated +=
+                static_cast<uint64_t>(m_performanceStats.sampleCount - aggregate.lastSampleCount);
+        }
+    }
+    aggregate.lastSampleCount = m_performanceStats.sampleCount;
+    aggregate.hasLastSampleCount = true;
+    if (gpuTimingAvailable) {
+        aggregate.gpuTimedFrameCount += 1u;
+        aggregate.sumPathGpuMs += m_performanceStats.gpuTimeMs;
+        aggregate.sumPathSppPerSec += pathSppPerSecond;
+        aggregate.minPathGpuMs = std::min(aggregate.minPathGpuMs, m_performanceStats.gpuTimeMs);
+        aggregate.maxPathGpuMs = std::max(aggregate.maxPathGpuMs, m_performanceStats.gpuTimeMs);
+        aggregate.pathGpuTimesMs.push_back(m_performanceStats.gpuTimeMs);
+    }
+    if (rayCountersAvailable && pathGpuSeconds > 0.0) {
+        aggregate.rayTimedFrameCount += 1u;
+        aggregate.sumRaysPerSec += raysPerSecond;
+        aggregate.sumRaysThisFrame += m_performanceStats.tracedRayCount;
+    }
+}
+
+void MetalRenderer::Impl::logInteractiveStatsIfNeeded(CFAbsoluteTime now) {
+    if (m_options.headless || !InteractiveStatsEnabled()) {
+        return;
+    }
+
+    const double interval = InteractiveStatsIntervalSeconds();
+    if (m_lastInteractiveStatsLogTime > 0.0 &&
+        (now - m_lastInteractiveStatsLogTime) < interval) {
+        return;
+    }
+
+    const double appFps =
+        m_performanceStats.frameTimeMs > 0.0 ? 1000.0 / m_performanceStats.frameTimeMs : 0.0;
+    const double appSppPerSecond = m_performanceStats.samplesPerMinute / 60.0;
+    const bool rayCountersAvailable = m_performanceStats.tracedRayCount > 0u;
+    const bool gpuTimingAvailable = m_performanceStats.gpuTimeMs > 0.0;
+    const double pathGpuSeconds = gpuTimingAvailable ? (m_performanceStats.gpuTimeMs / 1000.0) : 0.0;
+    const double pathSppPerSecond =
+        pathGpuSeconds > 0.0
+            ? static_cast<double>(std::max<uint32_t>(m_performanceStats.activeSamplesPerFrame, 1u)) /
+                  pathGpuSeconds
+            : 0.0;
+    const double raysPerSecond =
+        (rayCountersAvailable && pathGpuSeconds > 0.0)
+            ? static_cast<double>(m_performanceStats.tracedRayCount) / pathGpuSeconds
+            : 0.0;
+    const std::string scene = m_activeSceneId.empty() ? "procedural" : m_activeSceneId;
+    const std::string restir = restirStateLabel();
+    const std::string viewportPreset =
+        ViewportQualityPresetName(m_settings.viewportQualityPreset);
+    const std::string viewportMaturity =
+        ViewportQualityPresetMaturity(m_settings.viewportQualityPreset);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "[InteractiveStats]"
+              << " scene=\"" << scene << "\""
+              << " resolution=" << m_performanceStats.renderWidth << "x" << m_performanceStats.renderHeight
+              << " scale=" << std::setprecision(2) << m_performanceStats.renderScale
+              << " viewportPreset=" << viewportPreset
+              << " viewportMaturity=" << viewportMaturity
+              << " viewportOverride=" << (m_settings.viewportQualityPresetOverridden ? "custom" : "no")
+              << " backend=" << intersectionModeLabel(m_performanceStats.intersectionMode)
+              << " execution=" << executionModeLabel(m_performanceStats.renderExecutionMode)
+              << " wavefrontPolicy=" << wavefrontPolicyLabel(m_performanceStats.wavefrontSchedulingPolicy)
+              << " wavefrontCompaction=" << (m_performanceStats.wavefrontCompactionEnabled ? "on" : "off")
+              << " restir=\"" << restir << "\""
+              << " appFrameMs=" << std::setprecision(3) << m_performanceStats.frameTimeMs
+              << " appFps=" << std::setprecision(1) << appFps
+              << " spp=" << m_performanceStats.sampleCount
+              << " samplesPerFrame=" << m_performanceStats.activeSamplesPerFrame
+              << " appSppPerMin=" << std::setprecision(1) << m_performanceStats.samplesPerMinute
+              << " appSppPerSec=" << std::setprecision(1) << appSppPerSecond
+              << " pathSppPerSec=";
+    if (gpuTimingAvailable) {
+        std::cout << std::setprecision(1) << pathSppPerSecond;
+    } else {
+        std::cout << "unavailable";
+    }
+    std::cout
+              << " triangles=" << m_performanceStats.triangleCount
+              << " pathGpuMs=";
+    if (gpuTimingAvailable) {
+        std::cout << std::setprecision(3) << m_performanceStats.gpuTimeMs;
+    } else {
+        std::cout << "unavailable";
+    }
+    std::cout << " cpuEncodeMs=" << std::setprecision(3) << m_performanceStats.cpuEncodeMs
+              << " drawableWaitMs=" << m_performanceStats.drawableWaitMs
+              << " raysThisFrame=";
+    if (rayCountersAvailable) {
+        std::cout << m_performanceStats.tracedRayCount
+                  << " raysPerSec=" << static_cast<uint64_t>(raysPerSecond + 0.5);
+    } else {
+        std::cout << "unavailable raysPerSec=unavailable";
+    }
+    std::cout << " denoiser=" << denoiserStateLabel() << std::endl;
+
+    m_lastInteractiveStatsLogTime = now;
+
+    const double summaryInterval = InteractiveStatsSummaryIntervalSeconds();
+    if (summaryInterval <= 0.0 ||
+        (now - m_lastInteractiveStatsSummaryTime) < summaryInterval ||
+        m_interactiveStatsWindowFrameTimes.empty()) {
+        return;
+    }
+
+    std::vector<double> sortedFrameTimes = m_interactiveStatsWindowFrameTimes;
+    std::sort(sortedFrameTimes.begin(), sortedFrameTimes.end());
+    const double meanFrameMs =
+        std::accumulate(sortedFrameTimes.begin(), sortedFrameTimes.end(), 0.0) /
+        static_cast<double>(sortedFrameTimes.size());
+    double meanPathGpuMs = 0.0;
+    if (!m_interactiveStatsWindowGpuTimes.empty()) {
+        meanPathGpuMs =
+            std::accumulate(m_interactiveStatsWindowGpuTimes.begin(),
+                            m_interactiveStatsWindowGpuTimes.end(),
+                            0.0) /
+            static_cast<double>(m_interactiveStatsWindowGpuTimes.size());
+    }
+    const auto percentile = [&sortedFrameTimes](double p) -> double {
+        if (sortedFrameTimes.empty()) {
+            return 0.0;
+        }
+        const double pos = std::clamp(p, 0.0, 1.0) *
+                           static_cast<double>(sortedFrameTimes.size() - 1u);
+        const size_t index = static_cast<size_t>(std::llround(pos));
+        return sortedFrameTimes[std::min(index, sortedFrameTimes.size() - 1u)];
+    };
+    const double windowSeconds = std::max(now - m_interactiveStatsWindowStartTime, 1.0e-6);
+    const double meanRaysPerSecond =
+        m_interactiveStatsWindowRaySeconds > 0.0
+            ? static_cast<double>(m_interactiveStatsWindowRays) / m_interactiveStatsWindowRaySeconds
+            : 0.0;
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "[InteractiveStatsSummary]"
+              << " scene=\"" << scene << "\""
+              << " windowSec=" << windowSeconds
+              << " frames=" << sortedFrameTimes.size()
+              << " meanAppFrameMs=" << meanFrameMs
+              << " medianAppFrameMs=" << percentile(0.5)
+              << " p95AppFrameMs=" << percentile(0.95)
+              << " meanPathGpuMs=";
+    if (!m_interactiveStatsWindowGpuTimes.empty()) {
+        std::cout << meanPathGpuMs;
+    } else {
+        std::cout << "unavailable";
+    }
+    std::cout << " samplesAccumulated=" << m_interactiveStatsWindowSamples
+              << " meanRaysPerSec=";
+    if (m_interactiveStatsWindowRays > 0u && m_interactiveStatsWindowRaySeconds > 0.0) {
+        std::cout << static_cast<uint64_t>(meanRaysPerSecond + 0.5);
+    } else {
+        std::cout << "unavailable";
+    }
+    std::cout << std::endl;
+
+    resetInteractiveStatsWindow(now);
+}
+
+void MetalRenderer::Impl::writeInteractiveStatsJson() {
+    if (m_options.headless ||
+        !InteractiveStatsEnabled() ||
+        m_interactiveStatsJsonWritten ||
+        m_interactiveStatsBySegment.empty()) {
+        return;
+    }
+    m_interactiveStatsJsonWritten = true;
+    m_interactiveStatsEndedAt = CurrentLocalTimestampString();
+
+    const std::string outputPathString = InteractiveStatsJsonPath();
+    if (outputPathString.empty()) {
+        NSLog(@"[InteractiveStats] JSON path is empty; set PT_INTERACTIVE_STATS_JSON or use default benchmarks path");
+        return;
+    }
+
+    namespace fs = std::filesystem;
+    const fs::path outputPath(outputPathString);
+    std::error_code ec;
+    if (outputPath.has_parent_path()) {
+        fs::create_directories(outputPath.parent_path(), ec);
+        if (ec) {
+            NSLog(@"[InteractiveStats] failed to create JSON directory '%s': %s",
+                  outputPath.parent_path().string().c_str(),
+                  ec.message().c_str());
+            return;
+        }
+    }
+
+    std::ofstream out(outputPath);
+    if (!out) {
+        NSLog(@"[InteractiveStats] failed to open JSON output '%s'", outputPath.string().c_str());
+        return;
+    }
+
+    auto percentileOf = [](std::vector<double> values, double p) -> double {
+        if (values.empty()) {
+            return 0.0;
+        }
+        std::sort(values.begin(), values.end());
+        const double pos = std::clamp(p, 0.0, 1.0) * static_cast<double>(values.size() - 1u);
+        const size_t index = static_cast<size_t>(std::llround(pos));
+        return values[std::min(index, values.size() - 1u)];
+    };
+    auto finiteOrZero = [](double value) -> double {
+        return std::isfinite(value) ? value : 0.0;
+    };
+    const double sessionSeconds =
+        (m_interactiveStatsSessionStartTime > 0.0 && m_interactiveStatsSessionEndTime > 0.0)
+            ? std::max(m_interactiveStatsSessionEndTime - m_interactiveStatsSessionStartTime, 0.0)
+            : 0.0;
+    std::string deviceName;
+    if (id<MTLDevice> device = m_context.device()) {
+        deviceName = device.name ? std::string([device.name UTF8String]) : std::string();
+    }
+
+    std::vector<std::string> arguments;
+    for (NSString* arg in [[NSProcessInfo processInfo] arguments]) {
+        arguments.emplace_back(arg ? [arg UTF8String] : "");
+    }
+    const NSDictionary<NSString*, NSString*>* environment =
+        [[NSProcessInfo processInfo] environment];
+    const std::array<const char*, 6> trackedEnvNames = {
+        "PT_INTERACTIVE_STATS",
+        "PT_INTERACTIVE_STATS_INTERVAL",
+        "PT_INTERACTIVE_STATS_SUMMARY_INTERVAL",
+        "PT_INTERACTIVE_STATS_JSON",
+        "PT_HWRT_BUILD_POLICY",
+        "PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI",
+    };
+
+    std::vector<std::string> sceneOrder;
+    std::unordered_map<std::string, std::vector<std::string>> segmentKeysByScene;
+    for (const std::string& segmentKey : m_interactiveStatsSegmentOrder) {
+        const auto found = m_interactiveStatsBySegment.find(segmentKey);
+        if (found == m_interactiveStatsBySegment.end()) {
+            continue;
+        }
+        const std::string& sceneName = found->second.scene;
+        auto [sceneIt, inserted] = segmentKeysByScene.try_emplace(sceneName);
+        if (inserted) {
+            sceneOrder.push_back(sceneName);
+        }
+        sceneIt->second.push_back(segmentKey);
+    }
+
+    out << std::fixed << std::setprecision(6);
+    out << "{\n";
+    out << "  \"schema\": \"metal-pathtracer.interactiveStats.v2\",\n";
+    out << "  \"startedAt\": \"" << JsonEscape(m_interactiveStatsStartedAt) << "\",\n";
+    out << "  \"endedAt\": \"" << JsonEscape(m_interactiveStatsEndedAt) << "\",\n";
+    out << "  \"sessionSeconds\": " << sessionSeconds << ",\n";
+    out << "  \"statsIntervalSeconds\": " << InteractiveStatsIntervalSeconds() << ",\n";
+    out << "  \"summaryIntervalSeconds\": " << InteractiveStatsSummaryIntervalSeconds() << ",\n";
+    out << "  \"source\": \"interactive-gui\",\n";
+    out << "  \"gitCommit\": \"" << JsonEscape(PATH_TRACER_GIT_HASH) << "\",\n";
+    out << "  \"deviceName\": \"" << JsonEscape(deviceName) << "\",\n";
+    out << "  \"launch\": {\n";
+    out << "    \"arguments\": [";
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << "\"" << JsonEscape(arguments[i]) << "\"";
+    }
+    out << "],\n";
+    out << "    \"environment\": {";
+    bool firstEnv = true;
+    for (const char* envName : trackedEnvNames) {
+        NSString* key = [NSString stringWithUTF8String:envName];
+        NSString* value = [environment objectForKey:key];
+        if (!value) {
+            continue;
+        }
+        if (!firstEnv) {
+            out << ", ";
+        }
+        firstEnv = false;
+        out << "\"" << JsonEscape(envName) << "\": "
+            << "\"" << JsonEscape([value UTF8String]) << "\"";
+    }
+    out << "}\n";
+    out << "  },\n";
+    out << "  \"scenes\": [\n";
+
+    bool firstScene = true;
+    for (const std::string& sceneName : sceneOrder) {
+        const auto segmentListIt = segmentKeysByScene.find(sceneName);
+        if (segmentListIt == segmentKeysByScene.end()) {
+            continue;
+        }
+        if (!firstScene) {
+            out << ",\n";
+        }
+        firstScene = false;
+        out << "    {\n";
+        out << "      \"scene\": \"" << JsonEscape(sceneName) << "\",\n";
+        out << "      \"segments\": [\n";
+
+        bool firstSegment = true;
+        for (const std::string& segmentKey : segmentListIt->second) {
+            const auto found = m_interactiveStatsBySegment.find(segmentKey);
+            if (found == m_interactiveStatsBySegment.end()) {
+                continue;
+            }
+            const InteractiveStatsAggregate& a = found->second;
+            if (!firstSegment) {
+                out << ",\n";
+            }
+            firstSegment = false;
+
+            const double frameCount = static_cast<double>(std::max<uint64_t>(a.frameCount, 1u));
+            const double gpuFrameCount = static_cast<double>(std::max<uint64_t>(a.gpuTimedFrameCount, 1u));
+            const double rayFrameCount = static_cast<double>(std::max<uint64_t>(a.rayTimedFrameCount, 1u));
+            const double meanAppFrameMs = a.sumAppFrameMs / frameCount;
+            const double meanPathGpuMs =
+                a.gpuTimedFrameCount > 0u ? (a.sumPathGpuMs / gpuFrameCount) : 0.0;
+            const double meanCpuEncodeMs = a.sumCpuEncodeMs / frameCount;
+            const double meanDrawableWaitMs = a.sumDrawableWaitMs / frameCount;
+            const double meanAppSppPerSec = a.sumAppSppPerSec / frameCount;
+            const double meanPathSppPerSec =
+                a.gpuTimedFrameCount > 0u ? (a.sumPathSppPerSec / gpuFrameCount) : 0.0;
+            const double meanRaysPerSec =
+                a.rayTimedFrameCount > 0u ? (a.sumRaysPerSec / rayFrameCount) : 0.0;
+            const double meanRaysThisFrame =
+                a.rayTimedFrameCount > 0u
+                    ? static_cast<double>(a.sumRaysThisFrame) / rayFrameCount
+                    : 0.0;
+
+            out << "        {\n";
+            out << "          \"config\": {\n";
+            out << "            \"resolution\": {\"width\": " << a.lastRenderWidth
+                << ", \"height\": " << a.lastRenderHeight << "},\n";
+            out << "            \"renderScale\": " << a.lastRenderScale << ",\n";
+            out << "            \"samplesPerFrame\": " << a.lastSamplesPerFrame << ",\n";
+            out << "            \"triangleCount\": " << a.lastTriangleCount << ",\n";
+            out << "            \"viewportPreset\": \"" << JsonEscape(a.lastViewportPreset) << "\",\n";
+            out << "            \"viewportPresetMaturity\": \""
+                << JsonEscape(a.lastViewportPresetMaturity) << "\",\n";
+            out << "            \"viewportPresetOverride\": \""
+                << (a.lastViewportPresetOverridden ? "custom" : "no") << "\",\n";
+            out << "            \"backend\": \"" << JsonEscape(a.lastBackend) << "\",\n";
+            out << "            \"execution\": \"" << JsonEscape(a.lastExecution) << "\",\n";
+            out << "            \"wavefrontPolicy\": \"" << JsonEscape(a.lastWavefrontPolicy) << "\",\n";
+            out << "            \"wavefrontCompaction\": \""
+                << (a.lastWavefrontCompactionEnabled ? "on" : "off") << "\",\n";
+            out << "            \"restir\": \"" << JsonEscape(a.lastRestir) << "\",\n";
+            out << "            \"denoiser\": \"" << JsonEscape(a.lastDenoiser) << "\"\n";
+            out << "          },\n";
+            out << "          \"stats\": {\n";
+            out << "            \"frameCount\": " << a.frameCount << ",\n";
+            out << "            \"gpuTimedFrameCount\": " << a.gpuTimedFrameCount << ",\n";
+            out << "            \"rayTimedFrameCount\": " << a.rayTimedFrameCount << ",\n";
+            out << "            \"samplesAccumulated\": " << a.samplesAccumulated << ",\n";
+            out << "            \"appFrameMs\": {\n";
+            out << "              \"mean\": " << finiteOrZero(meanAppFrameMs) << ",\n";
+            out << "              \"median\": " << percentileOf(a.appFrameTimesMs, 0.5) << ",\n";
+            out << "              \"p95\": " << percentileOf(a.appFrameTimesMs, 0.95) << ",\n";
+            out << "              \"min\": " << finiteOrZero(a.minAppFrameMs) << ",\n";
+            out << "              \"max\": " << finiteOrZero(a.maxAppFrameMs) << "\n";
+            out << "            },\n";
+            out << "            \"pathGpuMs\": {\n";
+            out << "              \"available\": " << (a.gpuTimedFrameCount > 0u ? "true" : "false") << ",\n";
+            out << "              \"mean\": " << finiteOrZero(meanPathGpuMs) << ",\n";
+            out << "              \"median\": " << percentileOf(a.pathGpuTimesMs, 0.5) << ",\n";
+            out << "              \"p95\": " << percentileOf(a.pathGpuTimesMs, 0.95) << ",\n";
+            out << "              \"min\": " << finiteOrZero(a.minPathGpuMs) << ",\n";
+            out << "              \"max\": " << finiteOrZero(a.maxPathGpuMs) << "\n";
+            out << "            },\n";
+            out << "            \"meanCpuEncodeMs\": " << finiteOrZero(meanCpuEncodeMs) << ",\n";
+            out << "            \"meanDrawableWaitMs\": " << finiteOrZero(meanDrawableWaitMs) << ",\n";
+            out << "            \"meanAppSppPerSec\": " << finiteOrZero(meanAppSppPerSec) << ",\n";
+            out << "            \"meanPathSppPerSec\": " << finiteOrZero(meanPathSppPerSec) << ",\n";
+            out << "            \"meanRaysThisFrame\": " << finiteOrZero(meanRaysThisFrame) << ",\n";
+            out << "            \"meanRaysPerSec\": " << finiteOrZero(meanRaysPerSec) << "\n";
+            out << "          }\n";
+            out << "        }";
+        }
+        out << "\n";
+        out << "      ]\n";
+        out << "    }";
+    }
+    out << "\n";
+    out << "  ]\n";
+    out << "}\n";
+    out.close();
+
+    if (!out) {
+        NSLog(@"[InteractiveStats] failed while writing JSON output '%s'", outputPath.string().c_str());
+        return;
+    }
+    std::cout << "[InteractiveStats] wrote session JSON to "
+              << outputPath.string()
+              << std::endl;
 }
 
 void MetalRenderer::Impl::handleCameraInput() {
@@ -4198,6 +5503,28 @@ void MetalRenderer::Impl::launchSceneLoadWorker(SceneLoadRequest request, uint64
             } else if (isCancelled()) {
                 return;
             } else {
+                const auto& textureInventory = completion->resources->textureInventory();
+                uint64_t textureClampedCount = 0u;
+                for (const auto& texture : textureInventory) {
+                    if (texture.clampedByDimension) {
+                        ++textureClampedCount;
+                    }
+                }
+                const PathTracer::TextureLoadPolicy texturePolicy =
+                    completion->resources->textureLoadPolicy();
+                NSLog(@"[TexturePolicy] interactive summary id='%s' loaded=%zu clamped=%llu skipped=%llu "
+                      "footprintMipChains=%llu "
+                      "policy=%s pilotMode=%s maxDimension=%u maxTextureBytes=%.2f MiB loadedTextureBytes=%.2f MiB",
+                      request.activeSceneId.c_str(),
+                      textureInventory.size(),
+                      static_cast<unsigned long long>(textureClampedCount),
+                      static_cast<unsigned long long>(completion->resources->texturePolicySkippedCount()),
+                      static_cast<unsigned long long>(completion->resources->footprintMipChainCount()),
+                      TextureBudgetPolicyLabel(texturePolicy.policy),
+                      PilotModeLabel(texturePolicy.pilotMode),
+                      texturePolicy.maxDimension,
+                      BytesToMiB(texturePolicy.maxTextureBytes),
+                      BytesToMiB(completion->resources->estimatedTextureMemoryBytes()));
                 if (SceneLoadDiagnosticsEnabled()) {
                     const MeshAggregateStats parsedMeshStats = CollectMeshAggregateStats(*completion->resources);
                     NSLog(@"[SceneDiag] workerParseComplete id='%s' path='%s' materials=%u meshes=%u vertices=%llu indices=%llu triangles=%u",
@@ -4212,6 +5539,7 @@ void MetalRenderer::Impl::launchSceneLoadWorker(SceneLoadRequest request, uint64
                 if (forceSoftwareRayTracing) {
                     loadedSettings.enableSoftwareRayTracing = true;
                 }
+                PreserveViewportQualityAfterInteractiveSceneLoad(loadedSettings, request.startingSettings);
                 loadedSettings.renderScale = ClampRenderScale(loadedSettings.renderScale);
                 completion->resources->setSoftwareRayTracingOverride(loadedSettings.enableSoftwareRayTracing);
 
@@ -4220,7 +5548,8 @@ void MetalRenderer::Impl::launchSceneLoadWorker(SceneLoadRequest request, uint64
                     !loadedSettings.environmentMapPath.empty()) {
                     EnvGpuHandles handles;
                     if (!completion->resources->reloadEnvironmentIfNeeded(loadedSettings.environmentMapPath,
-                                                                          &handles)) {
+                                                                          &handles,
+                                                                          loadedSettings.environmentSunClamp)) {
                         completion->resources->clearEnvironmentMap();
                         loadedSettings.backgroundMode = BackgroundMode::Gradient;
                         loadedSettings.environmentMapPath.clear();
@@ -4315,12 +5644,12 @@ void MetalRenderer::Impl::launchSceneLoadWorker(SceneLoadRequest request, uint64
                     completion->resources.reset();
                 } else {
                     auto memoryReport = completion->resources->sceneMemoryReport();
-                    const uint64_t recommendedWorkingSet = memoryReport.recommendedMaxWorkingSetSizeBytes;
+                    const uint64_t postBuildRecommendedWorkingSet = memoryReport.recommendedMaxWorkingSetSizeBytes;
                     uint64_t allocatedWorkingSet = CurrentAllocatedSizeBytes(device);
                     const uint64_t postBuildLimit =
-                        InteractiveWorkingSetLimitBytes(recommendedWorkingSet);
+                        InteractiveWorkingSetLimitBytes(postBuildRecommendedWorkingSet);
                     const bool overRecommended =
-                        (recommendedWorkingSet > 0u) && (allocatedWorkingSet > recommendedWorkingSet);
+                        (postBuildRecommendedWorkingSet > 0u) && (allocatedWorkingSet > postBuildRecommendedWorkingSet);
                     bool builtHardwareRt =
                         completion->resources->intersectionProvider().mode ==
                         PathTracerShaderTypes::IntersectionMode::HardwareRayTracing;
@@ -4329,7 +5658,7 @@ void MetalRenderer::Impl::launchSceneLoadWorker(SceneLoadRequest request, uint64
                         NSLog(@"[SceneLoad] retrying in software BVH due to memory pressure "
                               "(currentAllocatedSize=%.2f MiB recommendedMaxWorkingSetSize=%.2f MiB)",
                               BytesToMiB(allocatedWorkingSet),
-                              BytesToMiB(recommendedWorkingSet));
+                              BytesToMiB(postBuildRecommendedWorkingSet));
                         completion->resources->setSoftwareRayTracingOverride(true);
                         completion->resources->rebuildAccelerationStructures();
                         if (completion->resources->isDirty()) {
@@ -4354,7 +5683,7 @@ void MetalRenderer::Impl::launchSceneLoadWorker(SceneLoadRequest request, uint64
                               "estimatedSceneWorkingSet=%.2f MiB mode=%s)",
                               BytesToMiB(allocatedWorkingSet),
                               BytesToMiB(postBuildLimit),
-                              BytesToMiB(recommendedWorkingSet),
+                              BytesToMiB(postBuildRecommendedWorkingSet),
                               BytesToMiB(memoryReport.totalEstimatedMemoryBytes),
                               builtHardwareRt ? "hardware" : "software");
                     }
@@ -4523,6 +5852,10 @@ void MetalRenderer::Impl::serviceSceneLoadState(bool allowGpuWork) {
             m_sceneLoadExclusiveActive = false;
             m_sceneLoadStage = SceneLoadStage::Idle;
             NSLog(@"[SceneLoad] activated scene '%s'", m_activeSceneId.c_str());
+            for (const std::string& line :
+                 PathTracer::SubsurfaceNotScatteringDiagnostics(activeSceneResources(), m_settings)) {
+                NSLog(@"[SSS] %s", line.c_str());
+            }
             if (SceneLoadDiagnosticsEnabled()) {
                 const auto& active = activeSceneResources();
                 const MeshAggregateStats activeMeshStats = CollectMeshAggregateStats(active);
@@ -4630,7 +5963,8 @@ bool MetalRenderer::Impl::syncEnvironmentMap(bool* outChanged) {
     const std::string currentPath = sceneResources.environmentPath();
     if (!m_settings.environmentMapDirty &&
         !currentPath.empty() &&
-        currentPath == m_settings.environmentMapPath) {
+        currentPath == m_settings.environmentMapPath &&
+        sceneResources.environmentSunClamp() == m_settings.environmentSunClamp) {
         if (outChanged) {
             *outChanged = false;
         }
@@ -4639,7 +5973,9 @@ bool MetalRenderer::Impl::syncEnvironmentMap(bool* outChanged) {
 
     m_settings.environmentMapDirty = false;
     EnvGpuHandles handles;
-    if (!sceneResources.reloadEnvironmentIfNeeded(m_settings.environmentMapPath, &handles)) {
+    if (!sceneResources.reloadEnvironmentIfNeeded(m_settings.environmentMapPath,
+                                                  &handles,
+                                                  m_settings.environmentSunClamp)) {
         if (!currentPath.empty()) {
             m_settings.environmentMapPath = currentPath;
         } else {
@@ -4733,6 +6069,7 @@ void MetalRenderer::Impl::setupDefaultScene() {
             if (m_options.enableSoftwareRayTracing) {
                 updatedSettings.enableSoftwareRayTracing = true;
             }
+            PreserveViewportQualityAfterInteractiveSceneLoad(updatedSettings, m_settings);
             m_settings = updatedSettings;
             m_settings.renderScale = ClampRenderScale(m_settings.renderScale);
             m_sceneResources.setSoftwareRayTracingOverride(m_settings.enableSoftwareRayTracing);
@@ -4761,7 +6098,38 @@ void MetalRenderer::Impl::setupDefaultScene() {
         }
 
         if (loadFromPath) {
-            if (queueSceneLoadFromResolvedPath(targetIdentifier, targetIdentifier, m_settings)) {
+            std::string resolvedScenePath = targetIdentifier;
+            std::error_code scenePathEc;
+            if (!candidate.is_absolute() && !std::filesystem::exists(candidate, scenePathEc)) {
+                scenePathEc.clear();
+                const std::filesystem::path sceneDirectory(m_sceneManager.sceneDirectory());
+                const std::filesystem::path byFilename = sceneDirectory / candidate.filename();
+                if (!sceneDirectory.empty() && std::filesystem::exists(byFilename, scenePathEc)) {
+                    resolvedScenePath = byFilename.string();
+                } else {
+                    scenePathEc.clear();
+                    const std::filesystem::path underSceneDirectory = sceneDirectory / candidate;
+                    if (!sceneDirectory.empty() && std::filesystem::exists(underSceneDirectory, scenePathEc)) {
+                        resolvedScenePath = underSceneDirectory.string();
+                    }
+                }
+            }
+
+            RenderSettings updatedSettings = m_settings;
+            const RenderSettings cameraDefaults{};
+            updatedSettings.cameraControlMode = cameraDefaults.cameraControlMode;
+            updatedSettings.cameraTarget = cameraDefaults.cameraTarget;
+            updatedSettings.cameraDistance = cameraDefaults.cameraDistance;
+            updatedSettings.cameraYaw = cameraDefaults.cameraYaw;
+            updatedSettings.cameraPitch = cameraDefaults.cameraPitch;
+            updatedSettings.firstPersonCameraPosition = cameraDefaults.firstPersonCameraPosition;
+            updatedSettings.firstPersonMoveSpeed = cameraDefaults.firstPersonMoveSpeed;
+            updatedSettings.cameraVerticalFov = cameraDefaults.cameraVerticalFov;
+            updatedSettings.cameraDefocusAngle = cameraDefaults.cameraDefocusAngle;
+            updatedSettings.cameraFocusDistance = cameraDefaults.cameraFocusDistance;
+
+            const std::string activeSceneId = std::filesystem::path(resolvedScenePath).stem().string();
+            if (queueSceneLoadFromResolvedPath(resolvedScenePath, activeSceneId, updatedSettings)) {
                 return;
             }
         } else {
@@ -4799,6 +6167,7 @@ void MetalRenderer::Impl::buildProceduralScene() {
     m_settings.environmentMapPath.clear();
     m_settings.environmentRotation = 0.0f;
     m_settings.environmentIntensity = 1.0f;
+    m_settings.environmentBackgroundScale = 1.0f;
     m_sceneResources.clearEnvironmentMap();
 
     m_sceneResources.clear();
@@ -4989,6 +6358,29 @@ void MetalRenderer::Impl::resetAccumulation() {
     m_performanceStats.restirPtReuseAppliedCount = 0;
     m_performanceStats.restirPtReuseRejectedInvalidCount = 0;
     m_performanceStats.restirPtReuseFallbackCount = 0;
+    m_performanceStats.restirPtEnhancedCandidateCount = 0;
+    m_performanceStats.restirPtEnhancedInitialSelectedCount = 0;
+    m_performanceStats.restirPtEnhancedTemporalAcceptedCount = 0;
+    m_performanceStats.restirPtEnhancedTemporalRejectedCount = 0;
+    m_performanceStats.restirPtEnhancedSpatialAcceptedCount = 0;
+    m_performanceStats.restirPtEnhancedSpatialRejectedCount = 0;
+    m_performanceStats.restirPtEnhancedInvalidShiftGeometryCount = 0;
+    m_performanceStats.restirPtEnhancedInvalidShiftMaterialCount = 0;
+    m_performanceStats.restirPtEnhancedInvalidShiftPdfCount = 0;
+    m_performanceStats.restirPtEnhancedInvalidShiftVisibilityCount = 0;
+    m_performanceStats.restirPtEnhancedInvalidShiftInvertibilityCount = 0;
+    m_performanceStats.restirPtEnhancedInvalidShiftUnsupportedCount = 0;
+    m_performanceStats.restirPtEnhancedDuplicateScoreSum = 0;
+    m_performanceStats.restirPtEnhancedBiasedCCapApplicationCount = 0;
+    m_performanceStats.restirPtEnhancedVectorWeightUseCount = 0;
+    m_performanceStats.restirPtEnhancedReplayCompactionInputCount = 0;
+    m_performanceStats.restirPtEnhancedReplayCompactionOutputCount = 0;
+    m_performanceStats.restirPtEnhancedFallbackCount = 0;
+    m_performanceStats.restirPtEnhancedCanonicalSampleCount = 0;
+    for (uint32_t i = 0u; i < PathTracerShaderTypes::kRestirPathReservoirDepthCount; ++i) {
+        m_performanceStats.restirPtEnhancedPathLengthHistogram[i] = 0;
+        m_performanceStats.restirPtEnhancedReconnectionDepthHistogram[i] = 0;
+    }
     m_performanceStats.radianceCacheQueryCount = 0;
     m_performanceStats.radianceCacheHitCount = 0;
     m_performanceStats.radianceCacheMissCount = 0;
@@ -5029,12 +6421,18 @@ void MetalRenderer::Impl::resetAccumulation() {
     m_previousSampleCount = 0;
 
     CGSize targetSize = targetRenderSize();
-    m_accumulation.ensureTextures(targetSize);
+    {
+        PathTracer::RenderPassGraphDesc allocationGraph =
+            PathTracer::BuildRenderPassGraph(m_settings,
+                                             true,
+                                             activeSceneResources().isDirty(),
+                                             false,
+                                             true);
+        m_accumulation.ensureTextures(targetSize, allocationGraph);
+    }
     m_accumulation.reset(m_context.commandQueue(), m_pipelines.clear(), nullptr);
-    const bool preserveSvgfHistory =
-        m_settings.svgfDenoiseEnabled &&
-        m_accumDirtyReason.rfind("CAMERA_", 0) == 0;
-    m_renderLoop.resetHistory(HistoryResetReason::FeatureToggleChanged, preserveSvgfHistory);
+    m_renderLoop.resetHistory(HistoryResetReasonForDirtyReason(m_accumDirtyReason),
+                              false);
 
     m_deferredAccumulationReset = false;
     m_accumDirty = false;
@@ -5043,7 +6441,7 @@ void MetalRenderer::Impl::resetAccumulation() {
 }
 
 void MetalRenderer::Impl::setTonemapMode(uint32_t mode) {
-    uint32_t clamped = std::max<uint32_t>(1u, std::min<uint32_t>(mode, 4u));
+    uint32_t clamped = std::max<uint32_t>(1u, std::min<uint32_t>(mode, 6u));
     m_settings.tonemapMode = clamped;
 }
 
@@ -5181,17 +6579,46 @@ std::vector<std::string> MetalRenderer::Impl::sceneIdentifiers() const {
     return identifiers;
 }
 
+bool MetalRenderer::Impl::ensureSourcePipelines() {
+    if (m_sourcePipelines) {
+        return true;
+    }
+    CFAbsoluteTime buildStart = CFAbsoluteTimeGetCurrent();
+    auto pipelines = std::make_unique<PathTracer::Pipelines>();
+    pipelines->setVerboseTiming(m_verboseTiming);
+    pipelines->setSourceFeatures(true);
+    if (!pipelines->initialize(m_context, m_pipelineDisplayFormat)) {
+        return false;
+    }
+    m_sourcePipelines = std::move(pipelines);
+    NSLog(@"[Pipelines] Source-feature pipelines built in %.0f ms", (CFAbsoluteTimeGetCurrent() - buildStart) * 1000.0);
+    return true;
+}
+
 void MetalRenderer::Impl::applySettings(const RenderSettings& settings, bool resetAccumulationFlag) {
     RenderSettings sanitized = settings;
     sanitized.renderScale = ClampRenderScale(sanitized.renderScale);
+    std::string sourceDiagnostic;
+    PathTracer::ResolveSourceCapabilities(activeSceneResources(), sanitized, false, false, sourceDiagnostic);
+    if (!sourceDiagnostic.empty()) std::cerr << "[Source capabilities] " << sourceDiagnostic << std::endl;
     m_settings = sanitized;
+    // Build the source-feature pipelines here (before a headless render timer starts); drawFrame retries on failure.
+    if (m_settings.sourceFeatures) {
+        ensureSourcePipelines();
+    }
     activeSceneResources().setSoftwareRayTracingOverride(m_settings.enableSoftwareRayTracing);
     applyBackgroundSettings();
     syncCameraSmoothingToTarget();
     if (resetAccumulationFlag) {
         resetAccumulation();
     } else {
-        m_accumulation.ensureTextures(targetRenderSize());
+        PathTracer::RenderPassGraphDesc allocationGraph =
+            PathTracer::BuildRenderPassGraph(m_settings,
+                                             m_accumulation.needsClear(),
+                                             activeSceneResources().isDirty(),
+                                             false,
+                                             true);
+        m_accumulation.ensureTextures(targetRenderSize(), allocationGraph);
     }
 }
 
@@ -5268,7 +6695,9 @@ bool MetalRenderer::Impl::captureAverageImage(std::vector<float>& outLinearRGB,
                                               uint32_t& height,
                                               std::vector<float>* outSampleCounts) {
     id<MTLTexture> sourceTexture = m_accumulation.present();
-    if ((m_settings.denoiseEnabled || m_settings.svgfDenoiseEnabled) &&
+    if ((m_settings.denoiseEnabled || m_settings.svgfDenoiseEnabled ||
+         (m_settings.mlBackendMode == PathTracer::RenderSettings::MlBackendMode::ReconstructionTiny &&
+          m_renderLoop.mlBackendActive())) &&
         m_renderLoop.hasDenoisedOutput()) {
         if (id<MTLTexture> denoised = m_accumulation.denoisedBuffer()) {
             sourceTexture = denoised;
@@ -5340,6 +6769,7 @@ bool MetalRenderer::Impl::captureAuxiliaryImages(std::vector<float>* outAlbedoRG
 MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() const {
     RuntimeStatsSnapshot snapshot{};
     snapshot.sampleCount = m_accumulation.sampleCount();
+    snapshot.lastCommandBufferCompleted = m_lastCommandBufferCompleted;
     snapshot.frameTimeMs = m_lastFrameTimeMs;
     snapshot.gpuTimeMs = m_performanceStats.gpuTimeMs;
     snapshot.cpuEncodeMs = m_performanceStats.cpuEncodeMs;
@@ -5364,6 +6794,9 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
             ? accelStats.fallbackReason
             : (m_settings.enableSoftwareRayTracing ? "software BVH requested explicitly"
                                                    : std::string());
+    snapshot.megakernelIntegratePipeline = m_renderLoop.megakernelIntegratePipeline();
+    snapshot.wavefrontDirectLightFallback = m_renderLoop.wavefrontDirectLightFallback();
+    snapshot.wavefrontMegakernelFallback = m_renderLoop.wavefrontMegakernelFallback();
     if (id<MTLDevice> device = m_context.device()) {
         snapshot.deviceName = device.name ? std::string([device.name UTF8String]) : std::string();
         snapshot.deviceRecommendedMaxWorkingSetBytes = DeviceRecommendedWorkingSetBytes(device);
@@ -5375,9 +6808,11 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
         snapshot.deviceSupportsSparseResources = false;
         snapshot.deviceSupportsMetalFX = false;
         snapshot.deviceSupportsMLBackend =
-            m_settings.mlBackendMode != PathTracer::RenderSettings::MlBackendMode::Off;
+            m_pipelines.mlReconstructionTiny() != nil;
     }
     snapshot.accelerationBuildPolicy = accelStats.buildPolicyLabel;
+    snapshot.accelerationBuildPolicyReason = accelStats.buildPolicyReason;
+    snapshot.accelerationCompactionPolicy = accelStats.compactionPolicy;
     snapshot.accelerationIdentityStable = accelStats.identityStable;
     snapshot.accelerationIdentityStrategy = accelStats.identityStrategy;
     snapshot.accelerationIntersectionFunctionStrategy =
@@ -5386,9 +6821,72 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
         accelStats.customIntersectionFunctionsSupported;
     snapshot.accelerationCustomIntersectionFunctionsEnabled =
         accelStats.customIntersectionFunctionsEnabled;
+    snapshot.accelerationBlasCompactionRatio = accelStats.blasCompactionRatio;
+    snapshot.accelerationTlasCompactionRatio = accelStats.tlasCompactionRatio;
     snapshot.accelerationPrimitiveCount = accelStats.primitiveCount;
     snapshot.accelerationInstanceCount = accelStats.instanceCount;
     snapshot.accelerationBlasCount = accelStats.blasCount;
+    const auto& provider = activeScene.intersectionProvider();
+    const bool hasMeshIdentityBuffers =
+        activeScene.meshInfoBuffer() != nil &&
+        activeScene.meshVertexBuffer() != nil &&
+        activeScene.meshIndexBuffer() != nil;
+    auto traversalDecision = [&](PathTracer::TraversalQueryKind kind,
+                                 bool hardwarePipelineAvailable) {
+        return PathTracer::SelectTraversalBackend(
+            provider,
+            PathTracer::TraversalServiceRequest{
+                .kind = kind,
+                .softwareOverride = m_settings.enableSoftwareRayTracing,
+                .hardwarePipelineAvailable = hardwarePipelineAvailable,
+                .hardwareTraversalResourceAvailable = provider.hardware.tlas != nil,
+                .sceneIdentityBuffersAvailable = hasMeshIdentityBuffers,
+                .encoderSupportsHardwareRaytracing = true,
+            });
+    };
+    const bool wavefrontMode =
+        m_settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront;
+    const bool primaryPipelineAvailable = wavefrontMode
+        ? (m_pipelines.wavefrontIntersectHardware() != nil)
+        : m_pipelines.integrateHardwareAvailable();
+    const bool continuationPipelineAvailable = primaryPipelineAvailable;
+    const bool shadowPipelineAvailable = wavefrontMode
+        ? (m_pipelines.wavefrontShadowHardware() != nil)
+        : m_pipelines.integrateHardwareAvailable();
+    const bool restirPipelineAvailable =
+        m_pipelines.restirDiVisibilityHardware() != nil ||
+        (wavefrontMode && m_pipelines.wavefrontShade() != nil);
+    const bool radianceCachePipelineAvailable = continuationPipelineAvailable;
+    const bool debugProbePipelineAvailable = m_pipelines.integrateHardwareAvailable() ||
+                                             m_pipelines.wavefrontIntersectHardware() != nil;
+    snapshot.accelerationTraversalCoverage =
+        JoinTraversalCoverage({
+            TraversalCoverageEntry("primary",
+                                   traversalDecision(PathTracer::TraversalQueryKind::PrimaryVisibility,
+                                                     primaryPipelineAvailable),
+                                   wavefrontMode ? "wavefront_intersect" : "megakernel_integrate"),
+            TraversalCoverageEntry("continuation",
+                                   traversalDecision(PathTracer::TraversalQueryKind::ContinuationRay,
+                                                     continuationPipelineAvailable),
+                                   wavefrontMode ? "wavefront_intersect" : "megakernel_integrate"),
+            TraversalCoverageEntry("shadow",
+                                   traversalDecision(PathTracer::TraversalQueryKind::ShadowRay,
+                                                     shadowPipelineAvailable),
+                                   wavefrontMode ? "wavefront_shadow" : "megakernel_integrate"),
+            TraversalCoverageEntry("restir_di_visibility",
+                                   traversalDecision(PathTracer::TraversalQueryKind::RestirDiVisibility,
+                                                     restirPipelineAvailable),
+                                   wavefrontMode ? "wavefront_direct_lighting_or_screen_pass"
+                                                 : "screen_pass"),
+            TraversalCoverageEntry("radiance_cache_query",
+                                   traversalDecision(PathTracer::TraversalQueryKind::RadianceCacheQuery,
+                                                     radianceCachePipelineAvailable),
+                                   "prototype_cache_lookup_uses_selected_transport_backend"),
+            TraversalCoverageEntry("debug_probe",
+                                   traversalDecision(PathTracer::TraversalQueryKind::DebugProbe,
+                                                     debugProbePipelineAvailable),
+                                   "path_debug_or_parity_probe"),
+        });
     snapshot.renderExecutionMode = m_performanceStats.renderExecutionMode;
     snapshot.wavefrontSchedulingPolicy = m_performanceStats.wavefrontSchedulingPolicy;
     snapshot.wavefrontCompactionEnabled = m_performanceStats.wavefrontCompactionEnabled;
@@ -5428,29 +6926,70 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
     snapshot.wavefrontBudgetUsagePercent = m_performanceStats.wavefrontBudgetUsagePercent;
     const bool wavefrontExecution =
         m_settings.executionMode == PathTracer::RenderSettings::ExecutionMode::Wavefront;
+    const bool guardedShadeIndirect =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeIndirectEnabled || WavefrontShadeIndirectEnabled());
+    const bool guardedShadeIndirectProbe =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeIndirectProbeEnabled || WavefrontShadeIndirectProbeEnabled());
+    const bool guardedShadeSurfaceProbe =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeSurfaceProbeEnabled || WavefrontShadeSurfaceProbeEnabled());
+    const bool guardedShadeMetadataProbe =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeMetadataProbeEnabled || WavefrontShadeMetadataProbeEnabled());
+    const bool guardedShadeScalarProbe =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeScalarProbeEnabled || WavefrontShadeScalarProbeEnabled());
+    const bool guardedShadeBsdfProbe =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeBsdfProbeEnabled || WavefrontShadeBsdfProbeEnabled());
+    const bool guardedShadeClosureProbe =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadeClosureProbeEnabled || WavefrontShadeClosureProbeEnabled());
+    const bool guardedShadowIndirect =
+        wavefrontExecution &&
+        (m_settings.wavefrontShadowIndirectEnabled || WavefrontShadowIndirectEnabled());
     snapshot.wavefrontIntersectDispatchMode =
         wavefrontExecution ? "active_count_indirect" : "disabled_non_wavefront";
     snapshot.wavefrontShadeDispatchMode =
-        wavefrontExecution ? "direct_grid_fallback" : "disabled_non_wavefront";
+        guardedShadeIndirect
+            ? "split_resolved_surface_active_count_indirect"
+            : (wavefrontExecution ? "direct_grid_exact_platform_limited" : "disabled_non_wavefront");
     snapshot.wavefrontShadowDispatchMode =
-        wavefrontExecution ? "direct_grid_sparse_storage" : "disabled_non_wavefront";
+        guardedShadowIndirect
+            ? "guarded_active_count_indexed_indirect"
+            : (wavefrontExecution ? "direct_grid_sparse_storage" : "disabled_non_wavefront");
     snapshot.wavefrontQueueStoragePolicySummary =
         wavefrontExecution
             ? "active/path queues physical_compact when compaction is enabled; shadow queue physical_sparse"
             : "metadata_only";
     snapshot.wavefrontM1BridgeStatus =
-        wavefrontExecution
-            ? "M1 bridge partial: intersect active-count indirect is live; shade remains direct-grid fallback; shadow remains direct-grid over sparse path-indexed storage pending dense shadow index queue"
-            : "wavefront bridge inactive for megakernel execution";
+        guardedShadeIndirect
+            ? "M.1 reframed closure diagnostic active: shade is split into active-count indirect surface/material resolution plus active-count indirect resolved continuation by --wavefront-shade-indirect=1 or PT_ENABLE_WAVEFRONT_SHADE_INDIRECT=1; this remains a default-off Code 8 diagnostic and is not original shade active-count closure"
+            : (guardedShadowIndirect
+                   ? "M.1 reframed closure shadow guard active: compact shadow index sidecar drives guarded active-count indexed shadow dispatch; guarded shadow remains default-off/not promoted and original shade indirect remains diagnostic"
+                   : ((guardedShadeIndirectProbe || guardedShadeSurfaceProbe || guardedShadeMetadataProbe || guardedShadeScalarProbe || guardedShadeClosureProbe || guardedShadeBsdfProbe)
+                        ? "M.1 reframed closure probe active: non-mutating shade active-count indirect probe is enabled before production direct-grid shade; production shade remains exact direct-grid platform-limited"
+                   : (wavefrontExecution
+                          ? "Milestone M.1 closed under the 2026-06-07 reframed stage-specific scheduling contract: intersect is active-count indirect, production shade is exact direct-grid platform-limited with residual metrics, default shadow is direct-grid sparse storage, and original shade active-count indirect remains a default-off Code 8 diagnostic"
+                          : "wavefront bridge inactive for megakernel execution")));
     snapshot.restirDiResourceBytesTotal = m_renderLoop.restirDiResourceBytesTotal();
     snapshot.restirDiReservoirBytesEach = m_renderLoop.restirDiReservoirBytesEach();
     snapshot.restirDiVisibilityBytes = m_renderLoop.restirDiVisibilityBytes();
     snapshot.restirDiDebugBytes = m_renderLoop.restirDiDebugBytes();
+    snapshot.restirDiPathStatus = m_performanceStats.restirDiPathStatus;
     snapshot.transportMemoryBytesTotal = m_renderLoop.transportMemoryBytesTotal();
     snapshot.transportMemoryBytesPrivate = m_renderLoop.transportMemoryBytesPrivate();
     snapshot.transportMemoryBytesShared = m_renderLoop.transportMemoryBytesShared();
     snapshot.transportMemoryBytesStaging = m_renderLoop.transportMemoryBytesStaging();
     snapshot.transportMemoryRecordCount = m_renderLoop.transportMemoryRecordCount();
+    snapshot.transportMemoryAllocatorBackedRecordCount =
+        m_renderLoop.transportMemoryAllocatorBackedRecordCount();
+    snapshot.transportMemoryFrameGraphBackedRecordCount =
+        m_renderLoop.transportMemoryFrameGraphBackedRecordCount();
+    snapshot.transportMemoryOwnershipGapRecordCount =
+        m_renderLoop.transportMemoryOwnershipGapRecordCount();
     snapshot.transportMemoryInvalidatedRecordCount =
         m_renderLoop.transportMemoryInvalidatedRecordCount();
     const auto& transportMemory = m_renderLoop.transportMemoryRegistry().records();
@@ -5473,6 +7012,8 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
     snapshot.transportMemoryInvalidationCounts.reserve(transportMemory.size());
     snapshot.transportMemoryHotPath.reserve(transportMemory.size());
     snapshot.transportMemoryTemporaryShared.reserve(transportMemory.size());
+    snapshot.transportMemoryFrameGraphOwned.reserve(transportMemory.size());
+    snapshot.transportMemoryAllocatorOwned.reserve(transportMemory.size());
     for (const auto& record : transportMemory) {
         snapshot.transportMemoryNames.push_back(record.name);
         snapshot.transportMemoryKinds.push_back(PathTracer::TransportMemoryKindLabel(record.kind));
@@ -5499,6 +7040,9 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
         snapshot.transportMemoryInvalidationCounts.push_back(record.invalidationCount);
         snapshot.transportMemoryHotPath.push_back(record.hotPath ? 1u : 0u);
         snapshot.transportMemoryTemporaryShared.push_back(record.temporaryShared ? 1u : 0u);
+        snapshot.transportMemoryFrameGraphOwned.push_back(record.frameGraphOwned ? 1u : 0u);
+        snapshot.transportMemoryAllocatorOwned.push_back(
+            (record.transportMemoryOwned && record.ownedBuffer) ? 1u : 0u);
     }
     const auto& passGraph = m_renderLoop.lastPassGraph();
     const auto& passGraphExecution = m_renderLoop.lastPassGraphExecution();
@@ -5527,6 +7071,9 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
     snapshot.passGraphExecutedPasses = passGraphExecution.executedPasses;
     snapshot.passGraphSkippedPasses = passGraphExecution.skippedPasses;
     snapshot.passGraphFailedPasses = passGraphExecution.failedPasses;
+    snapshot.passGraphTimingAvailable = passGraphExecution.passTimingAvailable;
+    snapshot.passGraphTimingNames = passGraphExecution.passTimingNames;
+    snapshot.passGraphTimingMs = passGraphExecution.passTimingMs;
     snapshot.passGraphNames.reserve(passGraph.passes.size());
     snapshot.passGraphTypes.reserve(passGraph.passes.size());
     snapshot.passGraphExecutions.reserve(passGraph.passes.size());
@@ -5546,31 +7093,31 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
         snapshot.passGraphTimingLabels.push_back(pass.timingLabel);
         snapshot.passGraphDebugPolicies.push_back(PathTracer::DebugCapturePolicyLabel(pass.debugPolicy));
         snapshot.passGraphTimingPolicies.push_back(PathTracer::TimingPolicyLabel(pass.timingPolicy));
-        if (pass.executionId == PathTracer::RenderPassExecutionId::MlBackendNoOp) {
+        if (pass.executionId == PathTracer::RenderPassExecutionId::MlBackendNoOp ||
+            pass.executionId == PathTracer::RenderPassExecutionId::MlBackendReconstructionTiny) {
             ++snapshot.mlBackendPassCount;
         }
     }
     snapshot.mlBackendMode = static_cast<uint32_t>(m_settings.mlBackendMode);
     snapshot.mlBackendRequested =
         m_settings.mlBackendMode != PathTracer::RenderSettings::MlBackendMode::Off;
-    snapshot.mlBackendActive = snapshot.mlBackendPassCount > 0u;
-    snapshot.mlBackendNativeAccelerationAvailable = false;
-    snapshot.mlBackendProvider = snapshot.mlBackendRequested ? "MLBackend.NoOp" : "disabled";
-    snapshot.mlBackendProviderVersion = snapshot.mlBackendRequested ? "noop-contract-v1" : "disabled";
-    snapshot.mlBackendTensorContract =
-        "radiance,albedo,normal,depth,motion,variance,confidence -> reconstructed_radiance,confidence";
-    snapshot.mlBackendFallbackReason =
-        snapshot.mlBackendRequested
-            ? "native ML acceleration backend is not selected; no-op backend preserves renderer output"
-            : "ml backend disabled";
-    snapshot.mlBackendConfidence = snapshot.mlBackendActive ? 1.0f : 0.0f;
-    snapshot.mlBackendBiasRisk = 0.0f;
+    snapshot.mlBackendActive = m_renderLoop.mlBackendActive();
+    snapshot.mlBackendNativeAccelerationAvailable =
+        m_renderLoop.mlBackendNativeAccelerationAvailable();
+    snapshot.mlBackendProvider = m_renderLoop.mlBackendProvider();
+    snapshot.mlBackendProviderVersion = m_renderLoop.mlBackendProviderVersion();
+    snapshot.mlBackendTensorContract = m_renderLoop.mlBackendTensorContract();
+    snapshot.mlBackendFallbackReason = m_renderLoop.mlBackendFallbackReason();
+    snapshot.mlBackendConfidence = m_renderLoop.mlBackendConfidence();
+    snapshot.mlBackendBiasRisk = m_renderLoop.mlBackendBiasRisk();
+    snapshot.mlBackendPassCount = m_renderLoop.mlBackendDispatchCount();
     snapshot.mlModelPackagePath = m_settings.mlModelPackagePath;
     const auto& pipelineReport = m_pipelines.compilationReport();
     snapshot.pipelineCompilationAvailable = pipelineReport.available;
     snapshot.pipelineRuntimeSourceCompilation = pipelineReport.runtimeSourceCompilation;
     snapshot.pipelineFunctionConstantsUsed = pipelineReport.functionConstantsUsed;
     snapshot.pipelineMetalBinaryArchiveUsed = pipelineReport.metalBinaryArchiveUsed;
+    snapshot.pipelineMetalBinaryArchiveSerialized = pipelineReport.metalBinaryArchiveSerialized;
     snapshot.pipelineHarvestedCompilationReady = pipelineReport.harvestedCompilationReady;
     snapshot.pipelineShaderSourceBytes = pipelineReport.shaderSourceBytes;
     snapshot.pipelineLibraryCompileMs = pipelineReport.libraryCompileMs;
@@ -5579,6 +7126,7 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
     snapshot.pipelineFailedPipelineCount = pipelineReport.failedPipelineCount;
     snapshot.pipelineCacheStrategy = pipelineReport.cacheStrategy;
     snapshot.pipelineSpecializationStrategy = pipelineReport.specializationStrategy;
+    snapshot.pipelineBinaryArchivePath = pipelineReport.binaryArchivePath;
     snapshot.pipelineCompileKeys.reserve(pipelineReport.records.size());
     snapshot.pipelineCompileFunctions.reserve(pipelineReport.records.size());
     snapshot.pipelineCompileStages.reserve(pipelineReport.records.size());
@@ -5605,6 +7153,7 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
     snapshot.passGraphResourceTargetOwners.reserve(passGraph.resources.size());
     snapshot.passGraphResourceFeatureGates.reserve(passGraph.resources.size());
     snapshot.passGraphResourceDebugReadbackPolicies.reserve(passGraph.resources.size());
+    snapshot.passGraphResourceClearLoadPolicies.reserve(passGraph.resources.size());
     snapshot.passGraphResourceMigrationRisks.reserve(passGraph.resources.size());
     snapshot.passGraphResourceFirstPasses.reserve(passGraph.resources.size());
     snapshot.passGraphResourceLastPasses.reserve(passGraph.resources.size());
@@ -5626,6 +7175,7 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
         snapshot.passGraphResourceTargetOwners.push_back(resource.targetOwner);
         snapshot.passGraphResourceFeatureGates.push_back(resource.featureGate);
         snapshot.passGraphResourceDebugReadbackPolicies.push_back(resource.debugReadbackPolicy);
+        snapshot.passGraphResourceClearLoadPolicies.push_back(resource.clearLoadPolicy);
         snapshot.passGraphResourceMigrationRisks.push_back(resource.migrationRisk);
         snapshot.passGraphResourceHotPath.push_back(resource.hotPath ? 1u : 0u);
         snapshot.passGraphResourceTemporaryShared.push_back(resource.temporaryShared ? 1u : 0u);
@@ -5671,6 +7221,22 @@ MetalRenderer::RuntimeStatsSnapshot MetalRenderer::Impl::runtimeStatsSnapshot() 
     }
 
     const auto* stats = reinterpret_cast<const PathtraceStats*>([statsBuffer contents]);
+    static_assert(PathTracerShaderTypes::kSssWalkStatCount == 5u, "sss walk stat layout mismatch");
+    snapshot.sssMaxSteps = m_settings.sssMaxSteps;
+    const auto& sssScene = activeSceneResources();
+    const uint32_t sssMaterialCount = std::min(sssScene.materialCount(), PathTracerShaderTypes::kMaxMaterials);
+    for (uint32_t m = 0u; m < sssMaterialCount; ++m) {
+        RuntimeStatsSnapshot::SssWalkMaterialStats entry;
+        for (uint32_t i = 0u; i < PathTracerShaderTypes::kSssWalkStatCount; ++i) {
+            const auto& counter = stats->sssWalkStats[m * PathTracerShaderTypes::kSssWalkStatCount + i];
+            entry.stats[i] = (static_cast<uint64_t>(counter.hi) << 32u) | static_cast<uint64_t>(counter.lo);
+            snapshot.sssWalkStats[i] += entry.stats[i];
+        }
+        if (entry.stats[PathTracerShaderTypes::kSssWalkStatWalks] > 0u) {
+            entry.material = sssScene.materialName(m);
+            snapshot.sssWalkMaterials.push_back(std::move(entry));
+        }
+    }
     const uint64_t primaryRayCount = static_cast<uint64_t>(stats->primaryRayCount);
     const uint64_t hardwareRayCount = static_cast<uint64_t>(stats->hardwareRayCount);
     const uint64_t shadowRayCount = static_cast<uint64_t>(stats->shadowRayCount);
@@ -5746,8 +7312,8 @@ void MetalRenderer::Impl::handleSaveExrRequest(const std::string& path) {
         rgba[4 * i + 0] = linearRGB[3 * i + 0];
         rgba[4 * i + 1] = linearRGB[3 * i + 1];
         rgba[4 * i + 2] = linearRGB[3 * i + 2];
-        const float alpha = sampleCounts.empty() ? 1.0f : sampleCounts[i];
-        rgba[4 * i + 3] = alpha;
+        // The image is opaque; per-pixel sample counts go in the separate SAMPLES channel.
+        rgba[4 * i + 3] = 1.0f;
     }
 
     const bool hasSamples = !sampleCounts.empty();
@@ -5881,6 +7447,12 @@ void MetalRenderer::Impl::shutdown() {
         }
     }
 
+    writeInteractiveStatsJson();
+
+    if (m_sourcePipelines) {
+        m_sourcePipelines->shutdown();
+        m_sourcePipelines.reset();
+    }
     m_pipelines.shutdown();
 #if HAS_IMGUI
     if (m_overlayInitialized) {
@@ -5914,7 +7486,7 @@ bool MetalRenderer::init(void* windowHandle, const MetalRendererOptions& options
     NSWindow* window = nullptr;
     if (windowHandle) {
         window = (__bridge NSWindow*)windowHandle;
-        [window setTitle:[NSString stringWithUTF8String:options.windowTitle.c_str()]];
+        ConfigureCenteredWindowTitle(window, options.windowTitle);
     }
     return m_impl->initialize(window, options);
 }
@@ -6242,7 +7814,7 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
     return false;
 #else
     MTLBufferHandle debugBuffer = m_renderLoop.debugBuffer();
-    if (!debugBuffer || !m_settings.enablePathDebug || !m_settings.debugDirectLightAudit) {
+    if (!debugBuffer || !m_settings.debugDirectLightAudit) {
         return false;
     }
     const auto* debugData =
@@ -6257,9 +7829,11 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
     }
 
     constexpr uint32_t kDebugEventShadingNormal = 12u;
+    constexpr uint32_t kDebugEventBsdfState = 18u;
     constexpr uint32_t kDebugEventBsdfRng = 19u;
     constexpr uint32_t kDebugEventDirectLightAuditMeta = 26u;
     constexpr uint32_t kDebugEventDirectLightAuditMaterial = 29u;
+    constexpr uint32_t kDebugEventDirectLightAuditMaterialExt = 48u;
     constexpr uint32_t kDebugEventDirectLightAuditEval = 27u;
     constexpr uint32_t kDebugEventDirectLightAuditContrib = 28u;
     constexpr uint32_t kDebugEventDirectLightAuditShadowRaw = 30u;
@@ -6279,6 +7853,8 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
     constexpr uint32_t kDebugEventWorldReuseWeights = 44u;
     constexpr uint32_t kDebugEventCacheReuseAudit = 45u;
     constexpr uint32_t kDebugEventCacheReuseWeights = 46u;
+    constexpr uint32_t kDebugEventRisAuditRng = 47u;
+    constexpr uint32_t kDebugEventRisAuditCandidate = 49u;
     constexpr int32_t kDirectLightAuditKindEmissivePrimitive = 1;
     constexpr uint32_t kAuditEntryKindBit = 0x80000000u;
 
@@ -6293,8 +7869,19 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
         bool sawEval = false;
         bool sawContrib = false;
     };
+    struct TempBsdfEntry {
+        HeadlessRenderOutput::DirectLightBsdfAuditEntry value{};
+        bool sawRng = false;
+        bool sawState = false;
+    };
+    auto floatBitsToUInt = [](float value) {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    };
 
     std::unordered_map<uint32_t, TempEntry> entries;
+    std::unordered_map<uint32_t, TempBsdfEntry> bsdfEntries;
     bool foundAny = false;
     uint32_t selectedSampleIndex = 0u;
     bool foundDepthZeroSample = false;
@@ -6310,7 +7897,40 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
 
     for (uint32_t i = 0; i < debugCount; ++i) {
         const auto& entry = debugData->entries[i];
-        if (entry.sampleIndex != selectedSampleIndex || entry.depth != 0u) {
+        if (entry.sampleIndex != selectedSampleIndex) {
+            continue;
+        }
+        if (entry.eventKind == kDebugEventBsdfRng) {
+            auto& dst = bsdfEntries[entry.depth];
+            dst.value.depth = entry.depth;
+            dst.value.materialIndex = entry.materialIndex;
+            dst.value.frontFace = entry.frontFace != 0u;
+            dst.value.isDelta = entry.scatterIsDelta != 0u;
+            dst.value.shadingNormal = simd_make_float3(entry.throughput.x, entry.throughput.y, entry.throughput.z);
+            dst.value.rngBefore = floatBitsToUInt(entry.scalars.x);
+            dst.value.rngAfter = floatBitsToUInt(entry.scalars.y);
+            dst.value.closureType = static_cast<uint32_t>(entry.scalars.z);
+            dst.value.usedRandomWalk = entry.scalars.w > 0.5f;
+            dst.value.wo = simd_make_float3(entry.aux.x, entry.aux.y, entry.aux.z);
+            dst.sawRng = true;
+            if (entry.depth == 0u) {
+                outDump.wo = dst.value.wo;
+            }
+            continue;
+        }
+        if (entry.eventKind == kDebugEventBsdfState) {
+            auto& dst = bsdfEntries[entry.depth];
+            dst.value.depth = entry.depth;
+            dst.value.materialIndex = entry.materialIndex;
+            dst.value.frontFace = entry.frontFace != 0u;
+            dst.value.isDelta = entry.scatterIsDelta != 0u;
+            dst.value.incidentDirection =
+                simd_make_float3(entry.throughput.x, entry.throughput.y, entry.throughput.z);
+            dst.value.pdf = entry.scalars.x;
+            dst.value.directionalPdf = entry.scalars.y;
+            dst.value.lobeType = static_cast<uint32_t>(entry.scalars.z);
+            dst.value.sampledDirection = simd_make_float3(entry.aux.x, entry.aux.y, entry.aux.z);
+            dst.sawState = true;
             continue;
         }
         switch (entry.eventKind) {
@@ -6323,6 +7943,7 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
                 outDump.materialIndex = entry.materialIndex;
                 outDump.materialType = static_cast<uint32_t>(entry.scalars.x);
                 outDump.primitiveIndex = static_cast<uint32_t>(entry.scalars.y);
+                outDump.rawMaterialType = static_cast<uint32_t>(entry.scalars.z);
                 outDump.hitPosition = simd_make_float3(entry.throughput.x, entry.throughput.y, entry.throughput.z);
                 outDump.shadingNormal = simd_make_float3(entry.aux.x, entry.aux.y, entry.aux.z);
                 foundAny = true;
@@ -6334,6 +7955,24 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
                 outDump.baseColorLod = entry.scalars.w;
                 outDump.baseColorTextureIndex = static_cast<uint32_t>(entry.aux.x);
                 break;
+            case kDebugEventDirectLightAuditMaterialExt:
+                outDump.pbrParams =
+                    simd_make_float4(entry.throughput.x,
+                                     entry.throughput.y,
+                                     entry.throughput.z,
+                                     entry.scalars.x);
+                outDump.typeEta =
+                    simd_make_float4(static_cast<float>(outDump.rawMaterialType),
+                                     entry.scalars.y,
+                                     0.0f,
+                                     0.0f);
+                outDump.pbrExtras =
+                    simd_make_float4(entry.aux.x,
+                                     entry.aux.y,
+                                     entry.scalars.z,
+                                     entry.aux.z);
+                outDump.diffuseOcclusion = entry.scalars.w;
+                break;
             case kDebugEventShadingNormal:
                 if (!foundAny) {
                     outDump.pixelX = entry.pixelX;
@@ -6343,9 +7982,6 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
                     outDump.materialIndex = entry.materialIndex;
                 }
                 outDump.shadingNormal = simd_make_float3(entry.aux.x, entry.aux.y, entry.aux.z);
-                break;
-            case kDebugEventBsdfRng:
-                outDump.wo = simd_make_float3(entry.aux.x, entry.aux.y, entry.aux.z);
                 break;
             case kDebugEventDirectLightAuditEval: {
                 uint32_t lightIndex = static_cast<uint32_t>(entry.scalars.x);
@@ -6466,6 +8102,28 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
                 outDump.ris.winnerNDotL = entry.aux.y;
                 outDump.ris.winnerBsdfPdf = entry.aux.z;
                 break;
+            case kDebugEventRisAuditRng:
+                outDump.ris.available = true;
+                outDump.ris.rngBefore = floatBitsToUInt(entry.throughput.x);
+                outDump.ris.rngAfter = floatBitsToUInt(entry.throughput.y);
+                outDump.ris.rngTemporalBefore = floatBitsToUInt(entry.scalars.x);
+                outDump.ris.rngTemporalAfter = floatBitsToUInt(entry.scalars.y);
+                break;
+            case kDebugEventRisAuditCandidate: {
+                HeadlessRenderOutput::RisCandidateAuditEntry candidate{};
+                candidate.candidateIndex = static_cast<uint32_t>(entry.scalars.x);
+                candidate.primitiveIndex = static_cast<uint32_t>(entry.scalars.y);
+                candidate.valid = entry.scalars.z > 0.5f;
+                candidate.rngBefore = floatBitsToUInt(entry.scalars.w);
+                candidate.rngAfter = floatBitsToUInt(entry.aux.x);
+                candidate.reservoirM = static_cast<uint32_t>(entry.aux.y);
+                candidate.reservoirWSum = entry.aux.z;
+                candidate.phat = entry.throughput.x;
+                candidate.weight = entry.throughput.y;
+                candidate.pdf = entry.throughput.z;
+                outDump.risCandidates.push_back(candidate);
+                break;
+            }
             case kDebugEventRisAuditWinnerA:
                 outDump.ris.available = true;
                 outDump.ris.winnerPosition =
@@ -6573,6 +8231,21 @@ bool MetalRenderer::Impl::captureDirectLightAuditDump(HeadlessRenderOutput::Dire
     if (!foundAny) {
         outDump = HeadlessRenderOutput::DirectLightAuditDump{};
         return false;
+    }
+
+    std::vector<uint32_t> orderedBsdfDepths;
+    orderedBsdfDepths.reserve(bsdfEntries.size());
+    for (const auto& [depth, _] : bsdfEntries) {
+        orderedBsdfDepths.push_back(depth);
+    }
+    std::sort(orderedBsdfDepths.begin(), orderedBsdfDepths.end());
+    outDump.bsdfPath.clear();
+    outDump.bsdfPath.reserve(orderedBsdfDepths.size());
+    for (uint32_t depth : orderedBsdfDepths) {
+        const auto& tmp = bsdfEntries[depth];
+        if (tmp.sawRng || tmp.sawState) {
+            outDump.bsdfPath.push_back(tmp.value);
+        }
     }
 
     std::vector<uint32_t> ordered;

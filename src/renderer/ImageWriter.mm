@@ -136,12 +136,31 @@ inline Vec3 tonemapHable(const Vec3& color) {
     return clampVec(mapped / white, 0.0f, 1.0f);
 }
 
+inline Vec3 tonemapExponential(const Vec3& color) {
+    return Vec3(1.0f - std::exp(-std::max(color.x, 0.0f)),
+                1.0f - std::exp(-std::max(color.y, 0.0f)),
+                1.0f - std::exp(-std::max(color.z, 0.0f)));
+}
+
+// Tungsten's Tonemap::Filmic. The curve has its gamma built in. It is evaluated unfused, in Tungsten's float
+// order (a fused multiply-add changes the last bit), so the float result matches the reference implementation.
+inline Vec3 tonemapTungstenFilmic(const Vec3& color) {
+    auto curve = [](float c) {
+#pragma clang fp contract(off)
+        const float x = std::max(0.0f, c - 0.004f);
+        return (x * (6.2f * x + 0.5f)) / (x * (6.2f * x + 1.7f) + 0.06f);
+    };
+    return clampVec(Vec3(curve(color.x), curve(color.y), curve(color.z)), 0.0f, 1.0f);
+}
+
 inline Vec3 applyTonemap(const Vec3& linearColor, const TonemapSettings& tonemap) {
     Vec3 color = linearColor * std::pow(2.0f, tonemap.exposure);
 
     switch (tonemap.tonemapMode) {
         case 2:
-            color = (tonemap.acesVariant == 0) ? ACESFitted(color) : ACESSimple(color);
+            // Variant 2 matches Falcor's ToneMapper: ACES with its 0.6 pre-exposure, sRGB encoded.
+            color = (tonemap.acesVariant == 0) ? ACESFitted(color)
+                  : ACESSimple(tonemap.acesVariant == 2 ? color * 0.6f : color);
             break;
         case 3:
             color = tonemapReinhard(color, tonemap.reinhardWhitePoint);
@@ -149,16 +168,126 @@ inline Vec3 applyTonemap(const Vec3& linearColor, const TonemapSettings& tonemap
         case 4:
             color = tonemapHable(color);
             break;
+        case 5:
+            color = tonemapExponential(color);
+            break;
+        case 6:
+            // Tungsten filmic is already display-referred: skip the sRGB / gamma encode below.
+            return tonemapTungstenFilmic(color);
         default:
             color = clampVec(color, 0.0f, 1.0f);
             break;
     }
 
+    // Piecewise sRGB matches the sRGB tag WritePNG attaches; the Falcor variant is always sRGB.
+    if (tonemap.srgbEncode || (tonemap.tonemapMode == 2 && tonemap.acesVariant == 2)) {
+        auto encode = [](float c) {
+            c = std::max(c, 0.0f);
+            return (c <= 0.0031308f) ? 12.92f * c : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+        };
+        return clampVec(Vec3(encode(color.x), encode(color.y), encode(color.z)), 0.0f, 1.0f);
+    }
+
+    // Legacy pure gamma 2.2 (renderer token srgbOutput=0).
     const float gamma = 1.0f / 2.2f;
     color.x = std::pow(std::max(color.x, 0.0f), gamma);
     color.y = std::pow(std::max(color.y, 0.0f), gamma);
     color.z = std::pow(std::max(color.z, 0.0f), gamma);
     return clampVec(color, 0.0f, 1.0f);
+}
+
+// Path-Tracing reference bloom (postprocess, bloomDownsample, bloomUpsample and
+// composition.comp): soft-knee threshold 1 on the exposed color, a 13-tap
+// downsample and 3x3 tent upsample over the mip chain, added at intensity * 0.1
+// before tone mapping. Returns the result in unexposed linear units.
+struct BloomLevel {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<Vec3> texels;
+
+    Vec3 sample(float u, float v) const {  // Bilinear, clamp to edge.
+        const float x = std::clamp(u * static_cast<float>(width) - 0.5f, 0.0f, static_cast<float>(width - 1));
+        const float y = std::clamp(v * static_cast<float>(height) - 0.5f, 0.0f, static_cast<float>(height - 1));
+        const uint32_t x0 = static_cast<uint32_t>(x);
+        const uint32_t y0 = static_cast<uint32_t>(y);
+        const uint32_t x1 = std::min(x0 + 1u, width - 1u);
+        const uint32_t y1 = std::min(y0 + 1u, height - 1u);
+        const float fx = x - static_cast<float>(x0);
+        const float fy = y - static_cast<float>(y0);
+        return texels[y0 * width + x0] * ((1.0f - fx) * (1.0f - fy)) +
+               texels[y0 * width + x1] * (fx * (1.0f - fy)) +
+               texels[y1 * width + x0] * ((1.0f - fx) * fy) +
+               texels[y1 * width + x1] * (fx * fy);
+    }
+};
+
+std::vector<float> ApplyReferenceBloom(const float* linearRGB,
+                                       uint32_t width,
+                                       uint32_t height,
+                                       float exposure,
+                                       float intensity) {
+    const float exposureScale = std::pow(2.0f, exposure);
+    const uint32_t mipCount = static_cast<uint32_t>(std::floor(std::log2(std::max(width, height)))) + 1u;
+    const uint32_t maxMip = std::min(mipCount > 3u ? mipCount - 3u : 1u, 12u);
+
+    std::vector<BloomLevel> mips(maxMip);
+    mips[0] = {width, height, std::vector<Vec3>(static_cast<size_t>(width) * height)};
+    for (size_t i = 0; i < mips[0].texels.size(); ++i) {
+        const Vec3 color = Vec3(linearRGB[3 * i], linearRGB[3 * i + 1], linearRGB[3 * i + 2]) * exposureScale;
+        const float knee = 0.5f;
+        const float brightness = std::max(color.x, std::max(color.y, color.z));
+        float rq = std::clamp(brightness - (1.0f - knee), 0.0f, 2.0f * knee);
+        rq = (0.25f / knee) * rq * rq;
+        mips[0].texels[i] = color * (std::max(rq, brightness - 1.0f) / std::max(brightness, 1.0e-4f));
+    }
+    for (uint32_t level = 1; level < maxMip; ++level) {
+        const BloomLevel& src = mips[level - 1];
+        BloomLevel& dst = mips[level];
+        dst.width = std::max(width >> level, 1u);
+        dst.height = std::max(height >> level, 1u);
+        dst.texels.resize(static_cast<size_t>(dst.width) * dst.height);
+        const float sx = 1.0f / static_cast<float>(src.width);
+        const float sy = 1.0f / static_cast<float>(src.height);
+        for (uint32_t y = 0; y < dst.height; ++y) {
+            for (uint32_t x = 0; x < dst.width; ++x) {
+                const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(dst.width);
+                const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(dst.height);
+                auto tap = [&](float ox, float oy) { return src.sample(u + ox * sx, v + oy * sy); };
+                dst.texels[y * dst.width + x] =
+                    tap(0, 0) * 0.125f +
+                    (tap(-2, 2) + tap(2, 2) + tap(-2, -2) + tap(2, -2)) * 0.03125f +
+                    (tap(0, 2) + tap(-2, 0) + tap(2, 0) + tap(0, -2)) * 0.0625f +
+                    (tap(-1, 1) + tap(1, 1) + tap(-1, -1) + tap(1, -1)) * 0.125f;
+            }
+        }
+    }
+    for (uint32_t level = maxMip - 1; level > 0; --level) {
+        const BloomLevel& src = mips[level];
+        BloomLevel& dst = mips[level - 1];
+        const float sx = 1.0f / static_cast<float>(src.width);
+        const float sy = 1.0f / static_cast<float>(src.height);
+        for (uint32_t y = 0; y < dst.height; ++y) {
+            for (uint32_t x = 0; x < dst.width; ++x) {
+                const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(dst.width);
+                const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(dst.height);
+                auto tap = [&](float ox, float oy) { return src.sample(u + ox * sx, v + oy * sy); };
+                const Vec3 upsample = tap(0, 0) * 4.0f +
+                                      (tap(0, 1) + tap(-1, 0) + tap(1, 0) + tap(0, -1)) * 2.0f +
+                                      (tap(-1, 1) + tap(1, 1) + tap(-1, -1) + tap(1, -1));
+                dst.texels[y * dst.width + x] = dst.texels[y * dst.width + x] + upsample * (1.0f / 16.0f);
+            }
+        }
+    }
+
+    std::vector<float> result(static_cast<size_t>(width) * height * 3);
+    const float bloomScale = intensity * 0.1f / exposureScale;
+    for (size_t i = 0; i < mips[0].texels.size(); ++i) {
+        const Vec3& bloom = mips[0].texels[i];
+        result[3 * i + 0] = linearRGB[3 * i + 0] + bloom.x * bloomScale;
+        result[3 * i + 1] = linearRGB[3 * i + 1] + bloom.y * bloomScale;
+        result[3 * i + 2] = linearRGB[3 * i + 2] + bloom.z * bloomScale;
+    }
+    return result;
 }
 
 bool WritePPM(const std::string& path,
@@ -241,15 +370,24 @@ bool WriteScanlineEXR(const std::string& path,
                       uint32_t interleavedStride,
                       uint32_t width,
                       uint32_t height,
-                      const std::vector<ChannelDescriptor>& channels,
+                      const std::vector<ChannelDescriptor>& callerChannels,
                       const char* colorspace,
                       std::string* error) {
-    if (width == 0 || height == 0 || channels.empty()) {
+    if (width == 0 || height == 0 || callerChannels.empty()) {
         if (error) {
             *error = "Invalid EXR parameters";
         }
         return false;
     }
+
+    // OpenEXR requires the channel list sorted by name (strcmp order), and readers assign
+    // each scanline's channel blocks to that sorted list by position. The chlist and the
+    // pixel data below both follow this sorted order, so callers may list channels in any order.
+    std::vector<ChannelDescriptor> channels = callerChannels;
+    std::stable_sort(channels.begin(), channels.end(),
+                     [](const ChannelDescriptor& a, const ChannelDescriptor& b) {
+                         return std::strcmp(a.name ? a.name : "", b.name ? b.name : "") < 0;
+                     });
 
     FILE* file = std::fopen(path.c_str(), "wb");
     if (!file) {
@@ -377,7 +515,8 @@ bool WriteScanlineEXR(const std::string& path,
     }
 
     if (colorspace && colorspace[0] != '\0') {
-        uint32_t size = static_cast<uint32_t>(std::strlen(colorspace) + 1);
+        // EXR string attributes carry their length in the attribute size, with no NUL terminator.
+        uint32_t size = static_cast<uint32_t>(std::strlen(colorspace));
         if (!beginAttribute("colorspace", "string", size) ||
             !writeBytes(colorspace, size)) {
             std::fclose(file);
@@ -615,6 +754,13 @@ bool WriteImage(const std::string& path,
                 uint32_t height,
                 const TonemapSettings& tonemap,
                 std::string* errorMessage) {
+    std::vector<float> bloomed;
+    if (tonemap.referenceBloomIntensity > 0.0f && linearRGB && width > 0 && height > 0 &&
+        (format == ImageFileFormat::PNG || format == ImageFileFormat::PPM)) {
+        bloomed = ApplyReferenceBloom(linearRGB, width, height, tonemap.exposure,
+                                      tonemap.referenceBloomIntensity);
+        linearRGB = bloomed.data();
+    }
     switch (format) {
         case ImageFileFormat::EXR:
             return WriteEXR(path, linearRGB, width, height, nullptr, errorMessage);

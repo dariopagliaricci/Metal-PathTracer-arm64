@@ -2,6 +2,8 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
+
 namespace PathTracer {
 
 namespace {
@@ -10,12 +12,6 @@ MTLResourceOptions MetalResourceOptionsFor(StorageClass storage) {
     switch (storage) {
         case StorageClass::Private:
             return MTLResourceStorageModePrivate;
-        case StorageClass::Managed:
-#if TARGET_OS_OSX
-            return MTLResourceStorageModeManaged;
-#else
-            return MTLResourceStorageModeShared;
-#endif
         case StorageClass::Shared:
         case StorageClass::Unknown:
         case StorageClass::External:
@@ -29,8 +25,6 @@ TransportMemoryStorageClass TransportStorageClassFor(StorageClass storage) {
     switch (storage) {
         case StorageClass::Private:
             return TransportMemoryStorageClass::Private;
-        case StorageClass::Managed:
-            return TransportMemoryStorageClass::Managed;
         case StorageClass::External:
             return TransportMemoryStorageClass::External;
         case StorageClass::Shared:
@@ -48,6 +42,34 @@ void TransportMemoryAllocator::clear() {
     ++m_generation;
 }
 
+void TransportMemoryAllocator::releaseOwner(TransportMemoryOwner owner) {
+    const size_t oldSize = m_records.size();
+    m_records.erase(
+        std::remove_if(m_records.begin(),
+                       m_records.end(),
+                       [owner](const TransportMemoryRecord& existing) {
+                           return existing.owner == owner;
+                       }),
+        m_records.end());
+    if (m_records.size() != oldSize) {
+        ++m_generation;
+    }
+}
+
+void TransportMemoryAllocator::releaseOwners(std::initializer_list<TransportMemoryOwner> owners) {
+    const size_t oldSize = m_records.size();
+    m_records.erase(
+        std::remove_if(m_records.begin(),
+                       m_records.end(),
+                       [&owners](const TransportMemoryRecord& existing) {
+                           return std::find(owners.begin(), owners.end(), existing.owner) != owners.end();
+                       }),
+        m_records.end());
+    if (m_records.size() != oldSize) {
+        ++m_generation;
+    }
+}
+
 MTLBufferHandle TransportMemoryAllocator::allocateBuffer(MTLDeviceHandle device,
                                                          TransportMemoryRecord record,
                                                          StorageClass storage,
@@ -55,6 +77,14 @@ MTLBufferHandle TransportMemoryAllocator::allocateBuffer(MTLDeviceHandle device,
     if (!device || record.bytes == 0u) {
         return nullptr;
     }
+
+    m_records.erase(
+        std::remove_if(m_records.begin(),
+                       m_records.end(),
+                       [&record](const TransportMemoryRecord& existing) {
+                           return existing.name == record.name;
+                       }),
+        m_records.end());
 
     id<MTLBuffer> buffer =
         [device newBufferWithLength:static_cast<NSUInteger>(record.bytes)

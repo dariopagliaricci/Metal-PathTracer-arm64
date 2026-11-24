@@ -285,7 +285,7 @@ bool DenoiserContext::initialize(MTLDeviceHandle metalDevice, MTLCommandQueueHan
     m_commandQueue = commandQueue;
 
     try {
-        // Create OIDN device with Metal backend using C API
+        // Create OIDN CPU device using C API
         // NOTE: This creates a CPU-based OIDN device. Metal GPU denoising would require
         // Metal compute shaders or OIDN's experimental Metal support.
         OIDNDevice device = oidnNewDevice(OIDN_DEVICE_TYPE_CPU);

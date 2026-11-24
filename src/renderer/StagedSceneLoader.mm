@@ -13,23 +13,6 @@ namespace PathTracer {
 
 namespace {
 
-const char* PhaseName(ScenePhase phase) {
-    switch (phase) {
-        case ScenePhase::Idle: return "Idle";
-        case ScenePhase::ParseSceneDesc: return "ParseSceneDesc";
-        case ScenePhase::ImportGeometry: return "ImportGeometry";
-        case ScenePhase::BuildCPUMaterialTables: return "BuildCPUMaterialTables";
-        case ScenePhase::AwaitingMainThread: return "AwaitingMainThread";
-        case ScenePhase::UploadBuffers: return "UploadBuffers";
-        case ScenePhase::BuildBLASBatch: return "BuildBLASBatch";
-        case ScenePhase::AssembleTLAS: return "AssembleTLAS";
-        case ScenePhase::FinalizeRenderState: return "FinalizeRenderState";
-        case ScenePhase::Complete: return "Complete";
-        case ScenePhase::Failed: return "Failed";
-    }
-    return "Unknown";
-}
-
 bool SceneLoadDiagnosticsEnabled() {
     static const bool enabled = []() {
         const char* value = std::getenv("PT_SCENE_LOAD_DIAGNOSTICS");

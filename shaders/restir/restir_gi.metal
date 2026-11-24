@@ -4,7 +4,7 @@ inline bool restir_gi_diffuse_candidate_valid(const BsdfSampleResult candidate,
                                               const bool specularOnly) {
     return depth == 0u &&
            !specularOnly &&
-           restir_prototype_diffuse_material_eligible(material) &&
+           restir_diffuse_material_eligible(material) &&
            candidate.pdf > 0.0f &&
            candidate.directionalPdf > 0.0f &&
            !candidate.isDelta &&
@@ -81,8 +81,9 @@ inline void update_restir_gi_reservoir(device RestirPtReservoirState* restirGiRe
     reservoir.normalDepth = float4(safe_normalize(normal), 0.0f);
     reservoir.directionWeight = float4(safe_normalize(sample.direction), sampleLuma);
     reservoir.throughputLuma = float4(1.0f, 1.0f, 1.0f, sampleLuma);
-    reservoir.materialType = static_cast<uint>(material.typeEta.x);
-    reservoir.lobeType = sample.lobeType;
+    const MaterialClosureMetadata closure = material_closure_metadata_for_sample(material, sample);
+    reservoir.materialType = closure.type;
+    reservoir.lobeType = closure.lobeIndex;
     reservoir.frameTag = uniforms.frameIndex;
     reservoir.flags = 1u;
     restirGiReservoirs[restir_path_state_index(uniforms, pixelCoord, 0u)] = reservoir;
@@ -99,7 +100,7 @@ inline bool restir_reweight_bsdf_sample_for_direction(const MaterialData materia
                                                       const bool specularOnly,
                                                       thread BsdfSampleResult& sample);
 
-inline bool apply_restir_gi_diffuse_prototype(constant PathtraceUniforms& uniforms,
+inline bool apply_restir_gi_production_diffuse(constant PathtraceUniforms& uniforms,
                                               const MaterialData material,
                                               const float3 position,
                                               const float3 normal,
@@ -115,7 +116,7 @@ inline bool apply_restir_gi_diffuse_prototype(constant PathtraceUniforms& unifor
                                               device PathtraceStats* stats,
                                               thread uint& state,
                                               thread BsdfSampleResult& sample) {
-    if (uniforms.restirGiMode != kRestirGiModeDiffusePrototype) {
+    if (PT_DEFAULT_OFF(uniforms.restirGiMode) != kRestirGiModeProductionDiffuse) {
         return false;
     }
     if (!restir_gi_diffuse_candidate_valid(sample, material, depth, specularOnly)) {
@@ -144,7 +145,7 @@ inline bool apply_restir_gi_diffuse_prototype(constant PathtraceUniforms& unifor
                                                       wo,
                                                       reservoirDirection,
                                                       clampParams,
-                                                      uniforms.sssMode,
+                                                      PT_DEFAULT_OFF(uniforms.sssMode),
                                                       diffuseOcclusion,
                                                       specularOnly,
                                                       reuseSample)) {

@@ -73,7 +73,7 @@ enum class StorageClass : uint32_t {
     Unknown = 0,
     Private = 1,
     Shared = 2,
-    Managed = 3,
+    // 3 was Managed: it has no effect on Apple Silicon (deprecated in the macOS 27 SDK); use Shared.
     Memoryless = 4,
     External = 5,
 };
@@ -125,6 +125,7 @@ enum class RenderPassExecutionId : uint32_t {
     RestirDiApplyLighting = 15,
     RestirDiDebugAov = 16,
     MlBackendNoOp = 17,
+    MlBackendReconstructionTiny = 18,
 };
 
 enum class DispatchKind : uint32_t {
@@ -186,6 +187,7 @@ struct FrameResourceDesc {
     std::string targetOwner;
     std::string featureGate;
     std::string debugReadbackPolicy;
+    std::string clearLoadPolicy;
     std::string migrationRisk;
     bool hotPath = false;
     bool temporaryShared = false;
@@ -279,6 +281,9 @@ struct RenderPassExecutionResult {
     std::vector<std::string> executedPasses;
     std::vector<std::string> skippedPasses;
     std::vector<std::string> failedPasses;
+    bool passTimingAvailable = false;
+    std::vector<std::string> passTimingNames;
+    std::vector<double> passTimingMs;
 };
 
 const char* RenderPassTypeLabel(RenderPassType type);

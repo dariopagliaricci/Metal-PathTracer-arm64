@@ -122,6 +122,7 @@ inline MaterialClosureMetadata material_closure_metadata_at(const MaterialData m
                                                   kMaterialClosureTypeDielectric,
                                                   kMaterialClosureFlagSpecular |
                                                       kMaterialClosureFlagTransmissive |
+                                                      (source_model(material) == 3.0f ? connectableFlag : 0u) |
                                                       deltaFlag,
                                                   1.0f,
                                                   roughness,
@@ -260,9 +261,26 @@ inline bool material_closure_is_cacheable(const MaterialData material) {
            !material_closure_has_flag(closure, kMaterialClosureFlagDelta);
 }
 
-inline bool material_closure_is_connectable(const MaterialData material) {
+inline bool material_closure_is_delta(const MaterialData material) {
     return material_closure_has_flag(material_primary_closure_metadata(material),
-                                     kMaterialClosureFlagConnectable);
+                                     kMaterialClosureFlagDelta);
+}
+
+inline bool material_closure_primary_is_emissive(const MaterialData material) {
+    return material_closure_has_flag(material_primary_closure_metadata(material),
+                                     kMaterialClosureFlagEmissive);
+}
+
+inline bool material_closure_is_transmissive(const MaterialData material) {
+    return material_closure_has_flag(material_primary_closure_metadata(material),
+                                     kMaterialClosureFlagTransmissive);
+}
+
+inline bool material_closure_direct_lighting_eligible(const MaterialData material) {
+    const MaterialClosureMetadata closure = material_primary_closure_metadata(material);
+    return material_closure_has_flag(closure, kMaterialClosureFlagConnectable) &&
+           !material_closure_has_flag(closure, kMaterialClosureFlagDelta) &&
+           !material_closure_has_flag(closure, kMaterialClosureFlagEmissive);
 }
 
 inline bool material_closure_is_emissive(const MaterialData material) {
@@ -284,21 +302,13 @@ inline float material_closure_aov_roughness(const MaterialData material) {
     return material_primary_closure_metadata(material).aovAlbedoRoughness.w;
 }
 
-inline float3 material_closure_aov_specular(const MaterialData material) {
-    return material_primary_closure_metadata(material).aovSpecularTransmission.xyz;
-}
-
-inline float material_closure_aov_transmission(const MaterialData material) {
-    return material_primary_closure_metadata(material).aovSpecularTransmission.w;
-}
-
 inline float4 material_closure_aov_features(const MaterialData material) {
     const MaterialClosureMetadata closure = material_primary_closure_metadata(material);
     const float specularLuma = luminance_rgb(max(closure.aovSpecularTransmission.xyz, float3(0.0f)));
     return float4(closure.aovAlbedoRoughness.w,
                   closure.aovSpecularTransmission.w,
                   specularLuma,
-                  material.typeEta.x);
+                  float(closure.type));
 }
 
 inline float3 material_closure_aov_emission(const MaterialData material) {

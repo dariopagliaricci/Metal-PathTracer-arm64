@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -21,11 +22,15 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #if PATH_TRACER_ENABLE_ASSIMP
+#include <assimp/DefaultIOSystem.h>
+#include <assimp/IOStream.hpp>
+#include <assimp/IOSystem.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
 #include <assimp/postprocess.h>
@@ -118,20 +123,6 @@ std::string JsonEscape(const std::string& value) {
     return out;
 }
 
-void WriteTextureBindingJson(std::ostringstream& json,
-                             const char* key,
-                             int textureIndex,
-                             int texCoord) {
-    if (textureIndex < 0) {
-        return;
-    }
-    json << ",\"" << key << "\":{\"index\":" << textureIndex;
-    if (texCoord > 0) {
-        json << ",\"texCoord\":" << texCoord;
-    }
-    json << "}";
-}
-
 bool ReadFileBytes(const fs::path& path, std::vector<uint8_t>& outBytes, std::string& error) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream.is_open()) {
@@ -201,6 +192,24 @@ std::string Sha256Hex(const std::vector<uint8_t>& bytes) {
     return out;
 }
 
+std::string Sha256HexString(const std::string& text) {
+    const uint8_t* data = text.empty() ? nullptr : reinterpret_cast<const uint8_t*>(text.data());
+    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
+    CC_SHA256(data, static_cast<CC_LONG>(text.size()), digest.data());
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(digest.size() * 2);
+    for (size_t i = 0; i < digest.size(); ++i) {
+        out[i * 2] = kHex[digest[i] >> 4];
+        out[i * 2 + 1] = kHex[digest[i] & 0x0F];
+    }
+    return out;
+}
+
+std::string StableImportId(const std::string& type, const std::string& source) {
+    return "assimp:" + type + ":" + Sha256HexString(source).substr(0, 16);
+}
+
 bool QueryImageInfoFromData(NSData* data, int& width, int& height) {
     CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, nullptr);
     if (!source) {
@@ -240,12 +249,6 @@ bool QueryImageInfoFromPath(const fs::path& path, int& width, int& height) {
     CFRelease(properties);
     CFRelease(source);
     return ok;
-}
-
-bool IsLinearDataExtension(const std::string& extension) {
-    const std::string lower = ToLowerAscii(extension);
-    return lower == ".dds" || lower == ".png" || lower == ".jpg" || lower == ".jpeg" ||
-           lower == ".tga" || lower == ".bmp" || lower == ".ktx2";
 }
 
 bool EncodeRawTextureToPng(const uint8_t* rgbaBytes,
@@ -383,9 +386,20 @@ struct MeshInfo {
     std::vector<int> primitiveIndices;
 };
 
+struct CameraInfo {
+    std::string name;
+    float yfov = 0.7853982f;
+    float aspect = 1.7777778f;
+    float znear = 0.01f;
+    float zfar = 1000000.0f;
+    std::array<double, 3> translation{0.0, 0.0, 0.0};
+    std::array<double, 4> rotation{0.0, 0.0, 0.0, 1.0};
+};
+
 struct NodeInfo {
     std::string name;
     int mesh = -1;
+    int camera = -1;
     std::vector<int> children;
     std::array<double, 3> translation{0.0, 0.0, 0.0};
     std::array<double, 4> rotation{0.0, 0.0, 0.0, 1.0};
@@ -435,6 +449,19 @@ struct CanonicalManifestEntry {
     std::vector<std::string> unresolved;
 };
 
+struct ZeroDayManifestEntry {
+    std::string materialName;
+    std::string sourceBaseColor;
+    std::string sourceNormal;
+    std::string sourceSpecular;
+    std::string sourceEmissive;
+    bool baseColorAlphaUsed = false;
+    bool normalYFlipped = false;
+    std::string specularAction = "absent";
+    std::string ormTarget = "absent";
+    std::vector<std::string> unresolved;
+};
+
 struct OrmSource {
     enum class Kind {
         Texture,
@@ -478,6 +505,16 @@ struct SceneStats {
     uint32_t meshCount = 0;
     uint64_t triangleCount = 0;
     uint32_t nodeCount = 0;
+};
+
+// Result of the OBJ material check (see ScanObjMaterials / CheckObjMaterialAssignment).
+struct ObjMaterialReport {
+    uint64_t faceCount = 0;
+    size_t materialCount = 0;
+    size_t mismatchedMaterials = 0;
+    uint64_t mtllibDirectives = 0;
+    std::vector<std::string> mtllibLibraries;
+    bool mtllibHoisted = false;
 };
 
 class BinaryWriter {
@@ -535,15 +572,19 @@ struct ImportContext {
     std::vector<ImageInfo> images;
     std::vector<SamplerInfo> samplers;
     std::vector<MeshInfo> meshes;
+    std::vector<CameraInfo> cameras;
     std::vector<NodeInfo> nodes;
     std::vector<int> rootNodes;
     std::vector<TextureInventoryEntry> textureInventory;
     std::vector<ManifestTextureEntry> manifestTextures;
     std::vector<TextureAlphaInfo> textureAlphaInfo;
     std::vector<CanonicalManifestEntry> canonicalManifestEntries;
+    std::vector<ZeroDayManifestEntry> zeroDayManifestEntries;
     std::vector<std::string> warnings;
+    std::optional<ObjMaterialReport> objMaterialReport;
     uint32_t ormTextureCount = 0;
     std::unordered_map<std::string, int> textureByKey;
+    std::unordered_map<std::string, int> cameraByName;
     std::map<std::vector<unsigned int>, int> meshByPrimitiveSet;
 };
 
@@ -593,10 +634,6 @@ void LogMaterialWarning(ImportContext& ctx,
     const std::string full = "[ImportMaterial][warn] " + materialName + ": " + message;
     ctx.warnings.push_back(full);
     std::cerr << full << "\n";
-}
-
-void LogMaterialNote(const std::string& materialName, const std::string& message) {
-    std::cout << "[ImportMaterial][note] " << materialName << ": " << message << "\n";
 }
 
 void LogMaterialDecision(const std::string& materialName,
@@ -758,6 +795,9 @@ std::optional<TextureAsset> ResolveTextureAsset(const ImportContext& ctx,
         pushCandidate(sourceRoot / driveRelative);
         pushCandidate(sourceRoot / driveRelative.filename());
     }
+    // Last resort: archives often ship the scene next to a textures/ folder while
+    // the scene still references the author's absolute path.
+    pushCandidate(sourceDir / "textures" / rawFsPath.filename());
 
     TextureAsset asset;
     for (const fs::path& candidate : candidates) {
@@ -1064,22 +1104,6 @@ int RegisterGeneratedTexture(ImportContext& ctx,
     return textureIndex;
 }
 
-std::optional<int> RegisterMaterialTexture(ImportContext& ctx,
-                                           aiMaterial* material,
-                                           aiTextureType type) {
-    aiString texturePath;
-    if (material->GetTexture(type, 0, &texturePath) != aiReturn_SUCCESS) {
-        return std::nullopt;
-    }
-    std::string error;
-    const auto asset = ResolveTextureAsset(ctx, texturePath, error);
-    if (!asset) {
-        ctx.warnings.push_back(error);
-        return std::nullopt;
-    }
-    return RegisterTexture(ctx, *asset);
-}
-
 std::optional<TextureAsset> ResolveMaterialTextureAsset(const ImportContext& ctx,
                                                         aiMaterial* material,
                                                         aiTextureType type,
@@ -1172,40 +1196,6 @@ std::optional<DecodedTextureCacheEntry> DecodeTextureForOrm(
     }
 }
 
-std::optional<int> RegisterBistroNormalTexture(ImportContext& ctx,
-                                               const TextureAsset& asset,
-                                               const std::string& materialName) {
-    if (asset.sourcePath.empty()) {
-        LogMaterialDecision(materialName,
-                            "NORMALS",
-                            "used",
-                            "embedded normal texture cannot be transformed offline; keeping original texture");
-        return RegisterTexture(ctx, asset);
-    }
-
-    try {
-        Import::DecodedTexture decoded = Import::decodeTextureFile(asset.sourcePath.string());
-        for (size_t i = 1; i < decoded.rgba.size(); i += 4u) {
-            decoded.rgba[i] = static_cast<uint8_t>(255u - decoded.rgba[i]);
-        }
-        LogMaterialDecision(materialName,
-                            "NORMALS",
-                            "used",
-                            "Bistro/CryEngine normal Y flipped to OpenGL convention during import");
-        return RegisterGeneratedTexture(ctx,
-                                        "bistro-normal-yflip:" + asset.key,
-                                        asset.debugName + "_ogl",
-                                        decoded.rgba,
-                                        decoded.width,
-                                        decoded.height);
-    } catch (const std::exception& ex) {
-        LogMaterialWarning(ctx,
-                           materialName,
-                           "failed to flip Bistro normal texture, keeping original: " + std::string(ex.what()));
-        return RegisterTexture(ctx, asset);
-    }
-}
-
 float SampleLinearChannel(const Import::DecodedTexture& texture,
                           uint32_t channel,
                           uint32_t x,
@@ -1270,6 +1260,70 @@ bool IsBistroImport(const ImportContext& ctx) {
            file == "bistroexterior.fbx" ||
            file == "bistrointerior.fbx" ||
            file == "bistrointerior_wine.fbx";
+}
+
+bool IsZeroDayImport(const ImportContext& ctx) {
+    const std::string lower = ToLowerAscii(ctx.sourcePath.string());
+    const std::string file = ToLowerAscii(ctx.sourcePath.filename().string());
+    return lower.find("/zeroday_v1/") != std::string::npos ||
+           lower.find("/zero_day_v1/") != std::string::npos ||
+           file == "measure_one.fbx" ||
+           file == "measure_seven.fbx" ||
+           file == "measure_seven_colored_lights.fbx";
+}
+
+bool IsSunTempleImport(const ImportContext& ctx) {
+    const std::string lower = ToLowerAscii(ctx.sourcePath.string());
+    const std::string file = ToLowerAscii(ctx.sourcePath.filename().string());
+    return lower.find("/suntemple_v4/") != std::string::npos ||
+           lower.find("/suntemple/") != std::string::npos ||
+           file == "suntemple.fbx";
+}
+
+bool IsEmeraldSquareImport(const ImportContext& ctx) {
+    const std::string lower = ToLowerAscii(ctx.sourcePath.string());
+    const std::string file = ToLowerAscii(ctx.sourcePath.filename().string());
+    return lower.find("/emeraldsquare_v4_1/") != std::string::npos ||
+           lower.find("/emerald_square_v4_1/") != std::string::npos ||
+           file == "emeraldsquare_day.fbx" ||
+           file == "emeraldsquare_dusk.fbx";
+}
+
+bool UsePackedOrcaMaterialImport(const ImportContext& ctx) {
+    return IsZeroDayImport(ctx) ||
+           IsEmeraldSquareImport(ctx) ||
+           (IsSunTempleImport(ctx) && UseCanonicalImport(ctx));
+}
+
+
+const char* PackedOrcaImportLabel(const ImportContext& ctx) {
+    if (IsSunTempleImport(ctx)) {
+        return "SunTemple";
+    }
+    if (IsEmeraldSquareImport(ctx)) {
+        return "EmeraldSquare";
+    }
+    return "ZeroDay";
+}
+
+bool IsEmeraldSquareFoliageMaterial(const ImportContext& ctx, std::string_view materialName) {
+    if (!IsEmeraldSquareImport(ctx)) {
+        return false;
+    }
+    const std::string lower = ToLowerAscii(std::string(materialName));
+    return lower.find("leaf") != std::string::npos ||
+           lower.find("leaves") != std::string::npos ||
+           lower.find("foliage") != std::string::npos ||
+           lower.find("fern_fiddlehead") != std::string::npos ||
+           lower.find("fern_leaflets") != std::string::npos;
+}
+
+bool IsEmeraldSquareWorldGridMaterial(const ImportContext& ctx, std::string_view materialName) {
+    if (!IsEmeraldSquareImport(ctx)) {
+        return false;
+    }
+    const std::string lower = ToLowerAscii(std::string(materialName));
+    return lower.rfind("worldgridmaterial", 0) == 0;
 }
 
 namespace canonical {
@@ -1551,6 +1605,127 @@ SourceMaterialBundle BuildSourceMaterialBundle(ImportContext& ctx,
 }
 
 }  // namespace canonical
+
+std::vector<std::string> ZeroDayMaterialNameCandidates(const std::string& materialName) {
+    std::vector<std::string> candidates = canonical::MaterialNameCandidates(materialName);
+    auto push = [&](std::string value) {
+        if (value.empty()) {
+            return;
+        }
+        if (std::find(candidates.begin(), candidates.end(), value) == candidates.end()) {
+            candidates.push_back(std::move(value));
+        }
+    };
+
+    const size_t c4dPos = materialName.find("_c4d");
+    if (c4dPos != std::string::npos) {
+        push(materialName.substr(0, c4dPos));
+    }
+    const size_t slashPos = materialName.find('/');
+    if (slashPos != std::string::npos) {
+        push(materialName.substr(0, slashPos));
+    }
+    return candidates;
+}
+
+std::optional<TextureAsset> ResolveZeroDayTextureByConvention(const ImportContext& ctx,
+                                                              const std::string& materialName,
+                                                              const char* suffix,
+                                                              std::string& error) {
+    const fs::path textureRoot = ctx.sourcePath.parent_path() /
+                                 ((IsSunTempleImport(ctx) || IsEmeraldSquareImport(ctx)) ? "Textures" : "tex");
+    const std::array<std::string, 10> extensions{
+        ".dds", ".DDS", ".tga", ".TGA", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG"};
+    for (const std::string& candidateName : ZeroDayMaterialNameCandidates(materialName)) {
+        for (const std::string& extension : extensions) {
+            const fs::path candidate = textureRoot / (candidateName + suffix + extension);
+            std::error_code ec;
+            if (!fs::exists(candidate, ec) || ec) {
+                continue;
+            }
+            TextureAsset asset;
+            if (BuildFileTexture(candidate, candidate.generic_string(), asset, error)) {
+                return asset;
+            }
+        }
+    }
+    error = std::string("No ") + PackedOrcaImportLabel(ctx) + " source texture matched " +
+            materialName + suffix;
+    return std::nullopt;
+}
+
+// The texture the FBX material connects to the slot wins: Falcor, which the
+// packed ORCA scenes target, binds exactly that file. Some connections name a
+// file other than <material>_<Slot> (Zero Day's "side - white three" emits
+// through "..._Emissive2.dds", the colored-lights floor clickers through
+// "new_light_orange.dds"), so the file-name convention is only the fallback for
+// materials whose FBX connects no texture to the slot. `fromConnection` (when
+// given) reports whether the returned texture is the FBX-connected one.
+// A slot with neither a connection nor a convention file has nothing to bind:
+// it returns nullopt with an empty `error`, which callers do not report.
+std::optional<canonical::LoadedTexture> LoadZeroDayTexture(ImportContext& ctx,
+                                                           aiMaterial* material,
+                                                           const std::string& materialName,
+                                                           std::initializer_list<aiTextureType> connectedTypes,
+                                                           const char* suffix,
+                                                           std::string& error,
+                                                           bool* fromConnection = nullptr) {
+    const std::string slot = std::string(suffix + (suffix[0] == '_' ? 1 : 0));
+    if (fromConnection) {
+        *fromConnection = false;
+    }
+    std::string connectionError;
+    for (aiTextureType type : connectedTypes) {
+        aiString connectedPath;
+        if (material->GetTexture(type, 0, &connectedPath) != aiReturn_SUCCESS) {
+            continue;
+        }
+        std::string resolveError;
+        if (const auto asset = ResolveMaterialTextureAsset(ctx, material, type, resolveError)) {
+            error.clear();
+            if (auto loaded = canonical::LoadTexture(*asset, error)) {
+                LogMaterialDecision(materialName,
+                                    slot,
+                                    "fbx_connection",
+                                    std::string(PackedOrcaImportLabel(ctx)) + " texture the FBX connects: " +
+                                        ReplaceBackslashes(connectedPath.C_Str()));
+                if (fromConnection) {
+                    *fromConnection = true;
+                }
+                return loaded;
+            }
+            resolveError = error;
+        }
+        connectionError = "FBX connection " + ReplaceBackslashes(connectedPath.C_Str()) +
+                          " did not load" + (resolveError.empty() ? std::string() : ": " + resolveError);
+        LogMaterialWarning(ctx, materialName, std::string(PackedOrcaImportLabel(ctx)) + " " + slot + " " +
+                                                  connectionError + "; trying the next source");
+    }
+    std::string conventionError;
+    const auto conventionAsset = ResolveZeroDayTextureByConvention(ctx, materialName, suffix, conventionError);
+    if (conventionAsset) {
+        error.clear();
+        if (auto loaded = canonical::LoadTexture(*conventionAsset, error)) {
+            LogMaterialDecision(materialName,
+                                slot,
+                                connectionError.empty() ? "file_name_convention" : "file_name_convention_after_failed_connection",
+                                std::string(PackedOrcaImportLabel(ctx)) +
+                                    (connectionError.empty() ? " FBX connects no texture; " : " " + connectionError + "; ") +
+                                    "using " + ReplaceBackslashes(conventionAsset->sourcePath.string()));
+            return loaded;
+        }
+        conventionError = error;
+    } else if (connectionError.empty()) {
+        // No connection and no convention file: nothing to bind, nothing to report.
+        error.clear();
+        return std::nullopt;
+    }
+    error = connectionError;
+    if (!conventionError.empty()) {
+        error += (error.empty() ? std::string() : "; ") + conventionError;
+    }
+    return std::nullopt;
+}
 
 OrmResolution ChooseOrmResolution(const std::vector<const Import::DecodedTexture*>& varyingTextures,
                                   uint32_t baseColorWidth,
@@ -1919,15 +2094,15 @@ void ConvertCanonicalMaterials(ImportContext& ctx) {
             manifest.normalAlphaMax = bundle.normal->alphaStats.maxValue;
             manifest.normalAlphaStd = bundle.normal->alphaStats.stddev;
 
-            Import::DecodedTexture normalDecoded = bundle.normal->decoded.decoded;
-            for (size_t px = 1; px < normalDecoded.rgba.size(); px += 4u) {
-                normalDecoded.rgba[px] = static_cast<uint8_t>(255u - normalDecoded.rgba[px]);
-            }
-            manifest.normalYFlipped = true;
+            // Keep the source G: the reflected V and tangent.w negate the
+            // bitangent, which keeps the world-space normal that the earlier
+            // unreflected frame with a G flip produced.
+            const Import::DecodedTexture& normalDecoded = bundle.normal->decoded.decoded;
+            manifest.normalYFlipped = false;
             LogMaterialDecision(info.name,
                                 "NORMALS",
                                 "used",
-                                "canonical CryEngine normal G flipped during decode");
+                                "canonical CryEngine normal G preserved for the reflected V/bitangent frame");
             info.normalTexture = RegisterGeneratedTexture(ctx,
                                                           "canonical-normal:" + info.name,
                                                           info.name + "_canonical_normal",
@@ -2011,7 +2186,218 @@ void ConvertCanonicalMaterials(ImportContext& ctx) {
     }
 }
 
+void ConvertZeroDayMaterials(ImportContext& ctx) {
+    ctx.materials.reserve(ctx.scene->mNumMaterials);
+    ctx.zeroDayManifestEntries.reserve(ctx.scene->mNumMaterials);
+    for (unsigned int i = 0; i < ctx.scene->mNumMaterials; ++i) {
+        aiMaterial* material = ctx.scene->mMaterials[i];
+        MaterialInfo info;
+        aiString name;
+        if (AI_SUCCESS == material->Get(AI_MATKEY_NAME, name)) {
+            info.name = name.C_Str();
+        } else {
+            info.name = "material_" + std::to_string(i);
+        }
+
+        info.baseColorFactor = ReadBaseColor(material);
+        info.roughnessFactor = 1.0f;
+        info.metallicFactor = 0.0f;
+        info.emissiveFactor = ReadEmissive(material);
+        int twoSided = 0;
+        material->Get(AI_MATKEY_TWOSIDED, twoSided);
+        info.doubleSided = (twoSided != 0);
+        if (ContainsCaseInsensitive(info.name, ".doublesided") ||
+            ContainsCaseInsensitive(info.name, "_doublesided")) {
+            info.doubleSided = true;
+        }
+
+        ZeroDayManifestEntry manifest;
+        manifest.materialName = info.name;
+        auto pathString = [](const std::optional<canonical::LoadedTexture>& texture) -> std::string {
+            if (!texture) {
+                return "";
+            }
+            return ReplaceBackslashes(texture->asset.sourcePath.string());
+        };
+
+        std::string error;
+        const auto baseColor = LoadZeroDayTexture(ctx,
+                                                  material,
+                                                  info.name,
+                                                  {aiTextureType_DIFFUSE, aiTextureType_BASE_COLOR},
+                                                  "_BaseColor",
+                                                  error);
+        if (baseColor) {
+            const int tex = RegisterTexture(ctx, baseColor->asset);
+            info.baseColorTexture = tex;
+            info.baseColorTexCoord = canonical::GetTextureUvIndex(material, aiTextureType_DIFFUSE);
+            const TextureAlphaInfo& alphaInfo = GetTextureAlphaInfo(ctx, tex);
+            if (alphaInfo.hasAlpha) {
+                info.alphaMode = alphaInfo.binaryAlpha ? "MASK" : "BLEND";
+                info.alphaCutoff = alphaInfo.binaryAlpha ? 0.5f : info.alphaCutoff;
+                if (IsEmeraldSquareFoliageMaterial(ctx, info.name)) {
+                    info.alphaMode = "MASK";
+                    info.alphaCutoff = 0.5f;
+                }
+                manifest.baseColorAlphaUsed = true;
+            }
+            LogMaterialDecision(info.name,
+                                "BASE_COLOR_ALPHA",
+                                alphaInfo.hasAlpha ? "used" : "used_rgb_alpha_opaque",
+                                std::string(PackedOrcaImportLabel(ctx)) +
+                                    " BaseColor RGB plus opacity alpha imported through source texture");
+        } else if (!error.empty()) {
+            manifest.unresolved.push_back("baseColor: " + error);
+            LogMaterialWarning(ctx,
+                               info.name,
+                               std::string(PackedOrcaImportLabel(ctx)) + " baseColor unresolved: " + error);
+        }
+        manifest.sourceBaseColor = pathString(baseColor);
+
+        error.clear();
+        bool emissiveFromConnection = false;
+        const auto emissive = LoadZeroDayTexture(ctx,
+                                                 material,
+                                                 info.name,
+                                                 {aiTextureType_EMISSIVE},
+                                                 "_Emissive",
+                                                 error,
+                                                 &emissiveFromConnection);
+        if (emissive) {
+            info.emissiveTexture = RegisterTexture(ctx, emissive->asset);
+            info.emissiveTexCoord = canonical::GetTextureUvIndex(material, aiTextureType_EMISSIVE);
+            // Falcor's textured emissive channel replaces the FBX color; its
+            // separate scene emissiveFactor scales the texture later. Every
+            // packed ORCA pack targets Falcor, Zero Day ("optimized for Falcor
+            // 4.0") included, whose FBX EmissiveColor 0.5 would otherwise halve
+            // each connected emitter. A texture found only by file name (no FBX
+            // connection) keeps the earlier per-pack rule.
+            const bool textureReplacesEmissiveColor =
+                emissiveFromConnection || IsEmeraldSquareImport(ctx) || IsSunTempleImport(ctx);
+            const std::array<float, 3> fbxEmissiveColor = info.emissiveFactor;
+            if (textureReplacesEmissiveColor) {
+                info.emissiveFactor = {1.0f, 1.0f, 1.0f};
+            }
+            const std::string fbxColorText = std::to_string(fbxEmissiveColor[0]) + "," +
+                                             std::to_string(fbxEmissiveColor[1]) + "," +
+                                             std::to_string(fbxEmissiveColor[2]);
+            LogMaterialDecision(info.name,
+                                "EMISSIVE",
+                                textureReplacesEmissiveColor ? "texture_replaces_fbx_emissive_color" : "used",
+                                textureReplacesEmissiveColor
+                                    ? std::string(PackedOrcaImportLabel(ctx)) +
+                                          " emissive RGB texture replaces the FBX fallback color " + fbxColorText +
+                                          ", matching Falcor"
+                                    : std::string(PackedOrcaImportLabel(ctx)) +
+                                          " emissive texture found by file name only (no FBX connection); FBX color " +
+                                          fbxColorText + " kept as its factor");
+        } else if (!error.empty()) {
+            manifest.unresolved.push_back("emissive: " + error);
+        }
+        manifest.sourceEmissive = pathString(emissive);
+
+        error.clear();
+        const auto normal = LoadZeroDayTexture(ctx,
+                                               material,
+                                               info.name,
+                                               {aiTextureType_NORMALS, aiTextureType_NORMAL_CAMERA},
+                                               "_Normal",
+                                               error);
+        if (normal) {
+            // Keep the source G. ConvertMeshes reflects V and tangent.w, which
+            // negates the bitangent; together they keep the world-space normal
+            // the earlier unreflected frame with a DirectX->GL G flip produced.
+            const Import::DecodedTexture& normalDecoded = normal->decoded.decoded;
+            info.normalTexture = RegisterGeneratedTexture(ctx,
+                                                          "zeroday-normal:" + normal->asset.key,
+                                                          info.name + "_zeroday_normal",
+                                                          normalDecoded.rgba,
+                                                          normalDecoded.width,
+                                                          normalDecoded.height);
+            info.normalTexCoord = canonical::GetTextureUvIndex(material, aiTextureType_NORMALS);
+            manifest.normalYFlipped = false;
+            LogMaterialDecision(info.name,
+                                "NORMAL",
+                                "used",
+                                std::string(PackedOrcaImportLabel(ctx)) +
+                                    " source normal G preserved for the reflected V/bitangent frame");
+        } else if (!error.empty()) {
+            manifest.unresolved.push_back("normal: " + error);
+        }
+        manifest.sourceNormal = pathString(normal);
+
+        error.clear();
+        const auto specular = LoadZeroDayTexture(ctx,
+                                                 material,
+                                                 info.name,
+                                                 {aiTextureType_SPECULAR},
+                                                 "_Specular",
+                                                 error);
+        if (specular) {
+            const Import::DecodedTexture& src = specular->decoded.decoded;
+            std::vector<uint8_t> orm(static_cast<size_t>(src.width) * src.height * 4u, 255u);
+            bool sourceOcclusionUnused = IsEmeraldSquareImport(ctx) || IsSunTempleImport(ctx);
+            for (size_t px = 0; px < static_cast<size_t>(src.width) * src.height; ++px) {
+                sourceOcclusionUnused = sourceOcclusionUnused && src.rgba[px * 4u] == 0u;
+                orm[px * 4u + 0u] = src.rgba[px * 4u + 0u];
+                orm[px * 4u + 1u] = src.rgba[px * 4u + 1u];
+                orm[px * 4u + 2u] = src.rgba[px * 4u + 2u];
+                orm[px * 4u + 3u] = 255u;
+            }
+            const int ormTexture = RegisterGeneratedTexture(ctx,
+                                                            "zeroday-orm:" + specular->asset.key,
+                                                            info.name + "_zeroday_orm",
+                                                            orm,
+                                                            src.width,
+                                                            src.height);
+            info.metallicRoughnessTexture = ormTexture;
+            // EmeraldSquare and SunTemple source packs use constant-zero red
+            // for absent occlusion, rather than complete occlusion.
+            // Keep the authored texture bytes while omitting the AO binding,
+            // which would otherwise extinguish diffuse reflection.
+            info.occlusionTexture = sourceOcclusionUnused ? -1 : ormTexture;
+            info.metallicRoughnessTexCoord = canonical::GetTextureUvIndex(material, aiTextureType_SPECULAR);
+            info.occlusionTexCoord = canonical::GetTextureUvIndex(material, aiTextureType_SPECULAR);
+            info.roughnessFactor = 1.0f;
+            info.metallicFactor = 1.0f;
+            manifest.specularAction = "packed_rgb_to_orm";
+            manifest.ormTarget = sourceOcclusionUnused
+                                     ? "Specular R unused (constant zero; no AO binding), G->roughness, B->metalness"
+                                     : "Specular R->AO, G->roughness, B->metalness";
+            ++ctx.ormTextureCount;
+            LogMaterialDecision(info.name,
+                                "SPECULAR",
+                                manifest.specularAction,
+                                sourceOcclusionUnused
+                                    ? std::string(PackedOrcaImportLabel(ctx)) +
+                                          " source G=roughness and B=metalness preserved; unused constant-zero R is not bound as AO"
+                                    : std::string(PackedOrcaImportLabel(ctx)) +
+                                          " Specular R=AO, G=roughness, B=metalness preserved in glTF ORM texture");
+        } else {
+            info.roughnessFactor = ReadRoughness(material);
+            info.metallicFactor = ReadMetallic(material);
+            if (!error.empty()) {
+                manifest.unresolved.push_back("specular: " + error);
+                LogMaterialWarning(ctx,
+                                   info.name,
+                                   std::string(PackedOrcaImportLabel(ctx)) + " specular unresolved: " + error);
+            }
+        }
+        manifest.sourceSpecular = pathString(specular);
+
+        ctx.zeroDayManifestEntries.push_back(std::move(manifest));
+        ctx.materials.push_back(std::move(info));
+    }
+    if (ctx.materials.empty()) {
+        ctx.materials.push_back(MaterialInfo{});
+    }
+}
+
 void ConvertMaterials(ImportContext& ctx) {
+    if (UsePackedOrcaMaterialImport(ctx)) {
+        ConvertZeroDayMaterials(ctx);
+        return;
+    }
     if (UseCanonicalImport(ctx) && IsBistroImport(ctx)) {
         ConvertCanonicalMaterials(ctx);
         return;
@@ -2020,11 +2406,28 @@ void ConvertMaterials(ImportContext& ctx) {
 }
 
 void ConvertMeshes(ImportContext& ctx) {
+    // Assimp keeps texture coordinates with a bottom-left V origin for every
+    // source format: OBJ, FBX and DAE store them that way, and its glTF importer
+    // converts glTF's top-left V on load. glTF TEXCOORD uses a top-left origin,
+    // so V is written as 1 - v, as Assimp's own glTF exporter writes it.
+    // v' = 1 - v reverses dP/dv, so tangent.w is negated with it to keep the
+    // TANGENT handedness consistent with the emitted TEXCOORD: an upright quad
+    // gets the glTF w = +1.
     ctx.primitives.resize(ctx.scene->mNumMeshes);
     ctx.stats.meshCount = ctx.scene->mNumMeshes;
     for (unsigned int meshIndex = 0; meshIndex < ctx.scene->mNumMeshes; ++meshIndex) {
         const aiMesh* mesh = ctx.scene->mMeshes[meshIndex];
         PrimitiveRef primitive;
+        if (mesh->mNumBones > 0u) {
+            ctx.warnings.push_back("Unsupported skinning omitted from mesh " +
+                                   std::string(mesh->mName.C_Str()) +
+                                   ": bones=" + std::to_string(mesh->mNumBones));
+        }
+        if (mesh->mNumAnimMeshes > 0u) {
+            ctx.warnings.push_back("Unsupported morph/animated mesh data omitted from mesh " +
+                                   std::string(mesh->mName.C_Str()) +
+                                   ": anim_meshes=" + std::to_string(mesh->mNumAnimMeshes));
+        }
 
         std::vector<float> positions;
         std::vector<float> normals;
@@ -2061,15 +2464,16 @@ void ConvertMeshes(ImportContext& ctx) {
             if (mesh->HasTextureCoords(0)) {
                 const aiVector3D uv = mesh->mTextureCoords[0][vertex];
                 texcoord0.push_back(uv.x);
-                texcoord0.push_back(uv.y);
+                texcoord0.push_back(1.0f - uv.y);
             }
             if (mesh->HasTextureCoords(1)) {
                 const aiVector3D uv = mesh->mTextureCoords[1][vertex];
                 texcoord1.push_back(uv.x);
-                texcoord1.push_back(uv.y);
+                texcoord1.push_back(1.0f - uv.y);
             }
             if (mesh->HasTangentsAndBitangents()) {
-                const auto tangent = MakeTangent(mesh, vertex);
+                auto tangent = MakeTangent(mesh, vertex);
+                tangent[3] = -tangent[3];
                 tangents.insert(tangents.end(), tangent.begin(), tangent.end());
             }
         }
@@ -2125,6 +2529,110 @@ int RegisterMesh(ImportContext& ctx, const std::vector<unsigned int>& meshIndice
     return index;
 }
 
+bool ShouldSkipPrimitiveForImport(const ImportContext& ctx, unsigned int meshIndex) {
+    if (meshIndex >= ctx.primitives.size()) {
+        return false;
+    }
+    const int materialIndex = ctx.primitives[meshIndex].materialIndex;
+    if (materialIndex < 0 || materialIndex >= static_cast<int>(ctx.materials.size())) {
+        return false;
+    }
+    return IsEmeraldSquareWorldGridMaterial(ctx, ctx.materials[materialIndex].name);
+}
+
+aiVector3D NormalizeCameraVector(aiVector3D v, const aiVector3D& fallback) {
+    const float lenSq = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (!(lenSq > 1.0e-12f) || !std::isfinite(lenSq)) {
+        return fallback;
+    }
+    const float invLen = 1.0f / std::sqrt(lenSq);
+    return aiVector3D(v.x * invLen, v.y * invLen, v.z * invLen);
+}
+
+std::array<double, 4> QuaternionFromBasis(const aiVector3D& x,
+                                          const aiVector3D& y,
+                                          const aiVector3D& z) {
+    const double m00 = x.x;
+    const double m01 = y.x;
+    const double m02 = z.x;
+    const double m10 = x.y;
+    const double m11 = y.y;
+    const double m12 = z.y;
+    const double m20 = x.z;
+    const double m21 = y.z;
+    const double m22 = z.z;
+    const double trace = m00 + m11 + m22;
+    double qx = 0.0;
+    double qy = 0.0;
+    double qz = 0.0;
+    double qw = 1.0;
+    if (trace > 0.0) {
+        const double s = std::sqrt(trace + 1.0) * 2.0;
+        qw = 0.25 * s;
+        qx = (m21 - m12) / s;
+        qy = (m02 - m20) / s;
+        qz = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const double s = std::sqrt(1.0 + m00 - m11 - m22) * 2.0;
+        qw = (m21 - m12) / s;
+        qx = 0.25 * s;
+        qy = (m01 + m10) / s;
+        qz = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        const double s = std::sqrt(1.0 + m11 - m00 - m22) * 2.0;
+        qw = (m02 - m20) / s;
+        qx = (m01 + m10) / s;
+        qy = 0.25 * s;
+        qz = (m12 + m21) / s;
+    } else {
+        const double s = std::sqrt(1.0 + m22 - m00 - m11) * 2.0;
+        qw = (m10 - m01) / s;
+        qx = (m02 + m20) / s;
+        qy = (m12 + m21) / s;
+        qz = 0.25 * s;
+    }
+    const double len = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+    if (!(len > 0.0) || !std::isfinite(len)) {
+        return {0.0, 0.0, 0.0, 1.0};
+    }
+    return {qx / len, qy / len, qz / len, qw / len};
+}
+
+std::array<double, 4> CameraRotationFromLookUp(aiVector3D lookAt, aiVector3D up) {
+    const aiVector3D forward = NormalizeCameraVector(lookAt, aiVector3D(0.0f, 0.0f, -1.0f));
+    aiVector3D upN = NormalizeCameraVector(up, aiVector3D(0.0f, 1.0f, 0.0f));
+    aiVector3D right = forward ^ upN;
+    right = NormalizeCameraVector(right, aiVector3D(1.0f, 0.0f, 0.0f));
+    const aiVector3D localZ(-forward.x, -forward.y, -forward.z);
+    upN = NormalizeCameraVector(localZ ^ right, aiVector3D(0.0f, 1.0f, 0.0f));
+    return QuaternionFromBasis(right, upN, localZ);
+}
+
+void ConvertCameras(ImportContext& ctx) {
+    ctx.cameras.reserve(ctx.scene->mNumCameras);
+    for (unsigned int cameraIndex = 0; cameraIndex < ctx.scene->mNumCameras; ++cameraIndex) {
+        const aiCamera* camera = ctx.scene->mCameras[cameraIndex];
+        if (!camera) {
+            continue;
+        }
+        CameraInfo out;
+        out.name = camera->mName.length > 0 ? std::string(camera->mName.C_Str())
+                                            : "camera_" + std::to_string(ctx.cameras.size());
+        const float aspect = camera->mAspect > 0.0f ? camera->mAspect : (16.0f / 9.0f);
+        out.aspect = aspect;
+        const float horizontalFov = camera->mHorizontalFOV > 0.0f ? camera->mHorizontalFOV : 0.7853982f;
+        out.yfov = 2.0f * std::atan(std::tan(horizontalFov * 0.5f) / aspect);
+        out.znear = camera->mClipPlaneNear > 0.0f ? camera->mClipPlaneNear : 0.01f;
+        out.zfar = camera->mClipPlaneFar > out.znear ? camera->mClipPlaneFar : 1000000.0f;
+        out.translation = {camera->mPosition.x, camera->mPosition.y, camera->mPosition.z};
+        out.rotation = CameraRotationFromLookUp(camera->mLookAt, camera->mUp);
+
+        const int index = static_cast<int>(ctx.cameras.size());
+        ctx.cameraByName.emplace(out.name, index);
+        ctx.cameras.push_back(std::move(out));
+    }
+}
+
 int ConvertNode(ImportContext& ctx, const aiNode* node) {
     NodeInfo out;
     out.name = node->mName.length > 0 ? std::string(node->mName.C_Str())
@@ -2139,9 +2647,16 @@ int ConvertNode(ImportContext& ctx, const aiNode* node) {
     std::vector<unsigned int> primitiveSet;
     primitiveSet.reserve(node->mNumMeshes);
     for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
-        primitiveSet.push_back(node->mMeshes[i]);
+        const unsigned int meshIndex = node->mMeshes[i];
+        if (ShouldSkipPrimitiveForImport(ctx, meshIndex)) {
+            continue;
+        }
+        primitiveSet.push_back(meshIndex);
     }
     out.mesh = RegisterMesh(ctx, primitiveSet, out.name);
+    if (auto cameraIt = ctx.cameraByName.find(out.name); cameraIt != ctx.cameraByName.end()) {
+        out.camera = cameraIt->second;
+    }
     const int nodeIndex = static_cast<int>(ctx.nodes.size());
     ctx.nodes.push_back(std::move(out));
     ctx.nodes[nodeIndex].children.reserve(node->mNumChildren);
@@ -2407,6 +2922,30 @@ std::string BuildGltfJson(const ImportContext& ctx, const std::string& binaryUri
     }
     json << "],";
 
+    if (!ctx.cameras.empty()) {
+        json << "\"cameras\":[";
+        for (size_t i = 0; i < ctx.cameras.size(); ++i) {
+            if (i > 0) {
+                json << ",";
+            }
+            const auto& camera = ctx.cameras[i];
+            json << "{"
+                 << "\"name\":\"" << JsonEscape(camera.name) << "\","
+                 << "\"type\":\"perspective\","
+                 << "\"perspective\":{"
+                 << "\"yfov\":" << camera.yfov << ","
+                 << "\"znear\":" << camera.znear;
+            if (camera.aspect > 0.0f) {
+                json << ",\"aspectRatio\":" << camera.aspect;
+            }
+            if (camera.zfar > camera.znear) {
+                json << ",\"zfar\":" << camera.zfar;
+            }
+            json << "}}";
+        }
+        json << "],";
+    }
+
     json << "\"nodes\":[";
     for (size_t i = 0; i < ctx.nodes.size(); ++i) {
         if (i > 0) {
@@ -2417,6 +2956,9 @@ std::string BuildGltfJson(const ImportContext& ctx, const std::string& binaryUri
              << "\"name\":\"" << JsonEscape(node.name) << "\"";
         if (node.mesh >= 0) {
             json << ",\"mesh\":" << node.mesh;
+        }
+        if (node.camera >= 0) {
+            json << ",\"camera\":" << node.camera;
         }
         if (!node.children.empty()) {
             json << ",\"children\":[";
@@ -2514,11 +3056,99 @@ bool WriteManifest(const ImportContext& ctx,
     json << "  \"tool_version\": \"" << JsonEscape(kSemanticVersion) << "\",\n";
     json << "  \"git_hash\": \"" << JsonEscape(kGitHash) << "\",\n";
     json << "  \"assimp_version\": \"" << aiGetVersionMajor() << "." << aiGetVersionMinor() << "."
-         << aiGetVersionRevision() << "\",\n";
+         << aiGetVersionPatch() << "\",\n";
+    {
+        std::ostringstream revision;
+        revision << std::hex << aiGetVersionRevision();
+        json << "  \"assimp_revision\": \"" << revision.str() << "\",\n";
+    }
     json << "  \"source_path\": \"" << JsonEscape(ctx.sourcePath.string()) << "\",\n";
+    json << "  \"texcoord_v_origin\": \"top_left\",\n";
+    if (ctx.objMaterialReport) {
+        const ObjMaterialReport& report = *ctx.objMaterialReport;
+        json << "  \"obj_material_check\": {\"faces\": " << report.faceCount
+             << ", \"materials\": " << report.materialCount
+             << ", \"mismatched_materials\": " << report.mismatchedMaterials
+             << ", \"mtllib_directives\": " << report.mtllibDirectives
+             << ", \"mtllib_hoisted\": " << (report.mtllibHoisted ? "true" : "false")
+             << ", \"mtllib_libraries\": [";
+        for (size_t i = 0; i < report.mtllibLibraries.size(); ++i) {
+            json << (i > 0 ? ", " : "") << "\"" << JsonEscape(report.mtllibLibraries[i]) << "\"";
+        }
+        json << "]},\n";
+    }
     json << "  \"mesh_count\": " << ctx.stats.meshCount << ",\n";
     json << "  \"triangle_count\": " << ctx.stats.triangleCount << ",\n";
     json << "  \"node_count\": " << ctx.stats.nodeCount << ",\n";
+    json << "  \"support_matrix\": [\n";
+    json << "    {\"area\":\"geometry\",\"status\":\"supported\",\"details\":\"Assimp meshes are triangulated into deterministic glTF primitive records\"},\n";
+    json << "    {\"area\":\"transforms\",\"status\":\"supported\",\"details\":\"Assimp node transforms are preserved in the emitted glTF node hierarchy\"},\n";
+    json << "    {\"area\":\"cameras\",\"status\":\"supported\",\"details\":\"Assimp perspective cameras are emitted as glTF camera records and attached to matching scene nodes\"},\n";
+    json << "    {\"area\":\"textures\",\"status\":\"supported\",\"details\":\"copy, convert, embed, and link policies are explicit in the manifest texture table\"},\n";
+    json << "    {\"area\":\"materials\",\"status\":\"partial\",\"details\":\"PBR-compatible scalar and texture slots are converted; full DCC material graphs are not preserved\"},\n";
+    json << "    {\"area\":\"lights\",\"status\":\"unsupported\",\"details\":\"Assimp lights are diagnosed and not converted to renderer light primitives\"},\n";
+    json << "    {\"area\":\"animation\",\"status\":\"unsupported\",\"details\":\"animation, skinning, and morph data are diagnosed and omitted from the deterministic static package\"},\n";
+    json << "    {\"area\":\"alpha_transmission_emission\",\"status\":\"partial\",\"details\":\"alpha/emissive/material texture records are converted where Assimp exposes compatible data\"},\n";
+    json << "    {\"area\":\"ktx2_mip_compression\",\"status\":\"supported\",\"details\":\"convert mode emits deterministic KTX2 outputs where supported and records copy fallbacks\"},\n";
+    json << "    {\"area\":\"assimp_formats\",\"status\":\"supported\",\"details\":\"static Assimp-supported scene formats are accepted by PathTracerImport\"},\n";
+    json << "    {\"area\":\"usd_materialx\",\"status\":\"out_of_scope\",\"details\":\"USD and MaterialX are not importer targets in this pipeline\"}\n";
+    json << "  ],\n";
+    json << "  \"texture_policy\": {\n";
+    json << "    \"mode\": \"";
+    switch (ctx.options.textureMode) {
+        case ImportOptions::TextureMode::Copy: json << "copy"; break;
+        case ImportOptions::TextureMode::Convert: json << "convert"; break;
+        case ImportOptions::TextureMode::Embed: json << "embed"; break;
+        case ImportOptions::TextureMode::Link: json << "link"; break;
+    }
+    json << "\",\n";
+    json << "    \"residency_policy\": \"runtime SceneResources owns uploaded texture residency after loading emitted glTF/GLB\",\n";
+    json << "    \"mip_policy\": \"converted KTX2/DDS source mip metadata is preserved when available; runtime loader generates mips for decoded raster inputs\",\n";
+    json << "    \"compression_policy\": \"convert mode prefers deterministic KTX2 for supported inputs and records fall_back_to_copy otherwise\",\n";
+    json << "    \"budget_policy\": \"runtime budget policy is selected by renderer CLI and reported in headless metadata\",\n";
+    json << "    \"determinism_policy\": \"output file hashes, texture output hashes, and stable resource IDs are emitted in import_manifest.json\"\n";
+    json << "  },\n";
+    json << "  \"stable_resource_ids\": [\n";
+    bool wroteStableId = false;
+    auto writeStableId = [&](const char* resourceType,
+                             const std::string& name,
+                             int sourceIndex,
+                             const std::string& stableId) {
+        if (wroteStableId) {
+            json << ",\n";
+        }
+        wroteStableId = true;
+        json << "    {\"resource_type\":\"" << JsonEscape(resourceType)
+             << "\", \"name\":\"" << JsonEscape(name)
+             << "\", \"source_index\":" << sourceIndex
+             << ", \"stable_id\":\"" << JsonEscape(stableId) << "\"}";
+    };
+    for (size_t i = 0; i < ctx.materials.size(); ++i) {
+        writeStableId("material",
+                      ctx.materials[i].name,
+                      static_cast<int>(i),
+                      StableImportId("material",
+                                     ctx.sourcePath.string() + "|material|" + std::to_string(i) +
+                                         "|" + ctx.materials[i].name));
+    }
+    for (size_t i = 0; i < ctx.meshes.size(); ++i) {
+        writeStableId("geometry",
+                      ctx.meshes[i].name,
+                      static_cast<int>(i),
+                      StableImportId("geometry",
+                                     ctx.sourcePath.string() + "|geometry|" + std::to_string(i) +
+                                         "|" + ctx.meshes[i].name));
+    }
+    for (size_t i = 0; i < ctx.manifestTextures.size(); ++i) {
+        writeStableId("texture",
+                      ctx.manifestTextures[i].outputPath,
+                      static_cast<int>(i),
+                      StableImportId("texture",
+                                     ctx.manifestTextures[i].sourcePath + "|" +
+                                         ctx.manifestTextures[i].outputPath + "|" +
+                                         ctx.manifestTextures[i].outputSha256));
+    }
+    json << "\n  ],\n";
 
     json << "  \"texture_inventory\": [\n";
     for (size_t i = 0; i < ctx.textureInventory.size(); ++i) {
@@ -2641,6 +3271,578 @@ bool WriteCanonicalManifest(const ImportContext& ctx, std::string& error) {
     return WriteTextFile(manifestPath, json.str(), error);
 }
 
+bool WriteZeroDayManifest(const ImportContext& ctx, std::string& error) {
+    if (ctx.zeroDayManifestEntries.empty()) {
+        return true;
+    }
+
+    const fs::path manifestPath = ctx.outputDirectory /
+                                  (IsSunTempleImport(ctx)
+                                       ? "sun_temple_material_manifest.json"
+                                       : (IsEmeraldSquareImport(ctx)
+                                              ? "emerald_square_material_manifest.json"
+                                              : "zero_day_material_manifest.json"));
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"schema_version\": \"1.0\",\n";
+    json << "  \"asset_family\": \"" << JsonEscape(PackedOrcaImportLabel(ctx)) << "\",\n";
+    json << "  \"scene\": \"" << JsonEscape(ctx.sceneBaseName) << "\",\n";
+    json << "  \"source_path\": \"" << JsonEscape(ctx.sourcePath.string()) << "\",\n";
+    json << "  \"material_convention\": {\n";
+    json << "    \"base_color\": \"RGB base color, alpha opacity\",\n";
+    json << "    \"specular\": \""
+         << (IsEmeraldSquareImport(ctx)
+                 ? "R source occlusion (constant-zero channel unused; no AO binding), G roughness, B metalness"
+                 : "R ambient occlusion, G roughness, B metalness")
+         << "\",\n";
+    json << "    \"normal\": \"DirectX source normal, green preserved with reflected V/bitangent frame\",\n";
+    json << "    \"emissive\": \""
+         << (IsEmeraldSquareImport(ctx)
+                 ? "RGB emissive texture replaces FBX fallback color; glTF factor 1 preserves Falcor's separate scene multiplier"
+                 : "RGB emissive color")
+         << "\"\n";
+    json << "  },\n";
+    json << "  \"materials\": [\n";
+    for (size_t i = 0; i < ctx.zeroDayManifestEntries.size(); ++i) {
+        const ZeroDayManifestEntry& entry = ctx.zeroDayManifestEntries[i];
+        json << "    {\n";
+        json << "      \"material\": \"" << JsonEscape(entry.materialName) << "\",\n";
+        json << "      \"source_base_color\": \"" << JsonEscape(entry.sourceBaseColor) << "\",\n";
+        json << "      \"base_color_alpha_used\": " << (entry.baseColorAlphaUsed ? "true" : "false") << ",\n";
+        json << "      \"source_normal\": \"" << JsonEscape(entry.sourceNormal) << "\",\n";
+        json << "      \"normal_y_flipped\": " << (entry.normalYFlipped ? "true" : "false") << ",\n";
+        json << "      \"source_specular\": \"" << JsonEscape(entry.sourceSpecular) << "\",\n";
+        json << "      \"specular_action\": \"" << JsonEscape(entry.specularAction) << "\",\n";
+        json << "      \"orm_target\": \"" << JsonEscape(entry.ormTarget) << "\",\n";
+        json << "      \"source_emissive\": \"" << JsonEscape(entry.sourceEmissive) << "\",\n";
+        json << "      \"unresolved\": [";
+        for (size_t u = 0; u < entry.unresolved.size(); ++u) {
+            json << "\"" << JsonEscape(entry.unresolved[u]) << "\"";
+            if (u + 1 < entry.unresolved.size()) {
+                json << ", ";
+            }
+        }
+        json << "]\n";
+        json << "    }";
+        if (i + 1 < ctx.zeroDayManifestEntries.size()) {
+            json << ",";
+        }
+        json << "\n";
+    }
+    json << "  ]\n";
+    json << "}\n";
+    return WriteTextFile(manifestPath, json.str(), error);
+}
+
+// ---------------------------------------------------------------------------------------------
+// OBJ material libraries
+//
+// Assimp's OBJ importer (same logic in 5.4.3 through 6.0.6 and master, checked 2026-11) mis-assigns
+// materials when an `mtllib` directive is read after a mesh exists. Re-reading a known library leaves the
+// parser's current material on that library's last `newmtl`, so a following `usemtl` naming it is dropped
+// as a repeat and the mesh keeps the previous object's material. Loading a new library relabels the mesh
+// being filled. living_room.obj repeats `mtllib` before every object and lost WhitePaint that way (it
+// became the emissive BackLight).
+//
+// For OBJ sources the importer therefore (1) serves Assimp the file with each distinct `mtllib` once,
+// ahead of all geometry, and the original directives turned into comments, and (2) checks Assimp's
+// per-material face counts against an independent scan of the file before post-processing. The scan
+// mirrors Assimp's line handling: every '\n', '\r', '\f' or '\0' ends a line, '\\' before a line end
+// joins the next line, keywords are read at column 0, `cstype` ... `end` blocks are skipped, and faces
+// without indices are ignored.
+// ---------------------------------------------------------------------------------------------
+
+bool IsObjLineEnd(char c) {
+    return c == '\n' || c == '\r' || c == '\f' || c == '\0';
+}
+
+bool IsObjBlank(char c) {
+    return c == ' ' || c == '\t';
+}
+
+// Splits a file into logical lines the way Assimp's IOStreamBuffer::getNextDataLine does.
+class ObjLineReader {
+public:
+    explicit ObjLineReader(std::FILE* file) : m_file(file), m_buffer(size_t(1) << 22) {}
+
+    // Returns false at end of file. `offset` is the file offset of the line's first byte.
+    bool next(std::string& line, uint64_t& offset) {
+        line.clear();
+        if (m_pos == m_end && !fill()) {
+            return false;
+        }
+        offset = m_bufferOffset + m_pos;
+        for (;;) {
+            if (m_pos == m_end && !fill()) {
+                return true;
+            }
+            const char c = m_buffer[m_pos];
+            if (c == '\\') {
+                if (m_pos + 1 == m_end && !fill()) {
+                    line.push_back(c);
+                    ++m_pos;
+                    return true;
+                }
+                if (IsObjLineEnd(m_buffer[m_pos + 1])) {
+                    // Continuation: skip to just after the next '\n' and keep reading the same line.
+                    ++m_pos;
+                    for (;;) {
+                        if (m_pos == m_end && !fill()) {
+                            return true;
+                        }
+                        if (m_buffer[m_pos++] == '\n') {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            ++m_pos;
+            if (IsObjLineEnd(c)) {
+                return true;
+            }
+            line.push_back(c);
+        }
+    }
+
+private:
+    // Keeps unread bytes and appends more from the file; returns false when nothing new was read.
+    bool fill() {
+        const size_t remaining = m_end - m_pos;
+        if (remaining > 0 && m_pos > 0) {
+            std::memmove(m_buffer.data(), m_buffer.data() + m_pos, remaining);
+        }
+        m_bufferOffset += m_pos;
+        m_pos = 0;
+        m_end = remaining;
+        const size_t read = std::fread(m_buffer.data() + m_end, 1, m_buffer.size() - m_end, m_file);
+        m_end += read;
+        return read > 0;
+    }
+
+    std::FILE* m_file = nullptr;
+    std::vector<char> m_buffer;
+    size_t m_pos = 0;
+    size_t m_end = 0;
+    uint64_t m_bufferOffset = 0;
+};
+
+// First token of an OBJ line (up to a blank), as Assimp's getNameNoSpace reads keywords.
+std::string_view ObjKeyword(std::string_view line) {
+    size_t end = 0;
+    while (end < line.size() && !IsObjBlank(line[end])) {
+        ++end;
+    }
+    return line.substr(0, end);
+}
+
+// Text after the keyword with leading blanks skipped, as Assimp's getNextToken leaves it.
+std::string_view ObjArgument(std::string_view line) {
+    size_t pos = ObjKeyword(line).size();
+    while (pos < line.size() && IsObjBlank(line[pos])) {
+        ++pos;
+    }
+    return line.substr(pos);
+}
+
+std::string_view TrimObjText(std::string_view text) {
+    const auto isSpace = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    while (!text.empty() && isSpace(text.front())) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && isSpace(text.back())) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+// Number of vertex references on an f/l/p line (one per blank-separated group that starts like an index).
+uint64_t CountObjFaceVertices(std::string_view argument) {
+    uint64_t count = 0;
+    size_t pos = 0;
+    while (pos < argument.size()) {
+        while (pos < argument.size() && IsObjBlank(argument[pos])) {
+            ++pos;
+        }
+        if (pos >= argument.size()) {
+            break;
+        }
+        const char c = argument[pos];
+        if (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+') {
+            ++count;
+        }
+        while (pos < argument.size() && !IsObjBlank(argument[pos])) {
+            ++pos;
+        }
+    }
+    return count;
+}
+
+struct ObjMaterialScan {
+    std::vector<std::string> libraries;    // distinct `mtllib` arguments, first-appearance order
+    std::vector<uint64_t> mtllibOffsets;  // file offset of the 'm' of every `mtllib` directive
+    uint64_t mtllibDirectives = 0;
+    bool libraryAfterMeshDirective = false;  // an `mtllib` follows o/g/usemtl/f/l/p
+    uint64_t bomBytes = 0;
+    uint64_t fileSize = 0;
+    std::map<std::string, uint64_t> facesByUsemtl;
+    uint64_t facesBeforeUsemtl = 0;
+
+    bool needsHoist() const {
+        return mtllibDirectives > libraries.size() || libraryAfterMeshDirective;
+    }
+};
+
+bool ScanObjMaterials(const fs::path& path, ObjMaterialScan& scan, std::string& error) {
+    std::error_code ec;
+    scan.fileSize = fs::file_size(path, ec);
+    if (ec) {
+        error = "Failed to stat OBJ source: " + path.string();
+        return false;
+    }
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        error = "Failed to open OBJ source: " + path.string();
+        return false;
+    }
+
+    ObjLineReader reader(file);
+    std::string line;
+    uint64_t offset = 0;
+    bool firstLine = true;
+    bool insideCstype = false;
+    bool meshDirectiveSeen = false;
+    std::optional<std::string> currentUsemtl;
+    while (reader.next(line, offset)) {
+        std::string_view view(line);
+        if (firstLine) {
+            firstLine = false;
+            if (view.size() >= 3 && static_cast<unsigned char>(view[0]) == 0xEF &&
+                static_cast<unsigned char>(view[1]) == 0xBB && static_cast<unsigned char>(view[2]) == 0xBF) {
+                view.remove_prefix(3);
+                offset += 3;
+                scan.bomBytes = 3;
+            }
+        }
+        if (view.empty()) {
+            continue;
+        }
+        if (insideCstype) {
+            if (view[0] == 'e' && ObjKeyword(view) == "end") {
+                insideCstype = false;
+            }
+            continue;
+        }
+        switch (view[0]) {
+            case 'f':
+            case 'l':
+            case 'p': {
+                const uint64_t vertices = CountObjFaceVertices(ObjArgument(view));
+                if (vertices == 0) {
+                    break;  // Assimp ignores faces without vertices.
+                }
+                // Assimp stores a polyline of n vertices as n-1 line faces and n points as n faces.
+                const uint64_t faces = view[0] == 'f' ? 1 : (view[0] == 'l' ? vertices - 1 : vertices);
+                if (currentUsemtl) {
+                    scan.facesByUsemtl[*currentUsemtl] += faces;
+                } else {
+                    scan.facesBeforeUsemtl += faces;
+                }
+                meshDirectiveSeen = true;
+                break;
+            }
+            case 'u':
+                if (ObjKeyword(view) == "usemtl") {
+                    const std::string_view name = TrimObjText(ObjArgument(view));
+                    if (!name.empty()) {
+                        currentUsemtl = std::string(name);
+                    }
+                    meshDirectiveSeen = true;
+                }
+                break;
+            case 'm':
+                if (ObjKeyword(view) == "mtllib") {
+                    const std::string_view library = ObjArgument(view);
+                    if (library.empty()) {
+                        break;  // Assimp warns and loads nothing.
+                    }
+                    ++scan.mtllibDirectives;
+                    scan.mtllibOffsets.push_back(offset);
+                    if (meshDirectiveSeen) {
+                        scan.libraryAfterMeshDirective = true;
+                    }
+                    if (std::find(scan.libraries.begin(), scan.libraries.end(), library) == scan.libraries.end()) {
+                        scan.libraries.emplace_back(library);
+                    }
+                }
+                break;
+            case 'o':
+            case 'g':
+                meshDirectiveSeen = true;
+                break;
+            case 'c':
+                insideCstype = ObjKeyword(view) == "cstype";
+                break;
+            default:
+                break;
+        }
+    }
+    const bool readError = std::ferror(file) != 0;
+    std::fclose(file);
+    if (readError) {
+        error = "Failed to read OBJ source: " + path.string();
+        return false;
+    }
+    return true;
+}
+
+// Name of the last `newmtl` in an MTL file, read the way Assimp's ObjFileMtlImporter does (leading blanks
+// skipped, a line starting with "ne" is `newmtl`, a missing name means AI_DEFAULT_MATERIAL_NAME).
+std::optional<std::string> LastMtlMaterialName(const fs::path& path) {
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return std::nullopt;
+    }
+    ObjLineReader reader(file);
+    std::string line;
+    uint64_t offset = 0;
+    std::optional<std::string> last;
+    while (reader.next(line, offset)) {
+        std::string_view view(line);
+        if (view.size() >= 3 && static_cast<unsigned char>(view[0]) == 0xEF &&
+            static_cast<unsigned char>(view[1]) == 0xBB && static_cast<unsigned char>(view[2]) == 0xBF) {
+            view.remove_prefix(3);
+        }
+        while (!view.empty() && IsObjBlank(view.front())) {
+            view.remove_prefix(1);
+        }
+        if (view.size() < 2 || view[0] != 'n' || view[1] != 'e') {
+            continue;
+        }
+        const std::string_view name = TrimObjText(ObjArgument(view));
+        last = name.empty() ? std::string(AI_DEFAULT_MATERIAL_NAME) : std::string(name);
+    }
+    std::fclose(file);
+    return last;
+}
+
+// The material Assimp gives faces that precede every `usemtl`: the last `newmtl` of the last library that
+// loaded (libraries resolve against the OBJ's folder, then fall back to <obj>.mtl), else the default.
+std::string ObjMaterialBeforeUsemtl(const fs::path& objPath, const ObjMaterialScan& scan) {
+    std::string material = AI_DEFAULT_MATERIAL_NAME;
+    const std::string folder = objPath.parent_path().string();
+    const std::string objString = objPath.string();
+    const fs::path fallback = objString.substr(0, objString.size() - 3) + "mtl";
+    for (const std::string& library : scan.libraries) {
+        std::string slashed = library;
+        std::replace(slashed.begin(), slashed.end(), '\\', '/');
+        std::optional<std::string> last = LastMtlMaterialName(fs::path(folder + "/" + library));
+        if (!last && slashed != library) {
+            last = LastMtlMaterialName(fs::path(folder + "/" + slashed));
+        }
+        if (!last) {
+            last = LastMtlMaterialName(fallback);
+        }
+        if (last) {
+            material = *last;
+        }
+    }
+    return material;
+}
+
+// Serves an OBJ as one `mtllib` line per distinct library, then the original bytes (minus a UTF-8 BOM)
+// with the first byte of every original `mtllib` directive replaced by '#'. Offsets stay put and the
+// directives become comments.
+class ObjHoistedMtllibStream final : public Assimp::IOStream {
+public:
+    ObjHoistedMtllibStream(std::FILE* file,
+                           std::string prefix,
+                           uint64_t skipBytes,
+                           uint64_t fileSize,
+                           std::vector<uint64_t> commentOffsets)
+        : m_file(file),
+          m_prefix(std::move(prefix)),
+          m_skipBytes(skipBytes),
+          m_total(m_prefix.size() + (fileSize - skipBytes)),
+          m_commentOffsets(std::move(commentOffsets)) {}
+
+    ~ObjHoistedMtllibStream() override {
+        if (m_file != nullptr) {
+            std::fclose(m_file);
+        }
+    }
+
+    size_t Read(void* buffer, size_t size, size_t count) override {
+        if (size == 0 || count == 0 || m_position >= m_total) {
+            return 0;
+        }
+        uint64_t bytes = std::min<uint64_t>(static_cast<uint64_t>(size) * count, m_total - m_position);
+        bytes -= bytes % size;
+        char* out = static_cast<char*>(buffer);
+        uint64_t done = 0;
+        if (m_position < m_prefix.size()) {
+            const uint64_t fromPrefix = std::min<uint64_t>(bytes, m_prefix.size() - m_position);
+            std::memcpy(out, m_prefix.data() + m_position, static_cast<size_t>(fromPrefix));
+            done = fromPrefix;
+        }
+        if (done < bytes) {
+            const uint64_t fileOffset = m_position + done - m_prefix.size() + m_skipBytes;
+            if (fseeko(m_file, static_cast<off_t>(fileOffset), SEEK_SET) == 0) {
+                const size_t read = std::fread(out + done, 1, static_cast<size_t>(bytes - done), m_file);
+                for (auto it = std::lower_bound(m_commentOffsets.begin(), m_commentOffsets.end(), fileOffset);
+                     it != m_commentOffsets.end() && *it < fileOffset + read;
+                     ++it) {
+                    out[done + (*it - fileOffset)] = '#';
+                }
+                done += read;
+            }
+        }
+        m_position += done;
+        return static_cast<size_t>(done / size);
+    }
+
+    size_t Write(const void*, size_t, size_t) override { return 0; }
+
+    aiReturn Seek(size_t offset, aiOrigin origin) override {
+        int64_t base = 0;
+        switch (origin) {
+            case aiOrigin_SET:
+                base = 0;
+                break;
+            case aiOrigin_CUR:
+                base = static_cast<int64_t>(m_position);
+                break;
+            case aiOrigin_END:
+                base = static_cast<int64_t>(m_total);
+                break;
+            default:
+                return aiReturn_FAILURE;
+        }
+        const int64_t target = base + static_cast<int64_t>(offset);
+        if (target < 0 || static_cast<uint64_t>(target) > m_total) {
+            return aiReturn_FAILURE;
+        }
+        m_position = static_cast<uint64_t>(target);
+        return aiReturn_SUCCESS;
+    }
+
+    size_t Tell() const override { return static_cast<size_t>(m_position); }
+    size_t FileSize() const override { return static_cast<size_t>(m_total); }
+    void Flush() override {}
+
+private:
+    std::FILE* m_file = nullptr;
+    std::string m_prefix;
+    uint64_t m_skipBytes = 0;
+    uint64_t m_total = 0;
+    uint64_t m_position = 0;
+    std::vector<uint64_t> m_commentOffsets;
+};
+
+// Opens the source OBJ through ObjHoistedMtllibStream and every other path (the MTL files) as usual.
+class ObjHoistedMtllibIOSystem final : public Assimp::IOSystem {
+public:
+    ObjHoistedMtllibIOSystem(const fs::path& source, const ObjMaterialScan& scan)
+        : m_source(fs::absolute(source).lexically_normal()),
+          m_skipBytes(scan.bomBytes),
+          m_fileSize(scan.fileSize),
+          m_commentOffsets(scan.mtllibOffsets) {
+        for (const std::string& library : scan.libraries) {
+            m_prefix += "mtllib " + library + "\n";
+        }
+        std::sort(m_commentOffsets.begin(), m_commentOffsets.end());
+    }
+
+    bool Exists(const char* file) const override { return m_default.Exists(file); }
+    char getOsSeparator() const override { return m_default.getOsSeparator(); }
+    bool ComparePaths(const char* one, const char* second) const override {
+        return m_default.ComparePaths(one, second);
+    }
+
+    Assimp::IOStream* Open(const char* file, const char* mode = "rb") override {
+        if (file != nullptr && IsSource(file) && (mode == nullptr || std::strchr(mode, 'w') == nullptr)) {
+            std::FILE* handle = std::fopen(m_source.c_str(), "rb");
+            if (handle == nullptr) {
+                return nullptr;
+            }
+            return new ObjHoistedMtllibStream(handle, m_prefix, m_skipBytes, m_fileSize, m_commentOffsets);
+        }
+        return m_default.Open(file, mode);
+    }
+
+    void Close(Assimp::IOStream* stream) override { delete stream; }
+
+private:
+    bool IsSource(const char* file) const {
+        std::error_code ec;
+        const fs::path candidate = fs::absolute(fs::path(file), ec).lexically_normal();
+        return !ec && candidate == m_source;
+    }
+
+    Assimp::DefaultIOSystem m_default;
+    fs::path m_source;
+    std::string m_prefix;
+    uint64_t m_skipBytes = 0;
+    uint64_t m_fileSize = 0;
+    std::vector<uint64_t> m_commentOffsets;
+};
+
+// Compares Assimp's per-material face counts (raw import, before post-processing) with the scan.
+// Returns an empty string when they agree, else a description of the differences.
+std::string CheckObjMaterialAssignment(const aiScene* scene,
+                                       const fs::path& objPath,
+                                       const ObjMaterialScan& scan,
+                                       ObjMaterialReport& report) {
+    std::map<std::string, uint64_t> expected = scan.facesByUsemtl;
+    if (scan.facesBeforeUsemtl > 0) {
+        expected[ObjMaterialBeforeUsemtl(objPath, scan)] += scan.facesBeforeUsemtl;
+    }
+    std::map<std::string, uint64_t> actual;
+    for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+        const aiMesh* mesh = scene->mMeshes[i];
+        aiString name;
+        if (mesh->mMaterialIndex < scene->mNumMaterials) {
+            scene->mMaterials[mesh->mMaterialIndex]->Get(AI_MATKEY_NAME, name);
+        }
+        actual[name.C_Str()] += mesh->mNumFaces;
+    }
+
+    report.faceCount = 0;
+    for (const auto& [name, faces] : expected) {
+        report.faceCount += faces;
+    }
+    report.materialCount = expected.size();
+
+    std::vector<std::string> differences;
+    std::map<std::string, uint64_t> all = expected;
+    all.insert(actual.begin(), actual.end());
+    for (const auto& entry : all) {
+        const auto expectedIt = expected.find(entry.first);
+        const auto actualIt = actual.find(entry.first);
+        const uint64_t want = expectedIt == expected.end() ? 0 : expectedIt->second;
+        const uint64_t got = actualIt == actual.end() ? 0 : actualIt->second;
+        if (want != got) {
+            differences.push_back(entry.first + " expected " + std::to_string(want) + " got " + std::to_string(got));
+        }
+    }
+    report.mismatchedMaterials = differences.size();
+    if (differences.empty()) {
+        return {};
+    }
+    std::ostringstream message;
+    message << "OBJ material check failed for " << objPath.filename().string()
+            << ": Assimp's per-material face counts differ from the file's usemtl directives in "
+            << differences.size() << " of " << all.size() << " materials (";
+    for (size_t i = 0; i < differences.size() && i < 8; ++i) {
+        message << (i > 0 ? "; " : "") << differences[i];
+    }
+    if (differences.size() > 8) {
+        message << "; ...";
+    }
+    message << ")";
+    return message.str();
+}
+
 ImportResult RunImportPipelineImpl(const ImportOptions& options) {
     ImportResult result;
     ImportContext ctx;
@@ -2662,7 +3864,50 @@ ImportResult RunImportPipelineImpl(const ImportOptions& options) {
         aiProcess_CalcTangentSpace |
         aiProcess_ValidateDataStructure;
 
-    ctx.scene = importer.ReadFile(ctx.sourcePath.string(), postprocess);
+    const bool isObjSource = ToLowerAscii(ctx.sourcePath.extension().string()) == ".obj";
+    if (isObjSource) {
+        ObjMaterialScan objScan;
+        std::string scanError;
+        if (!ScanObjMaterials(ctx.sourcePath, objScan, scanError)) {
+            result.message = scanError;
+            return result;
+        }
+        ObjMaterialReport report;
+        report.mtllibDirectives = objScan.mtllibDirectives;
+        report.mtllibLibraries = objScan.libraries;
+        if (objScan.needsHoist()) {
+            if (options.objHoistMaterialLibraries) {
+                importer.SetIOHandler(new ObjHoistedMtllibIOSystem(ctx.sourcePath, objScan));
+                report.mtllibHoisted = true;
+                std::cout << "[PathTracerImport] OBJ: serving " << objScan.libraries.size()
+                          << " material librar" << (objScan.libraries.size() == 1 ? "y" : "ies")
+                          << " ahead of geometry (" << objScan.mtllibDirectives
+                          << " mtllib directives in the file)\n";
+            } else {
+                ctx.warnings.push_back("OBJ mtllib directives repeat or follow geometry and were not hoisted "
+                                       "(--no-obj-mtllib-hoist)");
+            }
+        }
+
+        // Raw import first so the material check sees Assimp's faces before post-processing.
+        // Equivalent to ReadFile(path, postprocess): ReadFile validates, preprocesses and then applies
+        // the remaining steps through ApplyPostProcessing.
+        ctx.scene = importer.ReadFile(ctx.sourcePath.string(), aiProcess_ValidateDataStructure);
+        if (ctx.scene) {
+            const std::string mismatch = CheckObjMaterialAssignment(ctx.scene, ctx.sourcePath, objScan, report);
+            if (!mismatch.empty()) {
+                if (!options.allowObjMaterialMismatch) {
+                    result.message = mismatch + ". Pass --allow-obj-material-mismatch to import anyway.";
+                    return result;
+                }
+                ctx.warnings.push_back(mismatch);
+            }
+            ctx.scene = importer.ApplyPostProcessing(postprocess & ~aiProcess_ValidateDataStructure);
+        }
+        ctx.objMaterialReport = report;
+    } else {
+        ctx.scene = importer.ReadFile(ctx.sourcePath.string(), postprocess);
+    }
     if (!ctx.scene) {
         result.message = std::string("Assimp import failed: ") + importer.GetErrorString();
         return result;
@@ -2670,6 +3915,14 @@ ImportResult RunImportPipelineImpl(const ImportOptions& options) {
     if (!ctx.scene->mRootNode) {
         result.message = "Imported scene has no root node.";
         return result;
+    }
+    if (ctx.scene->mNumLights > 0u) {
+        ctx.warnings.push_back("Unsupported Assimp lights omitted: lights=" +
+                               std::to_string(ctx.scene->mNumLights));
+    }
+    if (ctx.scene->mNumAnimations > 0u) {
+        ctx.warnings.push_back("Unsupported Assimp animations omitted: animations=" +
+                               std::to_string(ctx.scene->mNumAnimations));
     }
 
     std::error_code ec;
@@ -2688,6 +3941,7 @@ ImportResult RunImportPipelineImpl(const ImportOptions& options) {
     }
 
     ctx.stats.nodeCount = static_cast<uint32_t>(CountNodes(ctx.scene->mRootNode));
+    ConvertCameras(ctx);
     ConvertMaterials(ctx);
     ConvertMeshes(ctx);
     ctx.rootNodes.push_back(ConvertNode(ctx, ctx.scene->mRootNode));
@@ -2713,6 +3967,11 @@ ImportResult RunImportPipelineImpl(const ImportOptions& options) {
             result.message = error;
             return result;
         }
+    }
+
+    if (UsePackedOrcaMaterialImport(ctx) && !WriteZeroDayManifest(ctx, error)) {
+        result.message = error;
+        return result;
     }
 
     std::vector<OutputHashEntry> outputs = HashOutputs(ctx.outputDirectory);
@@ -2767,6 +4026,10 @@ std::string PathTracerImportUsage() {
           << "  --format <fmt>    glb or gltf (default glb)\n"
           << "  --textures <mode> copy, convert, embed, or link (default copy)\n"
           << "  --import-mode <mode>    generic or canonical (default generic)\n"
+          << "  --allow-obj-material-mismatch  OBJ: import even if Assimp's per-material face counts\n"
+          << "                          differ from the file's usemtl directives (recorded as a warning)\n"
+          << "  --no-obj-mtllib-hoist   OBJ: read mtllib directives where they are (diagnostics only;\n"
+          << "                          Assimp then mis-assigns materials after a repeated or late mtllib)\n"
           << "  --help            Show this help text\n\n"
           << "Notes:\n"
           << "  Runtime rendering remains glTF-first; FBX is importer-only.\n";

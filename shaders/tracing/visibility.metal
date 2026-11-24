@@ -1,12 +1,21 @@
+// lastDeltaUnpaired: the last delta scatter traced no specular connection along
+// its direction, so the emitter hit or environment miss is the only estimator
+// for that path and must take full weight.
 inline bool use_visible_emitter_mis(uint depth,
                                     bool lastScatterWasDelta,
+                                    bool lastDeltaUnpaired,
                                     constant PathtraceUniforms& uniforms) {
     if (depth == 0u) {
         return false;
     }
-    return (!lastScatterWasDelta) ||
-           (uniforms.enableSpecularNee != 0u) ||
-           ((ENABLE_MNEE_CAUSTICS != 0) && (uniforms.enableMnee != 0u));
+    if (!lastScatterWasDelta) {
+        return true;
+    }
+    if (lastDeltaUnpaired) {
+        return false;
+    }
+    return (uniforms.enableSpecularNee != 0u) ||
+           ((ENABLE_MNEE_CAUSTICS != 0) && (PT_DEFAULT_OFF(uniforms.enableMnee) != 0u));
 }
 
 
@@ -35,6 +44,74 @@ inline float3 offset_ray_origin(thread const HitRecord& rec, const float3 direct
     // Small push along the outgoing direction helps avoid self-intersections at grazing angles.
     origin += direction * kRayOriginEpsilon * 0.5f;
     return origin;
+}
+
+// A small, coordinate-scaled geometric displacement for thin source interfaces.
+// Four float ULPs near the point, with a 0.1 micrometer floor; independent of camera distance.
+__attribute__((noinline)) float3 offset_interface_origin(thread const HitRecord& rec, const float3 direction) {
+    const float3 n = rec.normal;
+    const float side = dot(direction, n) >= 0.0f ? 1.0f : -1.0f;
+    const float3 step = max(abs(rec.point) * (4.0f * 1.1920928955078125e-7f), float3(1.0e-7f));
+    return rec.point + side * step * n + direction * 1.0e-7f;
+}
+
+inline bool interface_precision(const MaterialData material) {
+    return source_material_flag(material, kMaterialFlagInterfacePrecision);
+}
+
+// Extend the interface policy to every explicitly tagged surface, including NEE.
+inline float3 offset_spawn_origin(thread const HitRecord& rec, const float3 direction,
+                                  const MaterialData material) {
+    return interface_precision(material) ? offset_interface_origin(rec, direction)
+                                         : offset_ray_origin(rec, direction);
+}
+
+// World-space distance a source-transport ray skips after leaving a surface.
+// Default: one micrometre (precise spawning). Scenes whose reference renderer
+// is Tungsten may set renderer sourceRayEpsilon=5e-4, its TraceableScene
+// DefaultEpsilon, so geometry closer than that to a scatter, forward or shadow
+// origin (e.g. the second face of a 0.2 mm thin skin, or a 1 mm mirror slab
+// hugging a glass wall) is not intersected. The uniform is zero unless
+// sourceTransport selected it, so every query below is unchanged by default.
+inline float source_ray_epsilon(constant PathtraceUniforms& uniforms) {
+    return (source_transport_enabled(uniforms) && uniforms.sourceRayEpsilon > 0.0f)
+        ? uniforms.sourceRayEpsilon : kInterfaceMinT;
+}
+
+// True for the minimum distance of a precisely spawned ray (default or source epsilon): only the
+// spawning triangle is excluded and t stays in the original ray frame.
+inline bool is_interface_min_t(constant PathtraceUniforms& uniforms, const float tMin) {
+    return kSourceFeatures && (tMin == kInterfaceMinT || tMin == source_ray_epsilon(uniforms));
+}
+
+inline float spawn_ray_min(const MaterialData material, const float legacyMin) {
+    return interface_precision(material) ? kInterfaceMinT : legacyMin;
+}
+
+// Explicit source media are selected by outgoing geometric side. Unassigned
+// interfaces inherit the current medium; relative dielectric IOR is independent.
+inline bool interface_select_medium(const MaterialData material,
+                                     thread const HitRecord& rec,
+                                     const float3 outgoing,
+                                     thread float3& sigma,
+                                     thread uint& depth) {
+    if (source_material_flag(material, kMaterialFlagExplicitInterior)) {
+        const float3 outward = rec.frontFace != 0u ? rec.normal : -rec.normal;
+        const bool inside = dot(outgoing, outward) < 0.0f;
+        sigma = inside ? max(material.dielectricSigmaA.xyz, float3(0.0f)) : float3(0.0f);
+        depth = inside ? 1u : 0u;
+        return true;
+    }
+    return source_material_flag(material, kMaterialFlagMediumInherit);
+}
+
+// Source forward events retain the ray line/far cap. Advance by the source ray
+// epsilon in world distance, with at least one positive float ULP.
+inline float source_forward_min_t(thread const Ray& ray, float t, float epsilon) {
+    const float scale = max(length(ray.direction),1.0e-20f);
+    const float positive = max(t,0.0f);
+    const float nextUlp = as_type<float>(as_type<uint>(positive)+1u);
+    return max(t+epsilon/scale,nextUlp);
 }
 
 inline float3 offset_surface_point(const float3 point,
@@ -113,6 +190,9 @@ inline bool hit_rectangle(const RectData rect,
                           float tMin,
                           float tMax,
                           thread HitRecord& rec) {
+    if (area_primitive_is_reference_point(rect)) {
+        return false;
+    }
     float3 normal = rect.normalAndPlane.xyz;
     float denom = dot(normal, ray.direction);
     if (fabs(denom) < 1e-6f) {
@@ -158,26 +238,6 @@ inline float3 sky_color(const float3 direction) {
     float3 unit = normalize(direction);
     float t = 0.5f * (unit.y + 1.0f);
     return mix(float3(1.0f, 1.0f, 1.0f), float3(0.5f, 0.7f, 1.0f), t);
-}
-
-inline float environment_max_mip(texture2d<float, access::sample> environmentTexture) {
-    uint mipCount = environmentTexture.get_num_mip_levels();
-    if (mipCount == 0u) {
-        return 0.0f;
-    }
-    return float(mipCount - 1u);
-}
-
-inline float environment_lod_from_roughness(float roughness,
-                                            texture2d<float, access::sample> environmentTexture) {
-    float maxMip = environment_max_mip(environmentTexture);
-    if (maxMip <= 0.0f) {
-        return 0.0f;
-    }
-    float alpha = clamp(roughness, 0.0f, 1.0f);
-    alpha = alpha * alpha;
-    float lod = alpha * maxMip;
-    return clamp(lod, 0.0f, maxMip);
 }
 
 inline float visor_override_mask(const float3 baseColor,
@@ -346,20 +406,6 @@ inline float environment_pdf(constant PathtraceUniforms& uniforms,
     return value;
 }
 
-inline float power_heuristic(const float pdfA, const float pdfB) {
-    float pdfA2 = pdfA * pdfA;
-    float pdfB2 = pdfB * pdfB;
-    float denom = pdfA2 + pdfB2;
-    if (denom <= 0.0f) {
-        return 0.0f;
-    }
-    float weight = pdfA2 / denom;
-    if (!isfinite(weight)) {
-        return 0.0f;
-    }
-    return clamp(weight, kMisWeightClampMin, kMisWeightClampMax);
-}
-
 inline bool sample_environment(constant PathtraceUniforms& uniforms,
                                texture2d<float, access::sample> environmentTexture,
                                device const EnvironmentAliasEntry* conditionalAlias,
@@ -399,16 +445,22 @@ inline bool sample_environment(constant PathtraceUniforms& uniforms,
     uint aliasIndexBase = min(row * width + col, uniforms.environmentAliasCount - 1u);
     float colFraction = colChoice - colFloor;
     const device EnvironmentAliasEntry& conditionalEntry = conditionalAlias[aliasIndexBase];
+    // Remap the alias branch's interval to a uniform offset inside its texel.
+    // Reusing raw uConditional couples the offset to the chosen column.
+    float jitterX = colFraction / max(conditionalEntry.threshold, 1.0e-7f);
     if (colFraction >= conditionalEntry.threshold) {
+        jitterX = (colFraction - conditionalEntry.threshold) /
+                  max(1.0f - conditionalEntry.threshold, 1.0e-7f);
         col = min(conditionalEntry.alias, width - 1u);
         aliasIndexBase = min(row * width + col, uniforms.environmentAliasCount - 1u);
     }
 
-    float fx = (float(col) + fract(uConditional)) / float(width);
+    float fx = (float(col) + clamp(jitterX, 0.0f, 0.99999994f)) / float(width);
     float fy = (float(row) + clamp(uJitter, 0.0f, 0.99999994f)) / float(height);
 
     float theta = fy * kPi;
-    float phi = fx * (2.0f * kPi);
+    // Inverse of the lookup/PDF longitude u=(atan2(z,x)+pi)/(2*pi).
+    float phi = (fx - 0.5f) * (2.0f * kPi);
     float sinTheta = sin(theta);
     float cosTheta = cos(theta);
     float3 mapDir = float3(sinTheta * cos(phi), cosTheta, sinTheta * sin(phi));
@@ -468,7 +520,13 @@ inline bool hit_triangle(constant PathtraceUniforms& uniforms,
     float3 edge2 = v2 - v0;
     float3 pVec = cross(ray.direction, edge2);
     float det = dot(edge1, pVec);
-    if (fabs(det) < 1e-8f) {
+    // Reject parallel rays and degenerate triangles only. det = |direction| * 2 * area * cos(angle to the normal),
+    // so the threshold is on the cosine: an absolute 1e-8 dropped every small triangle of a mesh whose instance
+    // is scaled up, because the object-space direction is then short (the Stanford dragon at scale 30 lost 82%
+    // of the rays that start inside it). For a unit direction and a unit-area triangle the two tests agree.
+    float3 areaNormal = cross(edge1, edge2);
+    float detScaleSq = dot(areaNormal, areaNormal) * dot(ray.direction, ray.direction);
+    if (!(det * det > 1e-16f * detScaleSq)) {
         return false;
     }
 
@@ -490,7 +548,7 @@ inline bool hit_triangle(constant PathtraceUniforms& uniforms,
         return false;
     }
 
-    float3 outwardNormal = cross(edge1, edge2);
+    float3 outwardNormal = areaNormal;
     if (!all(isfinite(outwardNormal))) {
         return false;
     }
@@ -878,6 +936,11 @@ inline bool traverse_bvh_triangles_segment(device const BvhNode* nodes,
                                       worldToLocal4[1].xyz,
                                       worldToLocal4[2].xyz);
     float3x3 normalMatrix = transpose(worldToLocal3);
+    // A hit is faced by the world-space winding of its triangle, as on the hardware path, which takes
+    // cross(worldV1 - worldV0, worldV2 - worldV0). The normal matrix keeps the normal's line, but under a
+    // mirroring instance transform (negative determinant) it points to the other side of that winding: a
+    // one-sided emitter or BSDF on a mirrored instance was then seen from behind.
+    const float windingSign = (determinant(worldToLocal3) < 0.0f) ? -1.0f : 1.0f;
 
     auto toLocalPoint = [&](float3 worldPoint) -> float3 {
         return (worldToLocal4 * float4(worldPoint, 1.0f)).xyz;
@@ -942,8 +1005,8 @@ inline bool traverse_bvh_triangles_segment(device const BvhNode* nodes,
                 float3 worldPoint = toWorldPoint(localRec.point);
                 float3 localGeom = cross(tri.v1.xyz - tri.v0.xyz, tri.v2.xyz - tri.v0.xyz);
                 float3 worldNormal = (all(isfinite(localGeom)) && dot(localGeom, localGeom) > 0.0f)
-                    ? (normalMatrix * localGeom)
-                    : (normalMatrix * localRec.normal);
+                    ? (normalMatrix * localGeom) * windingSign
+                    : (normalMatrix * localRec.normal) * windingSign;
                 if (!all(isfinite(worldPoint)) ||
                     !all(isfinite(worldNormal)) ||
                     dot(worldNormal, worldNormal) <= 0.0f) {
@@ -1212,6 +1275,7 @@ inline bool trace_scene_software(constant PathtraceUniforms& uniforms,
     reset_counters(counters);
     bool earlyExit = false;
 
+    reset_source_shadow(rec);
     rec.primitiveType = kPrimitiveTypeNone;
     rec.primitiveIndex = kInvalidIndex;
     if (shadowAudit != nullptr) {
@@ -1246,6 +1310,7 @@ inline bool trace_scene_software(constant PathtraceUniforms& uniforms,
             closest = triangleRec.t;
             rec = triangleRec;
             if (anyHitOnly) {
+                reset_source_shadow(rec);
                 return true;
             }
         }
@@ -1319,6 +1384,7 @@ inline bool trace_scene_software(constant PathtraceUniforms& uniforms,
         }
     }
 
+    reset_source_shadow(rec);
     return hitAnything;
 }
 
@@ -1381,7 +1447,10 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                                  uint excludeMeshIndex,
                                  uint excludePrimitiveIndex,
                                  thread HardwareShadowTraceAudit* shadowAudit,
-                                 thread HitRecord& rec) {
+                                 thread HitRecord& rec,
+                                 bool shadowQuery = false) {
+    reset_source_shadow(rec);
+    const bool preciseSpawn = is_interface_min_t(uniforms, tMin);
     rec.primitiveType = kPrimitiveTypeNone;
     rec.primitiveIndex = kInvalidIndex;
 
@@ -1600,18 +1669,22 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
             bool selfHit = (meshIndex == rec.meshIndex &&
                             triIndex == rec.primitiveIndex &&
                             fabs(worldHitDistance) <= kHardwareOcclusionEpsilon);
+            // Occlusion queries treat a same-mesh hit within kEpsilon
+            // as the shaded surface, whether traced any-hit (wavefront shadow rays)
+            // or closest-hit (the alpha-aware shadow trace), so both integrators
+            // see the same occluders.
             bool excluded = (meshIndex == excludeMesh &&
                              (triIndex == excludePrim ||
-                              (anyHitOnly && worldHitDistance <= kHardwareOcclusionEpsilon)));
+                              (!preciseSpawn && (anyHitOnly || shadowQuery) &&
+                               worldHitDistance <= kEpsilon)));
             bool excludeMeshOnly = (excluded && excludePrim == kInvalidIndex);
 
             // Hardware-only near-mesh hit (H5): the hardware found a same-mesh
-            // triangle at short distance that the software Möller–Trumbore test
-            // cannot reproduce (!resolvedHit).  SWRT runs the identical test and
+            // triangle at short distance that the software Möller-Trumbore test
+            // cannot reproduce (!resolvedHit). SWRT runs the identical test and
             // would also miss this triangle, so HWRT must reject it too to maintain
-            // parity on primary bounce rays.
-            bool hwOnlyNearMeshHit = (!resolvedHit &&
-                                      !anyHitOnly &&
+            // parity, on bounce and shadow rays alike.
+            bool hwOnlyNearMeshHit = (!preciseSpawn && !resolvedHit &&
                                       meshIndex == excludeMesh &&
                                       worldHitDistance <= kHardwareOcclusionEpsilon);
 
@@ -1646,8 +1719,14 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                 if (all(isfinite(dir)) && dirLenSq > 1.0e-12f) {
                     dirStep = dir * rsqrt(dirLenSq);
                 }
-                currentRay.origin = worldPoint + dirStep * kHardwareOcclusionEpsilon;
-                currentTMin = 0.0f;
+                if (preciseSpawn) {
+                    // Keep t in the original ray frame. Only the spawning triangle
+                    // is excluded; no finite world-space interval is discarded.
+                    currentTMin = nextafter(max(resolvedT, currentTMin), INFINITY);
+                } else {
+                    currentRay.origin = worldPoint + dirStep * kHardwareOcclusionEpsilon;
+                    currentTMin = 0.0f;
+                }
                 if (excludeMeshOnly) {
                     excludeMesh = kInvalidIndex;
                 }
@@ -1770,6 +1849,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                 atomic_fetch_add_explicit(&stats->shadowRayEarlyExitCount, 1u, memory_order_relaxed);
             }
             rec = hardwareRec;
+            reset_source_shadow(rec);
             return true;
         }
         return trace_scene_software(uniforms,
@@ -1847,6 +1927,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
         atomic_fetch_add_explicit(&stats->internalBothVisited, counters.internalBothVisited, memory_order_relaxed);
     }
 
+    reset_source_shadow(rec);
     return hitAnything;
 }
 
@@ -1868,7 +1949,8 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                                  bool anyHitOnly,
                                  uint excludeMeshIndex,
                                  uint excludePrimitiveIndex,
-                                 thread HitRecord& rec) {
+                                 thread HitRecord& rec,
+                                 bool shadowQuery = false) {
     return trace_scene_hardware(uniforms,
                                 accel,
                                 meshInfos,
@@ -1888,7 +1970,8 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                                 excludeMeshIndex,
                                 excludePrimitiveIndex,
                                 nullptr,
-                                rec);
+                                rec,
+                                shadowQuery);
 }
 #endif
 

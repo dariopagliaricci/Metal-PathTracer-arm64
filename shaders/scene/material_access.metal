@@ -72,6 +72,10 @@
             return true;
         }
 
+        if (is_interface_min_t(uniforms, tMin)) {
+            currentTMin = nextafter(max(tempRec.t, currentTMin), INFINITY);
+            continue;
+        }
         float advance = max(tempRec.t + kHardwareOcclusionEpsilon, kHardwareOcclusionEpsilon);
         currentRay.origin = ray_at(currentRay, advance);
         currentRay.origin += currentRay.direction * kHardwareOcclusionEpsilon;
@@ -79,14 +83,6 @@
     }
 
     return false;
-}
-
-inline float clamp01(const float value) {
-    return clamp(value, 0.0f, 1.0f);
-}
-
-inline float3 clamp01(const float3 value) {
-    return clamp(value, float3(0.0f), float3(1.0f));
 }
 
 inline float3 camera_visible_emission(const MaterialData material, const uint depth) {
@@ -105,7 +101,7 @@ inline bool material_texture_valid(constant PathtraceUniforms& uniforms, uint in
 }
 
 inline MaterialTextureInfo material_texture_info(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
     device const MaterialTextureInfo* textureInfos,
     constant PathtraceUniforms& uniforms,
     uint index) {
@@ -265,25 +261,9 @@ inline PbrTextureSamplingContext make_pbr_texture_sampling_context(const Materia
     return ctx;
 }
 
-inline float4 sample_material_texture(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
-    array<sampler, kMaxMaterialSamplers> materialSamplers,
-    device const MaterialTextureInfo* textureInfos,
-    constant PathtraceUniforms& uniforms,
-    uint index,
-    float2 uv,
-    float4 fallback) {
-    if (!material_texture_valid(uniforms, index)) {
-        return fallback;
-    }
-    MaterialTextureInfo info = material_texture_info(textures, textureInfos, uniforms, index);
-    uint samplerIndex = min(info.flags, kMaxMaterialSamplers - 1u);
-    return textures[index].sample(materialSamplers[samplerIndex], uv);
-}
-
 inline float4 sample_material_texture_level(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
-    array<sampler, kMaxMaterialSamplers> materialSamplers,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
+    constant array<sampler, kMaxMaterialSamplers>& materialSamplers,
     device const MaterialTextureInfo* textureInfos,
     constant PathtraceUniforms& uniforms,
     uint index,
@@ -304,8 +284,8 @@ inline float4 sample_material_texture_level(
 }
 
 inline float4 sample_material_texture_filtered(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
-    array<sampler, kMaxMaterialSamplers> materialSamplers,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
+    constant array<sampler, kMaxMaterialSamplers>& materialSamplers,
     device const MaterialTextureInfo* textureInfos,
     constant PathtraceUniforms& uniforms,
     uint index,
@@ -329,7 +309,8 @@ inline float4 sample_material_texture_filtered(
         if (gradMag > 0.0f && isfinite(gradMag)) {
             return textures[index].sample(materialSamplers[samplerIndex],
                                           uv,
-                                          gradient2d(dUVdx, dUVdy));
+                                          gradient2d(dUVdx * exp2(uniforms.textureLodBias),
+                                                     dUVdy * exp2(uniforms.textureLodBias)));
         }
     }
 
@@ -341,8 +322,43 @@ inline float4 sample_material_texture_filtered(
     return textures[index].sample(materialSamplers[samplerIndex], uv, level(clampedLod));
 }
 
+// The alpha a path ray's cutoff or BLEND coverage test reads: the hit point's own alpha at mip 0, as the
+// shadow-ray test reads. A hit is a point, and the samples average the coverage. Filtered alpha at the
+// path's cone LOD decides whole texture regions at once, so coarse levels turn MASK cutouts fully opaque
+// or fully empty (barcelona_pavilion_day leaves: 42% coverage at mip 0, 100% at the 1x1 level). BLEND
+// reads mip 0 too: its pass is a MIS null event whose light side NEE takes through the shadow test's mip-0
+// alpha, so the two strategies must see the same alpha at a point. With a filtered path alpha above 0
+// where mip 0 is 0, the pass and NEE both counted the light behind a BLEND hole. With mip 0 already read
+// (no LOD, no gradients) there is no second fetch.
+inline float path_cutout_alpha(constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
+                               constant array<sampler, kMaxMaterialSamplers>& materialSamplers,
+                               device const MaterialTextureInfo* textureInfos,
+                               constant PathtraceUniforms& uniforms,
+                               const MaterialData material,
+                               const PbrTextureSamplingContext baseColorCtx,
+                               float baseColorLod,
+                               float filteredAlpha) {
+    const bool alphaTested = material.pbrExtras.w > 0.5f;
+    if (!alphaTested || !material_texture_valid(uniforms, material.textureIndices0.x) ||
+        (!(baseColorLod > 0.0f) && !baseColorCtx.hasIgehyGradients)) {
+        return filteredAlpha;
+    }
+    const float4 texel = sample_material_texture_level(textures,
+                                                       materialSamplers,
+                                                       textureInfos,
+                                                       uniforms,
+                                                       material.textureIndices0.x,
+                                                       baseColorCtx.uv,
+                                                       float4(1.0f),
+                                                       0.0f);
+    if ((material.materialFlags & kMaterialFlagBlackKeyAlphaFromRgb) != 0u) {
+        return smoothstep(0.72f, 0.90f, dot(texel.xyz, kLuminanceWeights));
+    }
+    return texel.w;
+}
+
 inline float material_texture_lod_from_cone(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
     device const MaterialTextureInfo* textureInfos,
     constant PathtraceUniforms& uniforms,
     uint index,
@@ -352,11 +368,12 @@ inline float material_texture_lod_from_cone(
         return 0.0f;
     }
     MaterialTextureInfo info = material_texture_info(textures, textureInfos, uniforms, index);
-    return ray_cone_lod_from_footprint(info, uvPerWorld, footprintWorld);
+    return clamp(ray_cone_lod_from_footprint(info, uvPerWorld, footprintWorld) + uniforms.textureLodBias,
+                 0.0f, float(max(info.mipCount, 1u) - 1u));
 }
 
 inline bool material_texture_lod_from_gradients(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
     device const MaterialTextureInfo* textureInfos,
     constant PathtraceUniforms& uniforms,
     uint index,
@@ -386,12 +403,12 @@ inline bool material_texture_lod_from_gradients(
         return false;
     }
     float maxMip = float(info.mipCount - 1u);
-    outLod = clamp(lod, 0.0f, maxMip);
+    outLod = clamp(lod + uniforms.textureLodBias, 0.0f, maxMip);
     return isfinite(outLod);
 }
 
 inline float material_texture_lod_with_fallback(
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> textures,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
     device const MaterialTextureInfo* textureInfos,
     constant PathtraceUniforms& uniforms,
     uint index,
@@ -431,8 +448,12 @@ inline float material_texture_lod_with_fallback(
 }
 
 struct WavefrontSurfaceState {
-    MaterialData material;
     HitRecord rec;
+    float4 resolvedBaseColorRoughness;
+    float4 resolvedTypeEta;
+    float4 resolvedEmission;
+    float4 resolvedPbrParams;
+    float4 resolvedPbrExtras;
     float diffuseOcclusion;
     float3 firstHitAlbedo;
     float3 firstHitNormal;
@@ -452,10 +473,133 @@ struct WavefrontSurfaceState {
     float3 debugSnWorld;
     bool debugHasNormalMap;
     bool alphaDiscarded;
+    float3 sourceForwardWeight;
 };
 
 inline float3 material_base_color(const MaterialData material);
 inline float ior_from_f0(float f0);
+
+inline bool triangle_has_valid_vertex_tangents(
+    constant PathtraceUniforms& uniforms,
+    uint meshIndex,
+    uint primitiveIndex,
+    device const MeshInfo* meshInfos,
+    device const SceneVertex* vertices,
+    device const uint3* meshIndices) {
+    if (!meshInfos || !vertices || !meshIndices || uniforms.meshCount == 0u) {
+        return false;
+    }
+    MeshInfo info = meshInfos[min(meshIndex, uniforms.meshCount - 1u)];
+    if (primitiveIndex < info.triangleOffset ||
+        primitiveIndex - info.triangleOffset >= info.indexCount) {
+        return false;
+    }
+    uint3 indices = meshIndices[info.indexOffset + primitiveIndex - info.triangleOffset];
+    float4 t0 = vertices[indices.x].tangent;
+    float4 t1 = vertices[indices.y].tangent;
+    float4 t2 = vertices[indices.z].tangent;
+    // Interpolation historically replaces zero vectors/signs with defaults.
+    // Check the stored vertex data so Emerald's source repair skips that fallback.
+    return all(isfinite(t0)) && all(isfinite(t1)) && all(isfinite(t2)) &&
+        fabs(t0.w) > 0.5f && fabs(t1.w) > 0.5f && fabs(t2.w) > 0.5f &&
+        dot(t0.xyz, t0.xyz) > 1.0e-6f && dot(t1.xyz, t1.xyz) > 1.0e-6f &&
+        dot(t2.xyz, t2.xyz) > 1.0e-6f;
+}
+
+inline bool source_is_thin(const MaterialData m);
+inline float3 source_thin_forward(const MaterialData m, float3 n, float3 wo);
+
+inline bool scene_has_source_opacity(constant PathtraceUniforms& uniforms,
+                                    device const MaterialData* materials) {
+    return materials && source_opacity_present(uniforms);
+}
+
+inline float3 source_shadow_weight(float3 value, thread const HitRecord& rec) {
+    if (!kSourceFeatures) return value;
+    value = rec.sourceShadowTransmission < 1.0f ? value * rec.sourceShadowTransmission : value;
+    return any(rec.sourceShadowRgb < float3(1.0f)) ? value * rec.sourceShadowRgb : value;
+}
+
+// Tungsten scalar maps have independent dimensions and linear (raw byte) values.
+inline float2 source_texture_uv(const MaterialData material, const float2 uv) {
+    return float2(dot(material.textureTransform0.xy, uv) + material.textureTransform0.z,
+                  dot(material.textureTransform1.xy, uv) + material.textureTransform1.z);
+}
+
+inline float source_opacity(constant PathtraceUniforms& uniforms,
+    const MaterialData material, thread const HitRecord& rec,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
+    constant array<sampler, kMaxMaterialSamplers>& samplers,
+    device const MaterialTextureInfo* infos, device const MeshInfo* meshes,
+    device const SceneVertex* vertices, device const uint3* indices) {
+    if (!source_has_opacity(material)) return 1.0f;
+    float alpha = material.textureControl.x;
+    if (material_texture_valid(uniforms, material.textureIndices1.z) &&
+        rec.primitiveType == kPrimitiveTypeTriangle && meshes && vertices && indices) {
+        float2 uv = interpolate_uv(uniforms, rec.meshIndex, rec.primitiveIndex,
+            rec.barycentric, 0u, meshes, vertices, indices);
+        alpha *= sample_material_texture_level(textures, samplers, infos, uniforms,
+            material.textureIndices1.z, source_texture_uv(material, uv), float4(1.0f), 0.0f).x;
+    }
+    return saturate(alpha);
+}
+
+inline float source_height_texel(texture2d<float, access::sample> texture, int2 p) {
+    int2 size = int2(texture.get_width(), texture.get_height());
+    return texture.read(uint2((p % size + size) % size), 0).x;
+}
+
+inline float2 source_height_derivatives(texture2d<float, access::sample> texture, float2 uv) {
+    // BitmapTexture::derivatives: interpolate two-texel differences, with no
+    // division by two or texel size. y is positive in bitmap row coordinates.
+    float2 xy = uv * float2(texture.get_width(), texture.get_height()) - 0.5f;
+    int2 p = int2(xy); // Tungsten truncates toward zero, including at the repeat seam.
+    float2 f = xy - float2(p);
+    float2 gradients[4];
+    for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+        int2 q = p + int2(x,y);
+        gradients[y*2+x] = float2(
+            source_height_texel(texture,q+int2(1,0))-source_height_texel(texture,q-int2(1,0)),
+            source_height_texel(texture,q+int2(0,1))-source_height_texel(texture,q-int2(0,1)));
+    }
+    return mix(mix(gradients[0],gradients[1],f.x), mix(gradients[2],gradients[3],f.x),f.y);
+}
+
+inline float3 source_bump_normal(constant PathtraceUniforms& uniforms,
+    const MaterialData material, thread const HitRecord& rec, float3 ns,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& textures,
+    device const MeshInfo* meshes, device const SceneVertex* vertices, device const uint3* indices) {
+    if (!kSourceFeatures || !material_texture_valid(uniforms, material.textureIndices1.w) ||
+        material.textureControl.z == 0.0f || rec.primitiveType != kPrimitiveTypeTriangle ||
+        !meshes || !vertices || !indices) return ns;
+    // Tungsten perturbs the authored normal before facing the completed frame.
+    const float3 facedNs = ns;
+    const bool backFace = rec.frontFace == 0u;
+    if (backFace) ns = -ns;
+    MeshInfo mesh = meshes[min(rec.meshIndex, uniforms.meshCount - 1u)];
+    uint local = rec.primitiveIndex - mesh.triangleOffset;
+    if (local >= mesh.indexCount) return facedNs;
+    uint3 tri = indices[mesh.indexOffset + local];
+    SceneVertex v0 = vertices[tri.x], v1 = vertices[tri.y], v2 = vertices[tri.z];
+    float3 q1 = (mesh.localToWorld * float4(v1.position.xyz-v0.position.xyz,0.0f)).xyz;
+    float3 q2 = (mesh.localToWorld * float4(v2.position.xyz-v0.position.xyz,0.0f)).xyz;
+    float2 uv0 = vertex_uv_set(v0,0u), uv1 = vertex_uv_set(v1,0u), uv2 = vertex_uv_set(v2,0u);
+    float2 e1 = uv1-uv0, e2 = uv2-uv0;
+    if (fabs(e1.x*e2.y-e2.x*e1.y) < 1.0e-6f) return facedNs;
+    // TriangleMesh::tangentSpace normalizes the numerators, without dividing det.
+    float3 t = normalize(q1*e2.y-e1.y*q2), b = normalize(q2*e1.x-e2.x*q1);
+    float2 uv = interpolate_uv(uniforms,rec.meshIndex,rec.primitiveIndex,rec.barycentric,
+                              0u,meshes,vertices,indices);
+    float2 dh = source_height_derivatives(textures[material.textureIndices1.w],
+                                          source_texture_uv(material,uv)) * material.textureControl.z;
+    t += ns*(dh.x-dot(ns,t));
+    b += ns*(dh.y-dot(ns,b));
+    float3 n = cross(t,b);
+    if (!all(isfinite(n)) || dot(n,n)<1.0e-16f) return facedNs;
+    n = normalize(n);
+    n = dot(n,ns)<0.0f ? -n : n;
+    return backFace ? -n : n;
+}
 
 inline WavefrontSurfaceState resolve_wavefront_surface_state(
     constant PathtraceUniforms& uniforms,
@@ -463,6 +607,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
     const MaterialData baseMaterial,
     const uint matIndex,
     const uint depth,
+    const bool pavilionSmoothDifferentials,
     const Ray ray,
     const PrimaryRayDiff primaryRayDiff,
     const float3 incidentDir,
@@ -470,8 +615,8 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
     const RayCone rayCone,
     thread uint& state,
     const bool skipStochasticAlphaDiscard,
-    array<texture2d<float, access::sample>, kMaxMaterialTextures> materialTextures,
-    array<sampler, kMaxMaterialSamplers> materialSamplers,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& materialTextures,
+    constant array<sampler, kMaxMaterialSamplers>& materialSamplers,
     device const MaterialTextureInfo* materialTextureInfos,
     device const MeshInfo* meshInfos,
     device const SceneVertex* sceneVertices,
@@ -479,6 +624,11 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
     WavefrontSurfaceState result{};
     HitRecord rec = inputRec;
     MaterialData material = baseMaterial;
+    result.resolvedBaseColorRoughness = baseMaterial.baseColorRoughness;
+    result.resolvedTypeEta = baseMaterial.typeEta;
+    result.resolvedEmission = baseMaterial.emission;
+    result.resolvedPbrParams = baseMaterial.pbrParams;
+    result.resolvedPbrExtras = baseMaterial.pbrExtras;
     result.diffuseOcclusion = 1.0f;
     result.firstHitAlbedo = material_base_color(baseMaterial);
     result.firstHitNormal = inputRec.shadingNormal;
@@ -498,9 +648,17 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
     result.debugSnWorld = inputRec.shadingNormal;
     result.debugHasNormalMap = false;
     result.alphaDiscarded = false;
+    result.sourceForwardWeight = float3(1.0f);
     uint type = static_cast<uint>(material.typeEta.x);
+    if (!skipStochasticAlphaDiscard && source_has_opacity(material) &&
+        rand_uniform(state) >= source_opacity(uniforms,material,rec,materialTextures,
+            materialSamplers,materialTextureInfos,meshInfos,sceneVertices,meshIndices)) {
+        result.alphaDiscarded = true;
+        return result;
+    }
 
     float3 shadingNormal = rec.shadingNormal;
+    bool authoredNormalWasFaced = false;
     if (!all(isfinite(shadingNormal)) || dot(shadingNormal, shadingNormal) <= 0.0f) {
         shadingNormal = rec.normal;
     }
@@ -515,20 +673,39 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                       meshIndices);
         if (all(isfinite(candidate)) && dot(candidate, candidate) > 0.0f) {
             result.debugVtxNormalRaw = candidate;
-            if (dot(candidate, rec.normal) < 0.0f) {
+            if (dot(candidate, rec.normal) < 0.0f &&
+                !source_material_flag(material, kMaterialFlagAuthoredDielectricNormal)) {
+                authoredNormalWasFaced = true;
                 candidate = -candidate;
             }
             shadingNormal = normalize(candidate);
             result.debugVtxNormal = shadingNormal;
         }
     }
-    if (type == 2u) {
+    if (type == 2u && !source_material_flag(material, kMaterialFlagAuthoredDielectricNormal)) {
         float3 geomNormal = rec.normal;
         if (all(isfinite(geomNormal)) && dot(geomNormal, geomNormal) > 0.0f) {
             shadingNormal = geomNormal;
         }
     }
+    if (rec.primitiveType == kPrimitiveTypeSphere &&
+        source_material_flag(material, kMaterialFlagAuthoredDielectricNormal)) {
+        // An analytic sphere's authored normal is its outward normal, as the megakernel uses (EP8-f3).
+        shadingNormal = rec.frontFace != 0u ? rec.normal : -rec.normal;
+    }
+    shadingNormal = source_bump_normal(uniforms,material,rec,shadingNormal,
+                                      materialTextures,meshInfos,sceneVertices,meshIndices);
     rec.shadingNormal = shadingNormal;
+    if (!skipStochasticAlphaDiscard && source_transport_enabled(uniforms) && source_is_thin(material)) {
+        float3 forward = source_thin_forward(material,shadingNormal,-incidentDir);
+        float p = clamp(dot(forward,float3(1.0f/3.0f)),0.0f,1.0f);
+        if (rand_uniform(state) < p) {
+            result.alphaDiscarded = true;
+            result.sourceForwardWeight = forward/max(p,1.0e-30f);
+            result.rec = rec;
+            return result;
+        }
+    }
 
     if (type != 7u &&
         rec.primitiveType == kPrimitiveTypeTriangle &&
@@ -563,7 +740,8 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                              meshIndices,
                                                              dPdu0,
                                                              dPdv0,
-                                                             uvPerWorld0);
+                                                             uvPerWorld0,
+                                                             (material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u);
         float3 dPdu1 = float3(0.0f);
         float3 dPdv1 = float3(0.0f);
         float uvPerWorld1 = 0.0f;
@@ -579,15 +757,20 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                              uvPerWorld1);
         float2 dUVdx0 = float2(0.0f);
         float2 dUVdy0 = float2(0.0f);
+        // Pavilion textureGrad uses the interpolated normal's tangent plane,
+        // including smooth lily geometry, as in the reference renderer.
         bool hasIgehyGradients0 = false;
-        if (depth == 0u && hasSurfacePartials0) {
+        if ((depth == 0u || (pavilionSmoothDifferentials &&
+             (material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u)) &&
+            hasSurfacePartials0) {
             float3 dudP = float3(0.0f);
             float3 dvdP = float3(0.0f);
             if (uv_world_gradients_from_partials(dPdu0, dPdv0, dudP, dvdP)) {
                 hasIgehyGradients0 = first_hit_uv_gradients_igehy(ray,
                                                                   primaryRayDiff,
                                                                   rec.t,
-                                                                  rec.normal,
+                                                                  ((material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u
+                                                                      ? shadingNormal : rec.normal),
                                                                   dudP,
                                                                   dvdP,
                                                                   dUVdx0,
@@ -597,14 +780,17 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         float2 dUVdx1 = float2(0.0f);
         float2 dUVdy1 = float2(0.0f);
         bool hasIgehyGradients1 = false;
-        if (depth == 0u && hasSurfacePartials1) {
+        if ((depth == 0u || (pavilionSmoothDifferentials &&
+             (material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u)) &&
+            hasSurfacePartials1) {
             float3 dudP = float3(0.0f);
             float3 dvdP = float3(0.0f);
             if (uv_world_gradients_from_partials(dPdu1, dPdv1, dudP, dvdP)) {
                 hasIgehyGradients1 = first_hit_uv_gradients_igehy(ray,
                                                                   primaryRayDiff,
                                                                   rec.t,
-                                                                  rec.normal,
+                                                                  ((material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u
+                                                                      ? shadingNormal : rec.normal),
                                                                   dudP,
                                                                   dvdP,
                                                                   dUVdx1,
@@ -626,16 +812,21 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                                                    dUVdx1,
                                                                                    dUVdy1,
                                                                                    hasSurfacePartials1 ? uvPerWorld1 : 0.0f);
-        float baseColorLod =
-            material_texture_lod_with_fallback(materialTextures,
-                                               materialTextureInfos,
-                                               uniforms,
-                                               material.textureIndices0.x,
-                                               baseColorCtx.hasIgehyGradients,
-                                               baseColorCtx.dUVdx,
-                                               baseColorCtx.dUVdy,
-                                               baseColorCtx.uvPerWorld,
-                                               surfaceFootprintWorld);
+        // Non-PBR base color is filtered only where ray differentials exist (the primary hit),
+        // and sampled at mip 0 elsewhere, as in the megakernel and the Embree backend. The
+        // ray-cone LOD reaches the coarsest mips after one diffuse bounce, and those levels do
+        // not keep the texture mean for non-power-of-two sizes (bitterli_staircase: +4.7%).
+        float baseColorLod = baseColorCtx.hasIgehyGradients
+            ? material_texture_lod_with_fallback(materialTextures,
+                                                 materialTextureInfos,
+                                                 uniforms,
+                                                 material.textureIndices0.x,
+                                                 baseColorCtx.hasIgehyGradients,
+                                                 baseColorCtx.dUVdx,
+                                                 baseColorCtx.dUVdy,
+                                                 baseColorCtx.uvPerWorld,
+                                                 surfaceFootprintWorld)
+            : 0.0f;
         float4 baseColorSample =
             sample_material_texture_filtered(materialTextures,
                                             materialSamplers,
@@ -648,6 +839,8 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                             baseColorCtx.hasIgehyGradients,
                                             baseColorCtx.dUVdx,
                                             baseColorCtx.dUVdy);
+        baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
+                                                                         baseColorSample);
         float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
         float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
         material.baseColorRoughness.xyz = baseFactor * baseColorSampleRgb;
@@ -703,7 +896,8 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                              meshIndices,
                                                              dPdu0,
                                                              dPdv0,
-                                                             uvPerWorld0);
+                                                             uvPerWorld0,
+                                                             (material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u);
         float3 dPdu1 = float3(0.0f);
         float3 dPdv1 = float3(0.0f);
         float uvPerWorld1 = 0.0f;
@@ -721,14 +915,17 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         float2 dUVdx0 = float2(0.0f);
         float2 dUVdy0 = float2(0.0f);
         bool hasIgehyGradients0 = false;
-        if (depth == 0u && hasSurfacePartials0) {
+        if ((depth == 0u || (pavilionSmoothDifferentials &&
+             (material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u)) &&
+            hasSurfacePartials0) {
             float3 dudP = float3(0.0f);
             float3 dvdP = float3(0.0f);
             if (uv_world_gradients_from_partials(dPdu0, dPdv0, dudP, dvdP)) {
                 hasIgehyGradients0 = first_hit_uv_gradients_igehy(ray,
                                                                   primaryRayDiff,
                                                                   rec.t,
-                                                                  rec.normal,
+                                                                  ((material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u
+                                                                      ? shadingNormal : rec.normal),
                                                                   dudP,
                                                                   dvdP,
                                                                   dUVdx0,
@@ -738,14 +935,17 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         float2 dUVdx1 = float2(0.0f);
         float2 dUVdy1 = float2(0.0f);
         bool hasIgehyGradients1 = false;
-        if (depth == 0u && hasSurfacePartials1) {
+        if ((depth == 0u || (pavilionSmoothDifferentials &&
+             (material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u)) &&
+            hasSurfacePartials1) {
             float3 dudP = float3(0.0f);
             float3 dvdP = float3(0.0f);
             if (uv_world_gradients_from_partials(dPdu1, dPdv1, dudP, dvdP)) {
                 hasIgehyGradients1 = first_hit_uv_gradients_igehy(ray,
                                                                   primaryRayDiff,
                                                                   rec.t,
-                                                                  rec.normal,
+                                                                  ((material.materialFlags & kMaterialFlagSingleScatterSpecular) != 0u
+                                                                      ? shadingNormal : rec.normal),
                                                                   dudP,
                                                                   dvdP,
                                                                   dUVdx1,
@@ -856,11 +1056,14 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
             float luma = dot(baseColorSample.xyz, kLuminanceWeights);
             baseColorSample.w = smoothstep(0.72f, 0.90f, luma);
         }
+        baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
+                                                                         baseColorSample);
         float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
         float3 baseColor = baseFactor * baseColorSampleRgb;
 
         float metallic = clamp(material.pbrParams.x, 0.0f, 1.0f);
-        float roughness = clamp(material.pbrParams.y, 0.0f, 1.0f);
+        // Scene multipliers may exceed one; preserve them until source G is applied.
+        float roughness = max(material.pbrParams.y, 0.0f);
         float normalStrengthScale = 1.0f;
 #if PT_DEBUG_TOOLS
         normalStrengthScale = max(uniforms.debugNormalStrengthScale, 0.0f);
@@ -898,6 +1101,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
             metallic = clamp(mrSample.z * metallic, 0.0f, 1.0f);
             roughness = clamp(mrSample.y * roughness, 0.0f, 1.0f);
         }
+        roughness = clamp(roughness, 0.0f, 1.0f);
         float visorMask = visor_override_blend(baseColor, metallic, roughness, matIndex, uniforms);
         if (visorMask > 0.0f) {
             float overrideRoughness =
@@ -953,7 +1157,10 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         transmission *= (1.0f - metallic);
 
         float alpha = clamp(material.pbrExtras.x, 0.0f, 1.0f);
-        alpha = clamp(alpha * baseColorSample.w, 0.0f, 1.0f);
+        alpha = clamp(alpha * path_cutout_alpha(materialTextures, materialSamplers, materialTextureInfos,
+                                                uniforms, material, baseColorCtx, baseColorLod,
+                                                baseColorSample.w),
+                      0.0f, 1.0f);
         float alphaCutoff = clamp(material.pbrExtras.y, 0.0f, 1.0f);
         float alphaMode = material.pbrExtras.w;
         if (alphaMode > 0.5f) {
@@ -967,6 +1174,11 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
             }
             if (discard) {
                 result.alphaDiscarded = true;
+                result.resolvedBaseColorRoughness = material.baseColorRoughness;
+                result.resolvedTypeEta = material.typeEta;
+                result.resolvedEmission = material.emission;
+                result.resolvedPbrParams = material.pbrParams;
+                result.resolvedPbrExtras = material.pbrExtras;
                 return result;
             }
         }
@@ -1043,14 +1255,13 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         if (normalScale <= 1.0e-4f) {
             useNormalMap = false;
         }
-        float normalLength = 1.0f;
         bool flipNormalGreen = false;
 #if PT_DEBUG_TOOLS
         flipNormalGreen = uniforms.debugFlipNormalGreen != 0u;
 #endif
         if (useNormalMap) {
             result.debugHasNormalMap = true;
-            float3 normalTexel =
+            float4 normalTexel =
                 sample_material_texture_filtered(materialTextures,
                                                 materialSamplers,
                                                 materialTextureInfos,
@@ -1061,16 +1272,16 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                 normalLod,
                                                 normalCtx.hasIgehyGradients,
                                                 normalCtx.dUVdx,
-                                                normalCtx.dUVdy).xyz;
-            result.debugTexelRaw = normalTexel;
-            float3 normalSampleTs = decode_normal_map(normalTexel,
+                                                normalCtx.dUVdy);
+            result.debugTexelRaw = normalTexel.xyz;
+            float3 normalSampleTs = decode_normal_map(normalTexel.xyz,
                                                       normalScale,
-                                                      flipNormalGreen,
-                                                      normalLength);
+                                                      flipNormalGreen);
             result.debugTexelDecoded = normalSampleTs;
             float3 t = tangent.xyz;
             float3 b = float3(0.0f);
             bool hasBasis = false;
+            bool hasVertexTangentBasis = false;
             bool trustVertexTangent = fabs(tangent.w) > 0.5f;
             if (trustVertexTangent && all(isfinite(t)) && dot(t, t) > 1.0e-6f) {
                 t = normalize(t - shadingNormal * dot(shadingNormal, t));
@@ -1079,6 +1290,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                     b = normalize(cross(shadingNormal, t)) * tangentSign;
                     if (all(isfinite(b)) && dot(b, b) > 1.0e-6f) {
                         hasBasis = true;
+                        hasVertexTangentBasis = true;
                     }
                 }
             }
@@ -1098,18 +1310,45 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
             if (!hasBasis) {
                 build_onb(shadingNormal, t, b);
             }
-            float3 mapped = normalize(t * normalSampleTs.x +
-                                      b * normalSampleTs.y +
-                                      shadingNormal * normalSampleTs.z);
+            float3 mappedNormalTs = normalSampleTs;
+            if (hasVertexTangentBasis &&
+                (material.materialFlags & (kMaterialFlagAlphaCutoutContinuation |
+                                           kMaterialFlagSourceNormalGreen)) != 0u &&
+                triangle_has_valid_vertex_tangents(uniforms, rec.meshIndex, rec.primitiveIndex,
+                                                   meshInfos, sceneVertices, meshIndices)) {
+                // Per-material finding: these Emerald materials match the Falcor
+                // references only with G negated (other ORCA normal maps match with
+                // G kept). Then apply Falcor's complete-normal flip when N faced.
+                // Keep the original decoded sample for normal-variance roughness.
+                mappedNormalTs.y = -mappedNormalTs.y;
+                if (authoredNormalWasFaced) {
+                    mappedNormalTs.x = -mappedNormalTs.x;
+                }
+            }
+            float3 mapped = normalize(t * mappedNormalTs.x +
+                                      b * mappedNormalTs.y +
+                                      shadingNormal * mappedNormalTs.z);
             if (dot(mapped, rec.normal) < 0.0f) {
                 mapped = -mapped;
+            }
+            if ((material.materialFlags & kMaterialFlagSourceNormalGreen) != 0u) {
+                // Falcor 4.4 adjustShadingNormal(): avoid back-facing view vectors
+                // at normal-map bevels. This flag is Picnic_Table1-only. V must be a
+                // unit vector, as in Falcor; incidentDir is the traced direction, unit
+                // length on every ray, and is normalized here again for safety.
+                float nDotV = dot(mapped, -safe_normalize(incidentDir));
+                if (nDotV <= 0.1f) {
+                    mapped = normalize(mix(rec.normal, mapped, saturate(nDotV * 10.0f)));
+                }
             }
             result.debugTangent = t;
             result.debugBitangent = b;
             shadingNormal = mapped;
             result.debugSnWorld = shadingNormal;
 
-            float tok = max((1.0f - normalLength) / max(normalLength, 1.0e-6f), 0.0f);
+            float directionalVariance = normalTexel.w * normalTexel.w;
+            float meanLength = sqrt(1.0f - directionalVariance);
+            float tok = directionalVariance / (meanLength * (1.0f + meanLength));
             if (normalCtx.hasIgehyGradients &&
                 all(isfinite(normalCtx.dUVdx)) &&
                 all(isfinite(normalCtx.dUVdy))) {
@@ -1132,29 +1371,39 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                                normalCtx.uv + normalCtx.dUVdy,
                                                                float4(0.5f, 0.5f, 1.0f, 1.0f),
                                                                normalLod).xyz;
-                    float tmpLenDx = 1.0f;
-                    float tmpLenDy = 1.0f;
-                    nDx = decode_normal_map(nDx, normalScale, flipNormalGreen, tmpLenDx);
-                    nDy = decode_normal_map(nDy, normalScale, flipNormalGreen, tmpLenDy);
-                    float varianceX = max(1.0f - dot(normalSampleTs, nDx), 0.0f);
-                    float varianceY = max(1.0f - dot(normalSampleTs, nDy), 0.0f);
+                    nDx = decode_normal_map(nDx, normalScale, flipNormalGreen);
+                    nDy = decode_normal_map(nDy, normalScale, flipNormalGreen);
+                    float varianceX = 0.5f * dot(normalSampleTs - nDx, normalSampleTs - nDx);
+                    float varianceY = 0.5f * dot(normalSampleTs - nDy, normalSampleTs - nDy);
                     float normalVariance = max(varianceX, varianceY);
                     tok += 0.35f * normalVariance;
                 }
             }
-            roughness = clamp(sqrt(roughness * roughness + tok), 0.0f, 1.0f);
+            // Falcor's StandardMaterial shades the authored roughness unfiltered.
+            if (tok > 0.0f && uniforms.disableNormalVarianceRoughness == 0u &&
+                (material.materialFlags & kMaterialFlagFalcorStandardBsdf) == 0u) {
+                roughness = clamp(sqrt(roughness * roughness + tok), 0.0f, 1.0f);
+            }
         }
 
+        if ((material.materialFlags & kMaterialFlagFalcorStandardBsdf) != 0u) {
+            roughness = max(roughness, 0.08f);  // Falcor floors GGX alpha at 0.0064; never delta.
+        }
         material.baseColorRoughness = float4(baseColor, roughness);
         material.pbrParams.w = normalScale;
         material.pbrParams.x = metallic;
         material.emission = float4(emissive, 0.0f);
+        material = apply_foliage_beauty_lift(material);
         rec.shadingNormal = shadingNormal;
         result.debugRoughness = roughness;
     }
 
-    result.material = material;
     result.rec = rec;
+    result.resolvedBaseColorRoughness = material.baseColorRoughness;
+    result.resolvedTypeEta = material.typeEta;
+    result.resolvedEmission = material.emission;
+    result.resolvedPbrParams = material.pbrParams;
+    result.resolvedPbrExtras = material.pbrExtras;
     result.firstHitAlbedo = material_base_color(material);
     result.firstHitNormal = rec.shadingNormal;
     return result;

@@ -1,13 +1,13 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <simd/simd.h>
 
 namespace PathTracer {
 
 class SceneResources;
-struct GltfStagedLoadState;
 
 struct GltfCameraInfo {
     bool valid = false;
@@ -23,6 +23,13 @@ struct GltfCameraInfo {
     float sceneRadius = 1.0f;
 };
 
+// Explicit scene calibration multipliers; original texture pixels are unchanged.
+struct GltfMaterialFactors {
+    float roughnessMultiplier = 1.0f;  // [0,1.5], applied before sampled roughness is clamped.
+    simd::float3 baseColorMultiplier = {1.0f, 1.0f, 1.0f};  // Linear RGB [0,4]; also tints metallic F0.
+    float metallicMultiplier = 1.0f;  // [0,1], multiplied with authored metallic.
+};
+
 struct GltfLoadOptions {
     bool enableViewerCompatibilityMode = false;
     bool thinWalledTransmissionFallback = true;
@@ -30,15 +37,22 @@ struct GltfLoadOptions {
     bool forceLinearBaseColor = false;  // Treat baseColor as linear (debug/compat)
     bool forceLinearEmissive = false;   // Treat emissive as linear (debug/compat)
     bool flipTexcoordV = false;         // Compatibility path for assets authored against opposite image origin.
+    bool enableAnimationSampling = false;
+    int animationIndex = 0;
+    float animationTimeSeconds = 0.0f;
+    bool loopAnimation = false;
+    bool importPunctualLights = false;
+    bool texturedEmissionNee = false;   // Scene opt-in: textured emitters join direct-light sampling.
+    bool referenceDielectricContinuation = false;  // Scene opt-in: eta-free refraction (Path-Tracing references).
+    float punctualLightIntensityScale = 1.0f;
+    float transmissionScale = 1.0f;
+    float roughnessOverride = -1.0f;
+    std::unordered_map<std::string, GltfMaterialFactors> materialFactorsByName;  // Exact material names.
+    float alphaOverride = -1.0f;
     std::vector<std::string> disableOrmMaterialNameSubstrings;  // Case-insensitive material-name matches.
     float disableOrmRoughnessOverride = -1.0f;  // <0 disables override; otherwise [0,1].
 };
 
-enum class GltfStagedLoadStatus : uint32_t {
-    InProgress = 0,
-    Complete = 1,
-    Failed = 2,
-};
 
 /// Load a glTF 2.0 asset (static, core) and append meshes/materials into SceneResources.
 bool LoadGltfScene(const std::string& path,
@@ -47,16 +61,5 @@ bool LoadGltfScene(const std::string& path,
                    GltfCameraInfo* outCamera = nullptr,
                    const GltfLoadOptions* options = nullptr);
 
-GltfStagedLoadState* CreateGltfStagedLoadState();
-void DestroyGltfStagedLoadState(GltfStagedLoadState* state);
-bool BeginLoadGltfSceneStaged(const std::string& path,
-                              GltfStagedLoadState* state,
-                              std::string& errorMessage,
-                              const GltfLoadOptions* options = nullptr);
-GltfStagedLoadStatus ContinueLoadGltfSceneStaged(GltfStagedLoadState* state,
-                                                 SceneResources& resources,
-                                                 std::string& errorMessage,
-                                                 size_t primitiveBudget,
-                                                 GltfCameraInfo* outCamera = nullptr);
 
 }  // namespace PathTracer

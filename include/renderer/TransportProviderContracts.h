@@ -85,19 +85,19 @@ inline std::vector<LightCandidateProviderContract> DefaultLightCandidateProvider
 
 inline GuidingProviderContract DefaultGuidingProviderContract() {
     return {"PathGuiding.WorldGrid",
-            "pathGuidingMode=prototype",
+            "pathGuidingMode=path_guiding",
             true,
             true,
             true,
             true,
             true,
-            false,
-            "fallback to BSDF/path sampling when confidence is low or the bin is invalid"};
+            true,
+            "fallback to BSDF/path sampling when confidence is low, the bin is invalid, or the surface is unsupported"};
 }
 
 inline RadianceProviderContract DefaultRadianceProviderContract() {
     return {"RadianceCache.WorldGrid",
-            "radianceCacheMode=prototype",
+            "radianceCacheMode=radiance_cache",
             true,
             true,
             true,
@@ -107,7 +107,7 @@ inline RadianceProviderContract DefaultRadianceProviderContract() {
             true,
             true,
             true,
-            false,
+            true,
             "fallback to path continuation when cache confidence is low, invalid, biased, or unavailable"};
 }
 

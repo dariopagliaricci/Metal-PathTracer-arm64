@@ -2,7 +2,8 @@ struct HitRecord {
     float3 point;
     float3 normal;
     float3 shadingNormal;
-    float paddingNormal;
+    float3 sourceShadowRgb;
+    float sourceShadowTransmission; // Shadow-only cumulative mask transmission.
     float t;
     uint materialIndex;
     uint twoSided;
@@ -13,6 +14,14 @@ struct HitRecord {
     float2 barycentric;
     uint padding;
 };
+
+// The source shadow-transmission fields only exist for the source-feature pipelines; the legacy set never writes them.
+inline void reset_source_shadow(thread HitRecord& rec) {
+    if (kSourceFeatures) {
+        rec.sourceShadowTransmission = 1.0f;
+        rec.sourceShadowRgb = float3(1.0f);
+    }
+}
 
 struct HardwareShadowTraceAudit {
     bool rawResultAvailable = false;
@@ -91,7 +100,9 @@ inline PathtraceDebugContext make_debug_context(constant PathtraceUniforms& unif
         ? min(uniforms.debugMaxEntries, kPathtraceDebugMaxEntries)
         : 0u;
     bool active = (buffer != nullptr) &&
-                  (uniforms.debugPathActive != 0u) &&
+                  ((PT_DEFAULT_OFF(uniforms.debugPathActive) != 0u) ||
+                   (PT_DEFAULT_OFF(uniforms.debugDirectLightAudit) != 0u) ||
+                   (PT_DEFAULT_OFF(uniforms.parityAssertEnabled) != 0u)) &&
                   (ctx.maxEntries > 0u) &&
                   (gid.x == uniforms.debugPixelX) &&
                   (gid.y == uniforms.debugPixelY);
@@ -276,7 +287,7 @@ inline HitRecord make_empty_hit_record() {
     rec.point = float3(0.0f);
     rec.normal = float3(0.0f);
     rec.shadingNormal = float3(0.0f);
-    rec.paddingNormal = 0.0f;
+    reset_source_shadow(rec);
     rec.t = 0.0f;
     rec.materialIndex = 0u;
     rec.twoSided = 0u;
@@ -438,7 +449,7 @@ inline HitRecord make_empty_hit_record() {
     rec.point = float3(0.0f);
     rec.normal = float3(0.0f);
     rec.shadingNormal = float3(0.0f);
-    rec.paddingNormal = 0.0f;
+    reset_source_shadow(rec);
     rec.t = 0.0f;
     rec.materialIndex = 0u;
     rec.twoSided = 0u;

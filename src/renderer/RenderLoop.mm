@@ -10,9 +10,14 @@
 #include "MetalShaderTypes.h"
 #include "renderer/TraversalService.h"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
+#include <utility>
 
 using PathTracerShaderTypes::DisplayUniforms;
 using PathTracerShaderTypes::SvgfDenoiseUniforms;
@@ -28,6 +33,7 @@ using PathTracerShaderTypes::RestirDIReservoirState;
 using PathTracerShaderTypes::RestirDIVisibilityState;
 using PathTracerShaderTypes::RestirDIInitUniforms;
 using PathTracerShaderTypes::WavefrontHitRecord;
+using PathTracerShaderTypes::WavefrontResolvedSurface;
 using PathTracerShaderTypes::ShadowRay;
 using PathTracerShaderTypes::QueueCounters;
 using PathTracerShaderTypes::kMaxMaterialSamplers;
@@ -59,6 +65,151 @@ bool SkipTextureUseResources() {
     return enabled;
 }
 
+bool WavefrontShadeIndirectEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_INDIRECT");
+    return enabled;
+}
+
+bool WavefrontShadeIndirectProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_INDIRECT_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeSurfaceProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_SURFACE_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeMetadataProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_METADATA_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeScalarProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_SCALAR_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeBsdfProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_BSDF_PROBE");
+    return enabled;
+}
+
+bool WavefrontShadeClosureProbeEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADE_CLOSURE_PROBE");
+    return enabled;
+}
+
+constexpr uint32_t kMlTinyModelMagic = 0x4d4c5231u;
+constexpr uint32_t kMlTinyModelVersion = 1u;
+constexpr uint32_t kMlTinyFeatureCount = 8u;
+constexpr uint32_t kMlTinyOutputCount = 4u;
+constexpr uint32_t kMlTinyWeightCount =
+    (kMlTinyFeatureCount + 1u) * kMlTinyOutputCount;
+
+struct MlModelLoadResult {
+    bool valid = false;
+    MlReconstructionTinyModel model{};
+    std::string providerVersion = "invalid";
+    std::string fallbackReason;
+};
+
+MlModelLoadResult LoadMlReconstructionTinyModel(const std::string& path) {
+    MlModelLoadResult result{};
+    if (path.empty()) {
+        result.fallbackReason =
+            "custom Metal ML backend requires --mlModelPackage PTMLRECONv1 package";
+        return result;
+    }
+
+    std::ifstream input(path);
+    if (!input) {
+        result.fallbackReason = "model package unavailable: " + path;
+        return result;
+    }
+
+    std::string token;
+    input >> token;
+    if (token != "PTMLRECONv1") {
+        result.fallbackReason =
+            "invalid model package magic/version; expected PTMLRECONv1";
+        return result;
+    }
+
+    uint32_t version = 0u;
+    uint32_t featureCount = 0u;
+    uint32_t outputCount = 0u;
+    float confidenceBias = 0.0f;
+    float varianceScale = 0.05f;
+    std::array<float, kMlTinyWeightCount> weights{};
+    bool sawVersion = false;
+    bool sawFeatures = false;
+    bool sawOutputs = false;
+    bool sawWeights = false;
+
+    while (input >> token) {
+        if (token == "version") {
+            input >> version;
+            sawVersion = true;
+        } else if (token == "feature_count") {
+            input >> featureCount;
+            sawFeatures = true;
+        } else if (token == "output_count") {
+            input >> outputCount;
+            sawOutputs = true;
+        } else if (token == "confidence_bias") {
+            input >> confidenceBias;
+        } else if (token == "variance_scale") {
+            input >> varianceScale;
+        } else if (token == "weights") {
+            for (float& value : weights) {
+                if (!(input >> value)) {
+                    result.fallbackReason =
+                        "invalid model package: expected 36 float weights";
+                    return result;
+                }
+            }
+            sawWeights = true;
+        } else {
+            std::string discard;
+            std::getline(input, discard);
+        }
+    }
+
+    if (!sawVersion || version != kMlTinyModelVersion) {
+        result.fallbackReason =
+            "unsupported model version; expected PTMLRECONv1 version 1";
+        return result;
+    }
+    if (!sawFeatures || featureCount != kMlTinyFeatureCount ||
+        !sawOutputs || outputCount != kMlTinyOutputCount) {
+        result.fallbackReason =
+            "invalid model tensor shape; expected 8 features and 4 outputs";
+        return result;
+    }
+    if (!sawWeights) {
+        result.fallbackReason =
+            "invalid model package: missing weights block";
+        return result;
+    }
+
+    result.model.magic = kMlTinyModelMagic;
+    result.model.version = version;
+    result.model.featureCount = featureCount;
+    result.model.outputCount = outputCount;
+    result.model.confidenceBias = confidenceBias;
+    result.model.varianceScale = std::max(varianceScale, 0.0f);
+    result.model.weights = weights;
+    result.providerVersion = "ptmlrecon-v1";
+    result.valid = true;
+    return result;
+}
+
+bool WavefrontShadowIndirectEnabled() {
+    static const bool enabled = EnvFlagEnabled("PT_ENABLE_WAVEFRONT_SHADOW_INDIRECT");
+    return enabled;
+}
+
 uint64_t CurrentAllocatedSizeBytes(MTLDeviceHandle device) {
     if (device && [device respondsToSelector:@selector(currentAllocatedSize)]) {
         return static_cast<uint64_t>(device.currentAllocatedSize);
@@ -87,10 +238,34 @@ void LogIsolationTogglesIfNeeded() {
     static const bool logged = []() {
         const bool skipBlas = SkipBlasUseResources();
         const bool skipTextures = SkipTextureUseResources();
-        if (skipBlas || skipTextures) {
-            NSLog(@"[Isolation] PT_SKIP_BLAS_USE_RESOURCES=%@ PT_SKIP_TEXTURE_USE_RESOURCES=%@",
+        const bool shadeIndirect = WavefrontShadeIndirectEnabled();
+        const bool shadeIndirectProbe = WavefrontShadeIndirectProbeEnabled();
+        const bool shadeSurfaceProbe = WavefrontShadeSurfaceProbeEnabled();
+        const bool shadeMetadataProbe = WavefrontShadeMetadataProbeEnabled();
+        const bool shadeScalarProbe = WavefrontShadeScalarProbeEnabled();
+        const bool shadeBsdfProbe = WavefrontShadeBsdfProbeEnabled();
+        const bool shadeClosureProbe = WavefrontShadeClosureProbeEnabled();
+        const bool shadowIndirect = WavefrontShadowIndirectEnabled();
+        if (skipBlas || skipTextures || shadeIndirect || shadeIndirectProbe || shadeSurfaceProbe || shadeMetadataProbe || shadeScalarProbe || shadeBsdfProbe || shadeClosureProbe || shadowIndirect) {
+            NSLog(@"[Isolation] PT_SKIP_BLAS_USE_RESOURCES=%@ PT_SKIP_TEXTURE_USE_RESOURCES=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_INDIRECT=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_INDIRECT_PROBE=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_SURFACE_PROBE=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_METADATA_PROBE=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_SCALAR_PROBE=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_CLOSURE_PROBE=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADE_BSDF_PROBE=%@ "
+                  "PT_ENABLE_WAVEFRONT_SHADOW_INDIRECT=%@",
                   skipBlas ? @"1" : @"0",
-                  skipTextures ? @"1" : @"0");
+                  skipTextures ? @"1" : @"0",
+                  shadeIndirect ? @"1" : @"0",
+                  shadeIndirectProbe ? @"1" : @"0",
+                  shadeSurfaceProbe ? @"1" : @"0",
+                  shadeMetadataProbe ? @"1" : @"0",
+                  shadeScalarProbe ? @"1" : @"0",
+                  shadeClosureProbe ? @"1" : @"0",
+                  shadeBsdfProbe ? @"1" : @"0",
+                  shadowIndirect ? @"1" : @"0");
         }
         return true;
     }();
@@ -200,6 +375,9 @@ inline MTLSize PreferredLinearThreadgroupSize(id<MTLComputePipelineState> pipeli
 }
 
 inline bool ExplicitRestirDiEnabled(const RenderSettings& settings) {
+    if (RestirDiDemotedByVolume(settings)) {
+        return false;
+    }
     return settings.directLightMode == RenderSettings::DirectLightMode::RestirDi ||
            settings.directLightMode == RenderSettings::DirectLightMode::RestirDiRegirHybrid;
 }
@@ -211,6 +389,11 @@ inline bool InteractiveExplicitRestirDiEnabled() {
 
 inline bool HeadlessFusedRestirDiReferenceEnabled() {
     static const bool enabled = EnvFlagEnabled("PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE");
+    return enabled;
+}
+
+inline bool ForceSoftwareRestirDiInitialCandidates() {
+    static const bool enabled = EnvFlagEnabled("PT_RESTIR_DI_FORCE_SW_INITIAL");
     return enabled;
 }
 
@@ -276,25 +459,6 @@ inline double BytesToMiB(uint64_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-MTLResourceOptions MetalStorageOptions(StorageClass storage) {
-    switch (storage) {
-        case StorageClass::Private:
-            return MTLResourceStorageModePrivate;
-        case StorageClass::Managed:
-#if TARGET_OS_OSX
-            return MTLResourceStorageModeManaged;
-#else
-            return MTLResourceStorageModeShared;
-#endif
-        case StorageClass::Shared:
-        case StorageClass::Unknown:
-        case StorageClass::External:
-        case StorageClass::Memoryless:
-            return MTLResourceStorageModeShared;
-    }
-    return MTLResourceStorageModeShared;
-}
-
 }  // namespace
 
 bool RenderLoop::initialize(const MetalContext& context, DenoiserContext* denoiser) {
@@ -325,6 +489,7 @@ bool RenderLoop::initialize(const MetalContext& context, DenoiserContext* denois
         NSLog(@"Failed to create stats buffer");
         return false;
     }
+    std::memset([m_statsBuffer contents], 0, m_statsBuffer.length);
 
 #if PT_DEBUG_TOOLS
     m_debugBuffer = [m_device newBufferWithLength:sizeof(PathtraceDebugBuffer)
@@ -355,6 +520,143 @@ bool RenderLoop::initialize(const MetalContext& context, DenoiserContext* denois
     return true;
 }
 
+bool RenderLoop::ensureMlBackendResources(uint32_t width,
+                                          uint32_t height,
+                                          const RenderSettings& settings,
+                                          MTLCommandBufferHandle commandBuffer) {
+    m_mlState.activeThisFrame = false;
+    m_mlState.dispatchCount = 0u;
+    m_mlState.lastConfidence = 0.0f;
+    m_mlState.biasRisk = 0.0f;
+    m_mlState.tensorContract =
+        "radiance,albedo,normal,depth,motion,variance,confidence -> reconstructed_radiance,confidence,validity";
+
+    if (settings.mlBackendMode == RenderSettings::MlBackendMode::Off) {
+        m_mlState = {};
+        m_mlState.provider = "disabled";
+        m_mlState.providerVersion = "disabled";
+        m_mlState.tensorContract =
+            "radiance,albedo,normal,depth,motion,variance,confidence -> reconstructed_radiance,confidence,validity";
+        m_mlState.fallbackReason = "ml backend disabled";
+        m_transportAllocator.releaseOwner(TransportMemoryOwner::MLBackend);
+        return true;
+    }
+
+    if (settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionNoOp) {
+        m_mlState.modelBuffer = nullptr;
+        m_mlState.modelBytes = 0u;
+        m_mlState.width = width;
+        m_mlState.height = height;
+        m_mlState.modelValid = false;
+        m_mlState.modelPath = settings.mlModelPackagePath;
+        m_mlState.provider = "MLBackend.NoOp";
+        m_mlState.providerVersion = "noop-contract-v1";
+        m_mlState.fallbackReason =
+            "no-op ML backend selected; renderer preserves non-neural reconstruction output";
+        m_transportAllocator.releaseOwner(TransportMemoryOwner::MLBackend);
+        return true;
+    }
+
+    m_mlState.provider = "MLBackend.CustomMetal.TinyReconstruction";
+    if (settings.mlBackendMode != RenderSettings::MlBackendMode::ReconstructionTiny) {
+        m_mlState.modelValid = false;
+        m_mlState.fallbackReason = "unsupported ML backend mode";
+        m_transportAllocator.releaseOwner(TransportMemoryOwner::MLBackend);
+        return true;
+    }
+
+    MlModelLoadResult loaded = LoadMlReconstructionTinyModel(settings.mlModelPackagePath);
+    if (!loaded.valid) {
+        m_mlState.modelBuffer = nullptr;
+        m_mlState.modelBytes = 0u;
+        m_mlState.width = width;
+        m_mlState.height = height;
+        m_mlState.modelValid = false;
+        m_mlState.modelPath = settings.mlModelPackagePath;
+        m_mlState.providerVersion = "invalid";
+        m_mlState.fallbackReason = loaded.fallbackReason;
+        m_transportAllocator.releaseOwner(TransportMemoryOwner::MLBackend);
+        return true;
+    }
+
+    const uint64_t modelBytes = sizeof(MlReconstructionTinyModel);
+    const bool reuse =
+        m_mlState.modelBuffer &&
+        m_mlState.modelValid &&
+        m_mlState.modelPath == settings.mlModelPackagePath &&
+        m_mlState.modelBytes == modelBytes &&
+        m_mlState.width == width &&
+        m_mlState.height == height;
+    if (!reuse) {
+        TransportMemoryRecord record{};
+        record.name = "MLBackend.TensorMetadata";
+        record.kind = TransportMemoryKind::MLBackendTensor;
+        record.owner = TransportMemoryOwner::MLBackend;
+        record.targetOwner = TransportMemoryOwner::MLBackend;
+        record.frameGraphGroup = RenderResourceGroup::MLBackendResources;
+        record.lifetime = ResourceLifetime::Persistent;
+        record.width = width;
+        record.height = height;
+        record.depthOrCellCount = 1u;
+        record.bytes = modelBytes;
+        record.history = TransportMemoryHistoryPolicy::PersistentHistory;
+        record.debug = TransportMemoryDebugReadbackPolicy::MetadataOnly;
+        record.invalidatesOn = FrameHistoryInvalidationMask();
+        record.frameGraphOwned = true;
+        record.transportMemoryOwned = true;
+        record.hotPath = true;
+        record.byteSizeFormula =
+            "sizeof(PTMLRECONv1 header + 36 affine reconstruction weights)";
+        record.featureGate = "mlBackendMode=reconstruction_tiny";
+        record.migrationRisk = "low";
+        MTLBufferHandle modelBuffer =
+            m_transportAllocator.allocateBuffer(m_device,
+                                                record,
+                                                StorageClass::Private,
+                                                "TransportMemory.MLBackend.TinyReconstructionV1");
+        if (!modelBuffer) {
+            m_mlState.modelBuffer = nullptr;
+            m_mlState.modelBytes = 0u;
+            m_mlState.modelValid = false;
+            m_mlState.fallbackReason = "failed to allocate private ML model buffer";
+            return true;
+        }
+
+        id<MTLBuffer> upload =
+            [m_device newBufferWithBytes:&loaded.model
+                                  length:sizeof(loaded.model)
+                                 options:MTLResourceStorageModeShared];
+        if (!upload || !commandBuffer) {
+            m_transportAllocator.releaseOwner(TransportMemoryOwner::MLBackend);
+            m_mlState.modelBuffer = nullptr;
+            m_mlState.modelBytes = 0u;
+            m_mlState.modelValid = false;
+            m_mlState.fallbackReason =
+                "failed to stage ML model upload without CPU-hot synchronization";
+            return true;
+        }
+        upload.label = @"Upload.MLBackend.TinyReconstructionV1";
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        blit.label = @"Upload ML Reconstruction Model";
+        [blit copyFromBuffer:upload
+                sourceOffset:0
+                    toBuffer:modelBuffer
+           destinationOffset:0
+                        size:sizeof(loaded.model)];
+        [blit endEncoding];
+        m_mlState.modelBuffer = modelBuffer;
+    }
+
+    m_mlState.modelBytes = modelBytes;
+    m_mlState.width = width;
+    m_mlState.height = height;
+    m_mlState.modelValid = true;
+    m_mlState.modelPath = settings.mlModelPackagePath;
+    m_mlState.providerVersion = loaded.providerVersion;
+    m_mlState.fallbackReason.clear();
+    return true;
+}
+
 void RenderLoop::resetHistory(HistoryResetReason reason, bool preserveSvgfHistory) {
     if (!preserveSvgfHistory) {
         m_frameCounter = 0;
@@ -376,6 +678,11 @@ void RenderLoop::resetHistory(HistoryResetReason reason, bool preserveSvgfHistor
     if (m_restirState.radianceCache && [m_restirState.radianceCache contents]) {
         std::memset([m_restirState.radianceCache contents], 0, m_restirState.radianceCacheBytes);
     }
+    if (m_statsBuffer && [m_statsBuffer contents]) {
+        auto* stats = reinterpret_cast<PathtraceStats*>([m_statsBuffer contents]);
+        std::memset(stats->radianceCacheStats, 0, sizeof(stats->radianceCacheStats));
+        std::memset(stats->sssWalkStats, 0, sizeof(stats->sssWalkStats));
+    }
     if (m_restirState.restirDiCurrent && [m_restirState.restirDiCurrent contents]) {
         std::memset([m_restirState.restirDiCurrent contents], 0, m_restirState.restirDiReservoirBytes);
     }
@@ -394,7 +701,11 @@ void RenderLoop::resetHistory(HistoryResetReason reason, bool preserveSvgfHistor
     if (m_restirState.restirDiDebug && [m_restirState.restirDiDebug contents]) {
         std::memset([m_restirState.restirDiDebug contents], 0, m_restirState.restirDiDebugBytes);
     }
-    if (m_restirState.restirDiPrivateStorage || m_restirState.radianceCachePrivateStorage) {
+    if (m_restirState.pathGuidingPrivateStorage ||
+        m_restirState.restirPtPrivateStorage ||
+        m_restirState.restirDiPrivateStorage ||
+        m_restirState.radianceCachePrivateStorage ||
+        m_restirState.causticTransportActive) {
         m_restirState.pendingGpuClear = true;
     }
 }
@@ -416,9 +727,11 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
         settings.pathGuidingMode == RenderSettings::PathGuidingMode::Prototype;
     const bool restirPtEnabled =
         settings.restirPtMode != RenderSettings::RestirPtMode::Off ||
-        settings.restirGiMode == RenderSettings::RestirGiMode::DiffusePrototype;
-    const bool radianceCacheEnabled =
-        settings.radianceCacheMode == RenderSettings::RadianceCacheMode::Prototype;
+        settings.restirGiMode == RenderSettings::RestirGiMode::ProductionDiffuse;
+    const bool radianceCacheEnabled = RadianceCacheActive(settings);
+    const bool causticTransportEnabled =
+        settings.causticTransportMode == RenderSettings::CausticTransportMode::PathSpacePrototype;
+    const uint32_t causticMaxVertices = std::max<uint32_t>(settings.causticMaxVertices, 1u);
     const uint32_t capacity = static_cast<uint32_t>(capacity64);
     const bool hasAnyRestirDiBuffer =
         m_restirState.restirDiCurrent ||
@@ -441,7 +754,11 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
             : !hasAnyRestirDiBuffer;
     auto clearGpuPrivateTransportBuffers = [&](MTLCommandBufferHandle clearCommandBuffer) -> bool {
         if (!m_restirState.pendingGpuClear ||
-            (!m_restirState.restirDiPrivateStorage && !m_restirState.radianceCachePrivateStorage)) {
+            (!m_restirState.pathGuidingPrivateStorage &&
+             !m_restirState.restirPtPrivateStorage &&
+             !m_restirState.restirDiPrivateStorage &&
+             !m_restirState.radianceCachePrivateStorage &&
+             !m_restirState.causticTransportActive)) {
             return true;
         }
         if (!clearCommandBuffer) {
@@ -463,7 +780,11 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
         fillBuffer(m_restirState.restirDiVisibility, m_restirState.restirDiVisibilityBytes);
         fillBuffer(m_restirState.restirDiNeighborPattern, m_restirState.restirDiNeighborPatternBytes);
         fillBuffer(m_restirState.restirDiDebug, m_restirState.restirDiDebugBytes);
+        fillBuffer(m_restirState.pathGuiding, m_restirState.pathGuidingBytes);
+        fillBuffer(m_restirState.restirPt, m_restirState.restirPtBytes);
         fillBuffer(m_restirState.radianceCache, m_restirState.radianceCacheBytes);
+        fillBuffer(m_transportAllocator.bufferForName("CausticTransport.PathSpacePrototype"),
+                   m_restirState.causticTransportBytes);
         [blit endEncoding];
         m_restirState.pendingGpuClear = false;
         return true;
@@ -474,6 +795,8 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
         (pathGuidingEnabled == (m_restirState.pathGuiding != nullptr)) &&
         (restirPtEnabled == (m_restirState.restirPt != nullptr)) &&
         (radianceCacheEnabled == (m_restirState.radianceCache != nullptr)) &&
+        (causticTransportEnabled == m_restirState.causticTransportActive) &&
+        (!causticTransportEnabled || m_restirState.causticMaxVertices == causticMaxVertices) &&
         restirDiBuffersMatch) {
         if (!clearGpuPrivateTransportBuffers(commandBuffer)) {
             return false;
@@ -499,10 +822,28 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
             std::max<uint32_t>(1u, settings.spatialReuseNeighborCount) * sizeof(simd::int2));
     const NSUInteger restirDiDebugBytes =
         static_cast<NSUInteger>(capacity64 * sizeof(RestirDIReservoirState));
+    const NSUInteger causticTransportBytes =
+        causticTransportEnabled
+            ? static_cast<NSUInteger>(
+                  static_cast<uint64_t>(causticMaxVertices) *
+                  (sizeof(PathTracerShaderTypes::EyeSubpathVertex) +
+                   sizeof(PathTracerShaderTypes::LightSubpathVertex) +
+                   sizeof(PathTracerShaderTypes::PathConnection) +
+                   sizeof(PathTracerShaderTypes::ConnectionResult)))
+            : 0u;
 
     const TransportMemoryInvalidationMask allTransport = AllTransportInvalidations();
     const TransportMemoryInvalidationMask lightTransport = LightTransportInvalidationMask();
-    m_transportAllocator.clear();
+    m_transportAllocator.releaseOwners({
+        TransportMemoryOwner::RestirDI,
+        TransportMemoryOwner::RestirGI,
+        TransportMemoryOwner::RestirPT,
+        TransportMemoryOwner::PathGuiding,
+        TransportMemoryOwner::RadianceCache,
+        TransportMemoryOwner::CausticTransport,
+        TransportMemoryOwner::MLBackend,
+        TransportMemoryOwner::Debug,
+    });
     m_frameGraphOwnedBuffers.clear();
 
     auto allocateTransportBuffer =
@@ -561,10 +902,10 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
                                       std::max<uint64_t>(1u, reservoirCount / 64u),
                                       std::numeric_limits<uint32_t>::max())),
                                   pathGuidingBytes,
-                                  StorageClass::Shared,
+                                  StorageClass::Private,
                                   ResourceLifetime::History,
                                   TransportMemoryHistoryPolicy::PersistentHistory,
-                                  TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
                                   allTransport,
                                   "TransportMemory.PathGuiding.WorldGridBins")
         : nil;
@@ -577,10 +918,10 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
                                   height,
                                   PathTracerShaderTypes::kRestirPathReservoirDepthCount,
                                   restirPtBytes,
-                                  StorageClass::Shared,
+                                  StorageClass::Private,
                                   ResourceLifetime::History,
                                   TransportMemoryHistoryPolicy::PersistentHistory,
-                                  TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
                                   allTransport,
                                   "TransportMemory.ReSTIRPT.PathReservoirs")
         : nil;
@@ -593,10 +934,10 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
                                   height,
                                   PathTracerShaderTypes::kRestirPathReservoirDepthCount,
                                   radianceCacheBytes,
-                                  StorageClass::Shared,
+                                  StorageClass::Private,
                                   ResourceLifetime::History,
                                   TransportMemoryHistoryPolicy::PersistentHistory,
-                                  TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
                                   allTransport,
                                   "TransportMemory.RadianceCache.WorldGrid")
         : nil;
@@ -604,6 +945,26 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
         (restirPtEnabled && !restirPt) ||
         (radianceCacheEnabled && !radianceCache)) {
         NSLog(@"[ReSTIR State] failed to allocate production reservoir buffers");
+        return false;
+    }
+    MTLBufferHandle causticTransport = causticTransportEnabled
+        ? allocateTransportBuffer("CausticTransport.PathSpacePrototype",
+                                  TransportMemoryKind::CausticPathSpace,
+                                  TransportMemoryOwner::CausticTransport,
+                                  RenderResourceGroup::CausticTransportResources,
+                                  width,
+                                  height,
+                                  causticMaxVertices,
+                                  causticTransportBytes,
+                                  StorageClass::Private,
+                                  ResourceLifetime::History,
+                                  TransportMemoryHistoryPolicy::PersistentHistory,
+                                  TransportMemoryDebugReadbackPolicy::MetadataOnly,
+                                  allTransport,
+                                  "TransportMemory.CausticTransport.PathSpacePrototype")
+        : nil;
+    if (causticTransportEnabled && !causticTransport) {
+        NSLog(@"[CausticTransport] failed to allocate path-space transport buffer");
         return false;
     }
 
@@ -724,16 +1085,6 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
         }
     }
 
-    if (pathGuiding && [pathGuiding contents]) {
-        std::memset([pathGuiding contents], 0, pathGuidingBytes);
-    }
-    if (restirPt && [restirPt contents]) {
-        std::memset([restirPt contents], 0, restirPtBytes);
-    }
-    if (radianceCache && [radianceCache contents]) {
-        std::memset([radianceCache contents], 0, radianceCacheBytes);
-    }
-
     m_restirState.pathGuiding = pathGuiding;
     m_restirState.restirPt = restirPt;
     m_restirState.radianceCache = radianceCache;
@@ -755,10 +1106,19 @@ bool RenderLoop::ensureRestirStateResources(uint32_t width,
     m_restirState.restirDiNeighborPatternBytes = restirDiEnabled ? restirDiNeighborPatternBytes : 0u;
     m_restirState.restirDiDebugBytes =
         (restirDiEnabled && settings.restirDebugEnabled) ? restirDiDebugBytes : 0u;
+    m_restirState.causticTransportBytes = causticTransportEnabled ? causticTransportBytes : 0u;
+    m_restirState.causticMaxVertices = causticTransportEnabled ? causticMaxVertices : 0u;
+    m_restirState.pathGuidingPrivateStorage = pathGuidingEnabled;
+    m_restirState.restirPtPrivateStorage = restirPtEnabled;
     m_restirState.restirDiPrivateStorage = restirDiEnabled;
-    m_restirState.radianceCachePrivateStorage = false;
-    m_restirState.pendingGpuClear = restirDiEnabled;
-    if (!clearGpuPrivateTransportBuffers(commandBuffer) && (restirDiEnabled || radianceCacheEnabled)) {
+    m_restirState.radianceCachePrivateStorage = radianceCacheEnabled;
+    m_restirState.causticTransportActive = causticTransportEnabled;
+    m_restirState.pendingGpuClear =
+        pathGuidingEnabled || restirPtEnabled || restirDiEnabled || radianceCacheEnabled;
+    m_restirState.pendingGpuClear = m_restirState.pendingGpuClear || causticTransportEnabled;
+    if (!clearGpuPrivateTransportBuffers(commandBuffer) &&
+        (pathGuidingEnabled || restirPtEnabled || restirDiEnabled || radianceCacheEnabled ||
+         causticTransportEnabled)) {
         NSLog(@"[TransportMemory] private resources require a command buffer for initialization");
         return false;
     }
@@ -788,6 +1148,10 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
     const TransportMemoryInvalidationMask frameHistory = FrameHistoryInvalidationMask();
     const TransportMemoryInvalidationMask lightTransport = LightTransportInvalidationMask();
     const uint32_t pathDepth = PathTracerShaderTypes::kRestirPathReservoirDepthCount;
+    const bool restirGiActive =
+        settings.restirGiMode == RenderSettings::RestirGiMode::ProductionDiffuse;
+    const bool restirPtActive =
+        settings.restirPtMode != RenderSettings::RestirPtMode::Off;
 
     m_transportMemory.clear();
 
@@ -805,32 +1169,40 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
             record.targetStorage = TransportMemoryStorageClass::Private;
             record.byteSizeFormula =
                 "capacity * kRestirPathReservoirDepthCount / 64 * 64 * PathGuidingReservoirState";
-            record.featureGate = "pathGuidingMode=prototype";
-            record.migrationRisk = "high";
+            record.featureGate = "pathGuidingMode=path_guiding";
+            record.migrationRisk = "medium";
             record.hotPath = true;
             record.temporaryShared = record.storage == TransportMemoryStorageClass::Shared;
+        } else if (record.name == "ReSTIRGIProductionReservoirs") {
+            record.targetStorage = TransportMemoryStorageClass::Private;
+            record.byteSizeFormula =
+                "width * height * kRestirPathReservoirDepthCount * RestirPtReservoirState";
+            record.featureGate = "restirGiMode=production_diffuse";
+            record.migrationRisk = "low";
+            record.hotPath = true;
+            record.temporaryShared = false;
         } else if (record.name == "RestirPTPathReservoirs") {
             record.targetStorage = TransportMemoryStorageClass::Private;
             record.byteSizeFormula =
                 "width * height * kRestirPathReservoirDepthCount * RestirPtReservoirState";
             record.featureGate = "restirPtMode!=off";
-            record.migrationRisk = "high";
+            record.migrationRisk = "low";
             record.hotPath = true;
-            record.temporaryShared = record.storage == TransportMemoryStorageClass::Shared;
+            record.temporaryShared = false;
         } else if (record.name == "RadianceCache.WorldGrid") {
             record.targetOwner = TransportMemoryOwner::RadianceCache;
             record.targetStorage = TransportMemoryStorageClass::Private;
             record.byteSizeFormula =
                 "hashed world-grid cells * kRestirPathReservoirDepthCount * RadianceCacheState with query metadata";
-            record.featureGate = "radianceCacheMode=prototype";
-            record.migrationRisk = "low";
+            record.featureGate = "radianceCacheMode=radiance_cache";
+            record.migrationRisk = "medium";
             record.hotPath = true;
             record.temporaryShared = record.storage == TransportMemoryStorageClass::Shared;
         } else if (record.name == "CausticTransport.PathSpacePrototype") {
             record.targetOwner = TransportMemoryOwner::CausticTransport;
             record.targetStorage = TransportMemoryStorageClass::Private;
             record.byteSizeFormula =
-                "causticMaxVertices * (EyeSubpathVertex + LightSubpathVertex + PathConnection)";
+                "causticMaxVertices * (EyeSubpathVertex + LightSubpathVertex + PathConnection + ConnectionResult)";
             record.featureGate = "causticTransportMode=path_space";
             record.migrationRisk = "medium";
             record.hotPath = true;
@@ -839,10 +1211,16 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
             record.targetOwner = TransportMemoryOwner::MLBackend;
             record.targetStorage = TransportMemoryStorageClass::Private;
             record.byteSizeFormula =
-                "tensor descriptor table + optional scratch tensors; 0 bytes for NoOp backend";
+                settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny
+                    ? "sizeof(PTMLRECONv1 header + 36 affine reconstruction weights); graph textures own tensor IO"
+                    : "0 bytes for no-op backend contract";
             record.featureGate = "mlBackendMode!=off";
-            record.migrationRisk = "medium";
-            record.hotPath = false;
+            record.migrationRisk =
+                settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny
+                    ? "low"
+                    : "medium";
+            record.hotPath =
+                settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny;
             record.temporaryShared = false;
         } else if (record.owner == TransportMemoryOwner::RestirDI) {
             record.targetStorage = TransportMemoryStorageClass::Private;
@@ -856,6 +1234,27 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
             record.migrationRisk = "high";
             record.hotPath = true;
             record.temporaryShared = record.storage == TransportMemoryStorageClass::Shared;
+        } else if (record.owner == TransportMemoryOwner::Wavefront) {
+            record.targetOwner = TransportMemoryOwner::Wavefront;
+            record.targetStorage = record.name == "Wavefront.QueueCounters"
+                                       ? TransportMemoryStorageClass::Shared
+                                       : TransportMemoryStorageClass::Private;
+            record.byteSizeFormula = "queue capacity * queue element stride";
+            if (record.name == "Wavefront.QueueCounters") {
+                record.byteSizeFormula = "sizeof(QueueCounters)";
+            } else if (record.name == "Wavefront.IndirectDispatchArgs") {
+                record.byteSizeFormula = "3 * sizeof(uint32_t)";
+            } else if (record.name == "Wavefront.RadianceCacheQueryItems") {
+                record.byteSizeFormula = "width * height * RadianceCacheWorkItem";
+            } else if (record.name == "Wavefront.RadianceCacheTrainRecords") {
+                record.byteSizeFormula = "ceil(width * height / 8) * 6 * RadianceCacheTrainRecord";
+            }
+            record.featureGate = "executionMode=wavefront";
+            record.migrationRisk =
+                record.storage == record.targetStorage ? "medium" : "high";
+            record.hotPath = record.name != "Wavefront.QueueCounters";
+            record.temporaryShared =
+                record.hotPath && record.storage == TransportMemoryStorageClass::Shared;
         } else if (record.name == "ReSTIRDIDebugAOVReadback") {
             record.targetOwner = TransportMemoryOwner::Debug;
             record.targetStorage = TransportMemoryStorageClass::Staging;
@@ -911,24 +1310,90 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
             record.allocationGeneration = allocation->allocationGeneration;
         } else if (record.name == "PathGuiding.WorldGridBins") {
             record.ownedBuffer = m_restirState.pathGuiding;
-        } else if (record.name == "RestirPTPathReservoirs") {
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "ReSTIRGIProductionReservoirs" ||
+                   record.name == "RestirPTPathReservoirs") {
             record.ownedBuffer = m_restirState.restirPt;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "RadianceCache.WorldGrid") {
             record.ownedBuffer = m_restirState.radianceCache;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDIReservoirCurrent") {
             record.ownedBuffer = m_restirState.restirDiCurrent;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDIReservoirPrevious") {
             record.ownedBuffer = m_restirState.restirDiPrevious;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDIReservoirTemporal") {
             record.ownedBuffer = m_restirState.restirDiTemporal;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDIReservoirSpatial") {
             record.ownedBuffer = m_restirState.restirDiSpatial;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDIVisibility") {
             record.ownedBuffer = m_restirState.restirDiVisibility;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDINeighborPattern") {
             record.ownedBuffer = m_restirState.restirDiNeighborPattern;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
         } else if (record.name == "ReSTIRDIDebugAOVReadback") {
             record.ownedBuffer = m_restirState.restirDiDebug;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.ActiveRays.Current") {
+            record.ownedBuffer = m_wavefront.activeRays[0];
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.ActiveRays.Next") {
+            record.ownedBuffer = m_wavefront.activeRays[1];
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.HitRecords") {
+            record.ownedBuffer = m_wavefront.hitRecords;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.ShadowRays") {
+            record.ownedBuffer = m_wavefront.shadowRays;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.ShadowIndices") {
+            record.ownedBuffer = m_wavefront.shadowIndices;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.PathStates") {
+            record.ownedBuffer = m_wavefront.pathStates;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.RadianceCacheQueryItems") {
+            record.ownedBuffer = m_wavefront.cacheQueryItems;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.RadianceCacheTrainRecords") {
+            record.ownedBuffer = m_wavefront.cacheTrainRecords;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.QueueCounters") {
+            record.ownedBuffer = m_wavefront.queueCounters;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        } else if (record.name == "Wavefront.IndirectDispatchArgs") {
+            record.ownedBuffer = m_wavefront.indirectDispatchArgs;
+            record.frameGraphOwned = record.ownedBuffer != nullptr;
+            record.transportMemoryOwned = record.ownedBuffer != nullptr;
+        }
+        if (record.owner == TransportMemoryOwner::Denoiser ||
+            record.owner == TransportMemoryOwner::FrameHistory) {
+            record.frameGraphOwned = record.bytes > 0u;
+            record.transportMemoryOwned = false;
         }
         applyBridgeMetadata(record);
         m_transportMemory.registerResource(std::move(record));
@@ -947,13 +1412,27 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
                        static_cast<uint32_t>(std::min<uint64_t>(
                            guidingCellCount, std::numeric_limits<uint32_t>::max())),
                        m_restirState.pathGuidingBytes,
-                       TransportMemoryStorageClass::Shared,
+                       TransportMemoryStorageClass::Private,
                        TransportMemoryHistoryPolicy::PersistentHistory,
-                       TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
                        allTransport);
     }
 
-    if (m_restirState.restirPtBytes > 0u) {
+    if (restirGiActive && m_restirState.restirPtBytes > 0u) {
+        registerRecord("ReSTIRGIProductionReservoirs",
+                       TransportMemoryKind::RestirGIReservoir,
+                       TransportMemoryOwner::RestirGI,
+                       width,
+                       height,
+                       pathDepth,
+                       m_restirState.restirPtBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::PersistentHistory,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+    }
+
+    if (restirPtActive && m_restirState.restirPtBytes > 0u) {
         registerRecord("RestirPTPathReservoirs",
                        TransportMemoryKind::RestirPTReservoir,
                        TransportMemoryOwner::RestirPT,
@@ -961,9 +1440,9 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
                        height,
                        pathDepth,
                        m_restirState.restirPtBytes,
-                       TransportMemoryStorageClass::Shared,
+                       TransportMemoryStorageClass::Private,
                        TransportMemoryHistoryPolicy::PersistentHistory,
-                       TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
                        allTransport);
     }
 
@@ -975,26 +1454,21 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
                        height,
                        pathDepth,
                        m_restirState.radianceCacheBytes,
-                       TransportMemoryStorageClass::Shared,
+                       TransportMemoryStorageClass::Private,
                        TransportMemoryHistoryPolicy::PersistentHistory,
-                       TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
                        allTransport);
     }
 
-    if (settings.causticTransportMode == RenderSettings::CausticTransportMode::PathSpacePrototype) {
-        const uint64_t vertexBudget = std::max<uint32_t>(settings.causticMaxVertices, 1u);
-        const uint64_t causticBytes =
-            vertexBudget * (sizeof(PathTracerShaderTypes::EyeSubpathVertex) +
-                            sizeof(PathTracerShaderTypes::LightSubpathVertex) +
-                            sizeof(PathTracerShaderTypes::PathConnection));
+    if (settings.causticTransportMode == RenderSettings::CausticTransportMode::PathSpacePrototype &&
+        m_restirState.causticTransportBytes > 0u) {
         registerRecord("CausticTransport.PathSpacePrototype",
                        TransportMemoryKind::CausticPathSpace,
                        TransportMemoryOwner::CausticTransport,
                        width,
                        height,
-                       static_cast<uint32_t>(std::min<uint64_t>(
-                           vertexBudget, std::numeric_limits<uint32_t>::max())),
-                       causticBytes,
+                       m_restirState.causticMaxVertices,
+                       m_restirState.causticTransportBytes,
                        TransportMemoryStorageClass::Private,
                        TransportMemoryHistoryPolicy::PersistentHistory,
                        TransportMemoryDebugReadbackPolicy::MetadataOnly,
@@ -1092,6 +1566,123 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
                        lightTransport);
     }
 
+    if (m_wavefront.totalBytes > 0u) {
+        registerRecord("Wavefront.ActiveRays.Current",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       m_wavefront.width,
+                       m_wavefront.height,
+                       m_wavefront.capacity,
+                       m_wavefront.activeBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+        registerRecord("Wavefront.ActiveRays.Next",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       m_wavefront.width,
+                       m_wavefront.height,
+                       m_wavefront.capacity,
+                       m_wavefront.nextBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+        registerRecord("Wavefront.HitRecords",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       m_wavefront.width,
+                       m_wavefront.height,
+                       m_wavefront.capacity,
+                       m_wavefront.hitBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+        registerRecord("Wavefront.ShadowRays",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       m_wavefront.width,
+                       m_wavefront.height,
+                       m_wavefront.shadowCapacity,
+                       m_wavefront.shadowBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+        registerRecord("Wavefront.ShadowIndices",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       m_wavefront.width,
+                       m_wavefront.height,
+                       m_wavefront.shadowCapacity,
+                       m_wavefront.shadowIndexBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+        registerRecord("Wavefront.PathStates",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       m_wavefront.width,
+                       m_wavefront.height,
+                       m_wavefront.capacity,
+                       m_wavefront.pathStateBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+        if (m_wavefront.cacheQueryBytes > 0u) {
+            registerRecord("Wavefront.RadianceCacheQueryItems",
+                           TransportMemoryKind::WavefrontQueue,
+                           TransportMemoryOwner::Wavefront,
+                           m_wavefront.width,
+                           m_wavefront.height,
+                           m_wavefront.capacity,
+                           m_wavefront.cacheQueryBytes,
+                           TransportMemoryStorageClass::Private,
+                           TransportMemoryHistoryPolicy::Transient,
+                           TransportMemoryDebugReadbackPolicy::StagingCopy,
+                           allTransport);
+        }
+        if (m_wavefront.cacheTrainRecordBytes > 0u) {
+            registerRecord("Wavefront.RadianceCacheTrainRecords",
+                           TransportMemoryKind::WavefrontQueue,
+                           TransportMemoryOwner::Wavefront,
+                           m_wavefront.width,
+                           m_wavefront.height,
+                           m_wavefront.capacity,
+                           m_wavefront.cacheTrainRecordBytes,
+                           TransportMemoryStorageClass::Private,
+                           TransportMemoryHistoryPolicy::Transient,
+                           TransportMemoryDebugReadbackPolicy::StagingCopy,
+                           allTransport);
+        }
+        registerRecord("Wavefront.QueueCounters",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       1u,
+                       1u,
+                       1u,
+                       sizeof(QueueCounters),
+                       TransportMemoryStorageClass::Shared,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                       allTransport);
+        registerRecord("Wavefront.IndirectDispatchArgs",
+                       TransportMemoryKind::WavefrontQueue,
+                       TransportMemoryOwner::Wavefront,
+                       1u,
+                       1u,
+                       1u,
+                       m_wavefront.indirectDispatchArgsBytes,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Transient,
+                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                       allTransport);
+    }
+
     const uint64_t pixelCount = static_cast<uint64_t>(capacity);
     if (pixelCount > 0u) {
         const uint64_t rgba32fBytes = pixelCount * sizeof(float) * 4u;
@@ -1150,24 +1741,28 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
                        width,
                        height,
                        1u,
-                       0u,
+                       m_mlState.modelBytes,
                        TransportMemoryStorageClass::Private,
-                       TransportMemoryHistoryPolicy::Transient,
+                       settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny
+                           ? TransportMemoryHistoryPolicy::PersistentHistory
+                           : TransportMemoryHistoryPolicy::Transient,
                        TransportMemoryDebugReadbackPolicy::MetadataOnly,
                        frameHistory);
     }
 
-    registerRecord("ReSTIRGIReservoirPlaceholder",
-                   TransportMemoryKind::RestirGIReservoir,
-                   TransportMemoryOwner::RestirGI,
-                   width,
-                   height,
-                   1u,
-                   0u,
-                   TransportMemoryStorageClass::Private,
-                   TransportMemoryHistoryPolicy::Placeholder,
-                   TransportMemoryDebugReadbackPolicy::MetadataOnly,
-                   allTransport);
+    if (!restirGiActive) {
+        registerRecord("ReSTIRGIReservoirPlaceholder",
+                       TransportMemoryKind::RestirGIReservoir,
+                       TransportMemoryOwner::RestirGI,
+                       width,
+                       height,
+                       1u,
+                       0u,
+                       TransportMemoryStorageClass::Private,
+                       TransportMemoryHistoryPolicy::Placeholder,
+                       TransportMemoryDebugReadbackPolicy::MetadataOnly,
+                       allTransport);
+    }
     if (m_restirState.radianceCacheBytes == 0u) {
         registerRecord("RadianceCachePlaceholder",
                        TransportMemoryKind::RadianceCache,
@@ -1192,6 +1787,12 @@ void RenderLoop::rebuildTransportMemoryRegistry(const RenderSettings& settings) 
                    TransportMemoryHistoryPolicy::Placeholder,
                    TransportMemoryDebugReadbackPolicy::MetadataOnly,
                    allTransport);
+    const uint32_t ownershipGaps = m_transportMemory.ownershipGapRecordCount();
+    if (ownershipGaps > 0u) {
+        NSLog(@"[TransportMemory] ownership validation found %u nonzero records without "
+              "FrameGraph or allocator ownership",
+              ownershipGaps);
+    }
 }
 
 bool RenderLoop::encodeRestirDiInitializeReservoirs(MTLCommandBufferHandle commandBuffer,
@@ -1278,11 +1879,20 @@ bool RenderLoop::encodeRestirDiInitialCandidates(MTLCommandBufferHandle commandB
     PathtraceUniforms uniforms = UniformBuilder::buildPathtraceUniforms(
         settings, accumulation, scene, accumulation.currentSize());
     const auto& provider = scene.intersectionProvider();
+    const bool forceSoftwareInitialCandidates =
+        settings.enableSoftwareRayTracing || ForceSoftwareRestirDiInitialCandidates();
+    static bool sLoggedRestirDiInitialSoftwareTraversal = false;
+    if (forceSoftwareInitialCandidates &&
+        provider.mode == PathTracerShaderTypes::IntersectionMode::HardwareRayTracing &&
+        !sLoggedRestirDiInitialSoftwareTraversal) {
+        sLoggedRestirDiInitialSoftwareTraversal = true;
+        NSLog(@"[ReSTIR DI] explicit initial candidates use software traversal by request while HWRT remains active for the frame");
+    }
     const TraversalServiceDecision traversal = SelectTraversalBackend(
         provider,
         TraversalServiceRequest{
             .kind = TraversalQueryKind::RestirDiVisibility,
-            .softwareOverride = settings.enableSoftwareRayTracing,
+            .softwareOverride = forceSoftwareInitialCandidates,
             .hardwarePipelineAvailable = pipelines.restirDiInitialCandidatesHardware() != nil,
             .hardwareTraversalResourceAvailable = provider.hardware.tlas != nil,
             .sceneIdentityBuffersAvailable = scene.meshInfoBuffer() != nil &&
@@ -1334,6 +1944,13 @@ bool RenderLoop::encodeRestirDiInitialCandidates(MTLCommandBufferHandle commandB
         [encoder setBuffer:BufferOrDummy(provider.software.primitiveIndices, m_dummyBuffer) offset:0 atIndex:12];
         [encoder setBuffer:BufferOrDummy(scene.emissivePrimitivesBuffer(), m_dummyBuffer) offset:0 atIndex:13];
         [encoder setBuffer:m_restirState.restirDiCurrent offset:0 atIndex:14];
+        [encoder setBuffer:BufferOrDummy(scene.environmentConditionalAliasBuffer(), m_dummyBuffer)
+                    offset:0
+                   atIndex:15];
+        [encoder setBuffer:BufferOrDummy(scene.environmentMarginalAliasBuffer(), m_dummyBuffer)
+                    offset:0
+                   atIndex:16];
+        [encoder setBuffer:BufferOrDummy(scene.environmentPdfBuffer(), m_dummyBuffer) offset:0 atIndex:17];
     } else {
         [encoder setBuffer:BufferOrDummy(provider.software.nodes, m_dummyBuffer) offset:0 atIndex:1];
         [encoder setBuffer:BufferOrDummy(provider.software.primitiveIndices, m_dummyBuffer) offset:0 atIndex:2];
@@ -1349,6 +1966,13 @@ bool RenderLoop::encodeRestirDiInitialCandidates(MTLCommandBufferHandle commandB
         [encoder setBuffer:BufferOrDummy(provider.software.instanceInfoBuffer, m_dummyBuffer) offset:0 atIndex:12];
         [encoder setBuffer:BufferOrDummy(scene.emissivePrimitivesBuffer(), m_dummyBuffer) offset:0 atIndex:13];
         [encoder setBuffer:m_restirState.restirDiCurrent offset:0 atIndex:14];
+        [encoder setBuffer:BufferOrDummy(scene.environmentConditionalAliasBuffer(), m_dummyBuffer)
+                    offset:0
+                   atIndex:15];
+        [encoder setBuffer:BufferOrDummy(scene.environmentMarginalAliasBuffer(), m_dummyBuffer)
+                    offset:0
+                   atIndex:16];
+        [encoder setBuffer:BufferOrDummy(scene.environmentPdfBuffer(), m_dummyBuffer) offset:0 atIndex:17];
     }
     [encoder setTexture:scene.environmentTexture() atIndex:0];
 
@@ -1368,6 +1992,15 @@ bool RenderLoop::encodeRestirDiInitialCandidates(MTLCommandBufferHandle commandB
         }
         if (scene.environmentTexture()) {
             [encoder useResource:scene.environmentTexture() usage:MTLResourceUsageRead];
+        }
+        if (scene.environmentConditionalAliasBuffer()) {
+            [encoder useResource:scene.environmentConditionalAliasBuffer() usage:MTLResourceUsageRead];
+        }
+        if (scene.environmentMarginalAliasBuffer()) {
+            [encoder useResource:scene.environmentMarginalAliasBuffer() usage:MTLResourceUsageRead];
+        }
+        if (scene.environmentPdfBuffer()) {
+            [encoder useResource:scene.environmentPdfBuffer() usage:MTLResourceUsageRead];
         }
     }
 
@@ -1575,6 +2208,11 @@ bool RenderLoop::encodeRestirDiVisibility(MTLCommandBufferHandle commandBuffer,
         [encoder setBuffer:m_restirState.restirDiSpatial offset:0 atIndex:13];
         [encoder setBuffer:m_restirState.restirDiVisibility offset:0 atIndex:14];
         [encoder setBuffer:m_restirState.restirDiPrevious offset:0 atIndex:15];
+        [encoder setBuffer:BufferOrDummy(provider.software.tlasNodes, m_dummyBuffer) offset:0 atIndex:16];
+        [encoder setBuffer:BufferOrDummy(provider.software.tlasPrimitiveIndices, m_dummyBuffer) offset:0 atIndex:17];
+        [encoder setBuffer:BufferOrDummy(provider.software.blasNodes, m_dummyBuffer) offset:0 atIndex:18];
+        [encoder setBuffer:BufferOrDummy(provider.software.blasPrimitiveIndices, m_dummyBuffer) offset:0 atIndex:19];
+        [encoder setBuffer:BufferOrDummy(provider.software.instanceInfoBuffer, m_dummyBuffer) offset:0 atIndex:20];
     } else {
         [encoder setBuffer:BufferOrDummy(provider.software.nodes, m_dummyBuffer) offset:0 atIndex:1];
         [encoder setBuffer:BufferOrDummy(provider.software.primitiveIndices, m_dummyBuffer) offset:0 atIndex:2];
@@ -1741,6 +2379,11 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
     const uint32_t width = static_cast<uint32_t>(std::max<CGFloat>(1.0, currentSize.width));
     const uint32_t height = static_cast<uint32_t>(std::max<CGFloat>(1.0, currentSize.height));
     if (!ensureRestirStateResources(width, height, settings, commandBuffer)) {
+        static bool sLoggedMegakernelRestirStateFailure = false;
+        if (!sLoggedMegakernelRestirStateFailure) {
+            sLoggedMegakernelRestirStateFailure = true;
+            NSLog(@"[Megakernel] ReSTIR state allocation failed; frame not dispatched");
+        }
         return 0u;
     }
 
@@ -1756,7 +2399,8 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
         const uint32_t endSample = m_gpuTiming.nextSample++;
         attachment.startOfEncoderSampleIndex = startSample;
         attachment.endOfEncoderSampleIndex = endSample;
-        m_gpuTiming.ranges.push_back({GpuTimingBucket::FusedIntegrate, startSample, endSample});
+        m_gpuTiming.ranges.push_back(
+            {GpuTimingBucket::FusedIntegrate, "Megakernel Integrate", startSample, endSample});
         encoder = [commandBuffer computeCommandEncoderWithDescriptor:passDescriptor];
     } else {
         encoder = [commandBuffer computeCommandEncoder];
@@ -1771,7 +2415,7 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
         TraversalServiceRequest{
             .kind = TraversalQueryKind::ContinuationRay,
             .softwareOverride = settings.enableSoftwareRayTracing,
-            .hardwarePipelineAvailable = pipelines.integrateHardware() != nil,
+            .hardwarePipelineAvailable = pipelines.integrateHardwareAvailable(),
             .hardwareTraversalResourceAvailable = provider.hardware.tlas != nil,
             .sceneIdentityBuffersAvailable = scene.meshInfoBuffer() != nil &&
                                              scene.meshVertexBuffer() != nil &&
@@ -1784,8 +2428,30 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
         samplesThisFrame = 1u;
     }
 
+    // The hardware megakernel has a default-features specialization with every research and
+    // debug gate folded to 0 (the direct-light mode stays live). Use it when all those gates are
+    // off. The gates come from the
+    // settings and do not change between the samples dispatched below, so one build decides.
+    bool useDefaultFeatures = false;
+    if (useHardware && pipelines.integrateHardwareAvailable()) {
+        const PathtraceUniforms gateProbe = UniformBuilder::buildPathtraceUniforms(
+            settings, accumulation, scene, accumulation.currentSize());
+        useDefaultFeatures = UniformBuilder::usesOnlyDefaultFeatures(gateProbe);
+    }
+    const int integrateVariant = !useHardware ? 0 : (useDefaultFeatures ? 2 : 1);
+    if (integrateVariant != m_lastIntegrateVariant) {
+        m_lastIntegrateVariant = integrateVariant;
+        NSLog(@"[Megakernel] integrate pipeline: %s%s%s",
+              integrateVariant == 2 ? "hardware, default features (research and debug gates off, direct-light mode live)"
+              : integrateVariant == 1 ? "hardware, general (a research or debug gate is on)"
+                                      : "software (",
+              integrateVariant == 0 ? traversal.fallbackReason.c_str() : "",
+              integrateVariant == 0 ? ")" : "");
+    }
+
     id<MTLComputePipelineState> selectedPipeline = useHardware
-        ? pipelines.integrateHardware()
+        ? (useDefaultFeatures ? pipelines.integrateHardwareDefaultFeatures()
+                              : pipelines.integrateHardware())
         : pipelines.integrate();
     if (!selectedPipeline) {
         selectedPipeline = pipelines.integrate();
@@ -1843,6 +2509,36 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
                 [argumentEncoder setBuffer:BufferOrDummy(m_restirState.radianceCache, m_dummyBuffer)
                                     offset:0
                                    atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheStateIndex];
+                [argumentEncoder setBuffer:BufferOrDummy(m_wavefront.cacheQueryItems, m_dummyBuffer)
+                                    offset:0
+                                   atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheQueryItemIndex];
+                [argumentEncoder setBuffer:BufferOrDummy(m_wavefront.cacheTrainRecords, m_dummyBuffer)
+                                    offset:0
+                                   atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheTrainRecordIndex];
+                MTLBufferHandle causticTransport =
+                    m_transportAllocator.bufferForName("CausticTransport.PathSpacePrototype");
+                const NSUInteger causticVertexCount =
+                    causticTransport ? static_cast<NSUInteger>(m_restirState.causticMaxVertices) : 0u;
+                const NSUInteger causticLightOffset =
+                    causticVertexCount * sizeof(PathTracerShaderTypes::EyeSubpathVertex);
+                const NSUInteger causticConnectionOffset =
+                    causticLightOffset +
+                    causticVertexCount * sizeof(PathTracerShaderTypes::LightSubpathVertex);
+                const NSUInteger causticResultOffset =
+                    causticConnectionOffset +
+                    causticVertexCount * sizeof(PathTracerShaderTypes::PathConnection);
+                [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                    offset:0
+                                   atIndex:PathTracerShaderTypes::kMaterialResourceCausticEyeVertexIndex];
+                [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                    offset:(causticTransport ? causticLightOffset : 0u)
+                                   atIndex:PathTracerShaderTypes::kMaterialResourceCausticLightVertexIndex];
+                [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                    offset:(causticTransport ? causticConnectionOffset : 0u)
+                                   atIndex:PathTracerShaderTypes::kMaterialResourceCausticConnectionIndex];
+                [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                    offset:(causticTransport ? causticResultOffset : 0u)
+                                   atIndex:PathTracerShaderTypes::kMaterialResourceCausticConnectionResultIndex];
                 [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
                 if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
                     if (m_restirState.pathGuiding) {
@@ -1855,6 +2551,18 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
                     }
                     if (m_restirState.radianceCache) {
                         [encoder useResource:m_restirState.radianceCache
+                                       usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                    }
+                    if (m_wavefront.cacheQueryItems) {
+                        [encoder useResource:m_wavefront.cacheQueryItems
+                                       usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                    }
+                    if (m_wavefront.cacheTrainRecords) {
+                        [encoder useResource:m_wavefront.cacheTrainRecords
+                                       usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                    }
+                    if (causticTransport) {
+                        [encoder useResource:causticTransport
                                        usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
                     }
                 }
@@ -1972,7 +2680,16 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
     for (uint32_t sample = 0; sample < samplesThisFrame; ++sample) {
         PathtraceUniforms uniforms = UniformBuilder::buildPathtraceUniforms(
             settings, accumulation, scene, accumulation.currentSize());
-        if (m_explicitRestirDiActiveThisFrame) {
+        // The megakernel leaves direct light to the explicit ReSTIR DI stage only when that stage is its screen
+        // passes. A wavefront frame handed to the megakernel (encodeWavefrontMegakernelFallback) never ran the
+        // wavefront's explicit stage, so it shades its own direct light, the fused restir_di or hybrid.
+        const bool explicitRestirDiScreenLightingStage =
+            m_explicitRestirDiActiveThisFrame &&
+            !m_restirDiMegakernelIntegratedStageActiveThisFrame &&
+            !m_restirDiWavefrontStageActiveThisFrame;
+        uniforms.explicitRestirDiLightingStage =
+            explicitRestirDiScreenLightingStage ? 1u : 0u;
+        if (explicitRestirDiScreenLightingStage) {
             uniforms.emissivePrimitiveCount = 0u;
         }
         PathTracerShaderTypes::IntersectionMode modeOverride =
@@ -1997,6 +2714,10 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
         [encoder setTexture:accumulation.positionBuffer() atIndex:5];
         [encoder setTexture:accumulation.materialFeatureBuffer() atIndex:6];
         [encoder setTexture:accumulation.motionVectorBuffer() atIndex:7];
+        [encoder setTexture:accumulation.directRadianceSum() atIndex:8];
+        [encoder setTexture:accumulation.indirectRadianceSum() atIndex:9];
+        [encoder setTexture:accumulation.radianceMomentSum() atIndex:10];
+        [encoder setTexture:accumulation.reconstructionMetricBuffer() atIndex:11];
         [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
         m_currentPathtraceUniforms = uniforms;
         m_hasCurrentPathtraceUniforms = true;
@@ -2013,6 +2734,7 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
 }
 
 bool RenderLoop::ensureWavefrontResources(const SceneResources& scene,
+                                          const RenderSettings& settings,
                                           uint32_t width,
                                           uint32_t height) {
     const uint64_t capacity64 = std::max<uint64_t>(1u, static_cast<uint64_t>(width) * static_cast<uint64_t>(height));
@@ -2020,51 +2742,167 @@ bool RenderLoop::ensureWavefrontResources(const SceneResources& scene,
         NSLog(@"[Wavefront] render target too large for fixed queue capacity");
         return false;
     }
-    const uint64_t shadowCapacity64 = capacity64 * static_cast<uint64_t>(kWavefrontShadowCapacityMultiplier);
+    const uint64_t shadowStride = static_cast<uint64_t>(kWavefrontShadowCapacityMultiplier) +
+        (settings.referencePointExactNee ? scene.zeroRadiusReferencePointLightCount() : 0u);
+    const uint64_t shadowCapacity64 = capacity64 * shadowStride;
     if (shadowCapacity64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
         NSLog(@"[Wavefront] render target too large for fixed shadow queue capacity");
         return false;
     }
     const uint32_t capacity = static_cast<uint32_t>(capacity64);
     const uint32_t shadowCapacity = static_cast<uint32_t>(shadowCapacity64);
+    const bool cacheQueuesEnabled = RadianceCacheActive(settings);
+    const bool resolvedSurfacesEnabled =
+        settings.wavefrontShadeIndirectEnabled || WavefrontShadeIndirectEnabled();
     if (m_wavefront.capacity == capacity &&
         m_wavefront.shadowCapacity == shadowCapacity &&
         m_wavefront.width == width &&
         m_wavefront.height == height &&
+        m_wavefront.cacheQueuesEnabled == cacheQueuesEnabled &&
+        m_wavefront.resolvedSurfacesEnabled == resolvedSurfacesEnabled &&
         m_wavefront.activeRays[0] &&
         m_wavefront.activeRays[1] &&
         m_wavefront.hitRecords &&
         m_wavefront.shadowRays &&
+        m_wavefront.shadowIndices &&
         m_wavefront.pathStates &&
         m_wavefront.queueCounters &&
+        (!cacheQueuesEnabled || (m_wavefront.cacheQueryItems && m_wavefront.cacheTrainRecords)) &&
+        (!resolvedSurfacesEnabled || m_wavefront.resolvedSurfaces) &&
         m_wavefront.indirectDispatchArgs) {
         m_wavefront.budgetBytes = scene.recommendedMaxWorkingSetSizeBytes();
         return true;
     }
 
-    auto makeBuffer = ^MTLBufferHandle(NSUInteger length, NSString* label) {
-        id<MTLBuffer> buffer = [m_device newBufferWithLength:length options:MTLResourceStorageModeShared];
-        if (buffer) {
-            buffer.label = label;
-        }
-        return buffer;
-    };
-
     const NSUInteger activeBytes = static_cast<NSUInteger>(capacity64 * sizeof(WavefrontRay));
     const NSUInteger hitBytes = static_cast<NSUInteger>(capacity64 * sizeof(WavefrontHitRecord));
     const NSUInteger shadowBytes = static_cast<NSUInteger>(shadowCapacity64 * sizeof(ShadowRay));
+    const NSUInteger shadowIndexBytes = static_cast<NSUInteger>(shadowCapacity64 * sizeof(uint32_t));
     const NSUInteger pathStateBytes = static_cast<NSUInteger>(capacity64 * sizeof(PathState));
+    const NSUInteger resolvedSurfaceBytes =
+        resolvedSurfacesEnabled
+            ? static_cast<NSUInteger>(capacity64 * sizeof(WavefrontResolvedSurface))
+            : 0u;
+    const NSUInteger cacheWorkBytes =
+        cacheQueuesEnabled
+            ? static_cast<NSUInteger>(capacity64 *
+                                      sizeof(PathTracerShaderTypes::RadianceCacheWorkItem))
+            : 0u;
+    // Radiance cache training records: kRadianceCacheTrainRecordCount per training pixel, and one pixel in
+    // kRadianceCacheTrainingPathStride trains in a frame (shaders/wavefront/kernels.metal).
+    const uint64_t cacheTrainGroups64 =
+        (capacity64 + PathTracerShaderTypes::kRadianceCacheTrainingPathStride - 1u) /
+        PathTracerShaderTypes::kRadianceCacheTrainingPathStride;
+    const NSUInteger cacheTrainRecordBytes =
+        cacheQueuesEnabled
+            ? static_cast<NSUInteger>(cacheTrainGroups64 * PathTracerShaderTypes::kRadianceCacheTrainRecordCount *
+                                      sizeof(PathTracerShaderTypes::RadianceCacheTrainRecord))
+            : 0u;
     const NSUInteger counterBytes = sizeof(QueueCounters);
     const NSUInteger indirectDispatchArgsBytes = static_cast<NSUInteger>(3u * sizeof(uint32_t));
 
-    MTLBufferHandle active0 = makeBuffer(activeBytes, @"Wavefront Active Rays A");
-    MTLBufferHandle active1 = makeBuffer(activeBytes, @"Wavefront Active Rays B");
-    MTLBufferHandle hits = makeBuffer(hitBytes, @"Wavefront Hit Records");
-    MTLBufferHandle shadows = makeBuffer(shadowBytes, @"Wavefront Shadow Rays");
-    MTLBufferHandle pathStates = makeBuffer(pathStateBytes, @"Wavefront Path States");
-    MTLBufferHandle counters = makeBuffer(counterBytes, @"Wavefront Queue Counters");
-    MTLBufferHandle indirectArgs = makeBuffer(indirectDispatchArgsBytes, @"Wavefront Indirect Dispatch Args");
-    if (!active0 || !active1 || !hits || !shadows || !pathStates || !counters || !indirectArgs) {
+    auto makeWavefrontBuffer =
+        [&](const char* name,
+            NSUInteger length,
+            StorageClass storage,
+            ResourceLifetime lifetime,
+            TransportMemoryDebugReadbackPolicy debug,
+            const char* label) -> MTLBufferHandle {
+        TransportMemoryRecord record{};
+        record.name = name;
+        record.kind = TransportMemoryKind::WavefrontQueue;
+        record.owner = TransportMemoryOwner::Wavefront;
+        record.targetOwner = TransportMemoryOwner::Wavefront;
+        record.frameGraphGroup = RenderResourceGroup::WavefrontResources;
+        record.lifetime = lifetime;
+        record.width = width;
+        record.height = height;
+        record.depthOrCellCount = capacity;
+        record.bytes = static_cast<uint64_t>(length);
+        record.history = TransportMemoryHistoryPolicy::Transient;
+        record.debug = debug;
+        record.invalidatesOn = AllTransportInvalidations();
+        record.frameGraphOwned = true;
+        record.transportMemoryOwned = true;
+        return m_transportAllocator.allocateBuffer(m_device, record, storage, label);
+    };
+
+    MTLBufferHandle active0 = makeWavefrontBuffer("Wavefront.ActiveRays.Current",
+                                                  activeBytes,
+                                                  StorageClass::Private,
+                                                  ResourceLifetime::Transient,
+                                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                                  "TransportMemory.Wavefront.ActiveRays.Current");
+    MTLBufferHandle active1 = makeWavefrontBuffer("Wavefront.ActiveRays.Next",
+                                                  activeBytes,
+                                                  StorageClass::Private,
+                                                  ResourceLifetime::Transient,
+                                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                                  "TransportMemory.Wavefront.ActiveRays.Next");
+    MTLBufferHandle hits = makeWavefrontBuffer("Wavefront.HitRecords",
+                                               hitBytes,
+                                               StorageClass::Private,
+                                               ResourceLifetime::Transient,
+                                               TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                               "TransportMemory.Wavefront.HitRecords");
+    MTLBufferHandle shadows = makeWavefrontBuffer("Wavefront.ShadowRays",
+                                                  shadowBytes,
+                                                  StorageClass::Private,
+                                                  ResourceLifetime::Transient,
+                                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                                  "TransportMemory.Wavefront.ShadowRays");
+    MTLBufferHandle shadowIndices = makeWavefrontBuffer("Wavefront.ShadowIndices",
+                                                        shadowIndexBytes,
+                                                        StorageClass::Private,
+                                                        ResourceLifetime::Transient,
+                                                        TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                                        "TransportMemory.Wavefront.ShadowIndices");
+    MTLBufferHandle pathStates = makeWavefrontBuffer("Wavefront.PathStates",
+                                                     pathStateBytes,
+                                                     StorageClass::Private,
+                                                     ResourceLifetime::Transient,
+                                                     TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                                     "TransportMemory.Wavefront.PathStates");
+    MTLBufferHandle cacheQueryItems = cacheQueuesEnabled
+        ? makeWavefrontBuffer("Wavefront.RadianceCacheQueryItems",
+                              cacheWorkBytes,
+                              StorageClass::Private,
+                              ResourceLifetime::Transient,
+                              TransportMemoryDebugReadbackPolicy::StagingCopy,
+                              "TransportMemory.Wavefront.RadianceCacheQueryItems")
+        : nil;
+    MTLBufferHandle cacheTrainRecords = cacheQueuesEnabled
+        ? makeWavefrontBuffer("Wavefront.RadianceCacheTrainRecords",
+                              cacheTrainRecordBytes,
+                              StorageClass::Private,
+                              ResourceLifetime::Transient,
+                              TransportMemoryDebugReadbackPolicy::StagingCopy,
+                              "TransportMemory.Wavefront.RadianceCacheTrainRecords")
+        : nil;
+    MTLBufferHandle resolvedSurfaces =
+        resolvedSurfacesEnabled
+            ? makeWavefrontBuffer("Wavefront.ResolvedSurfaces",
+                                  resolvedSurfaceBytes,
+                                  StorageClass::Private,
+                                  ResourceLifetime::Transient,
+                                  TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                  "TransportMemory.Wavefront.ResolvedSurfaces")
+            : nil;
+    MTLBufferHandle counters = makeWavefrontBuffer("Wavefront.QueueCounters",
+                                                   counterBytes,
+                                                   StorageClass::Shared,
+                                                   ResourceLifetime::DebugReadback,
+                                                   TransportMemoryDebugReadbackPolicy::DirectCpuVisible,
+                                                   "TransportMemory.Wavefront.QueueCounters");
+    MTLBufferHandle indirectArgs = makeWavefrontBuffer("Wavefront.IndirectDispatchArgs",
+                                                       indirectDispatchArgsBytes,
+                                                       StorageClass::Private,
+                                                       ResourceLifetime::Transient,
+                                                       TransportMemoryDebugReadbackPolicy::StagingCopy,
+                                                       "TransportMemory.Wavefront.IndirectDispatchArgs");
+    if (!active0 || !active1 || !hits || !shadows || !shadowIndices || !pathStates ||
+        (cacheQueuesEnabled && (!cacheQueryItems || !cacheTrainRecords)) || !counters ||
+        (resolvedSurfacesEnabled && !resolvedSurfaces) || !indirectArgs) {
         NSLog(@"[Wavefront] failed to allocate queue buffers");
         return false;
     }
@@ -2073,24 +2911,40 @@ bool RenderLoop::ensureWavefrontResources(const SceneResources& scene,
     m_wavefront.activeRays[1] = active1;
     m_wavefront.hitRecords = hits;
     m_wavefront.shadowRays = shadows;
+    m_wavefront.shadowIndices = shadowIndices;
     m_wavefront.pathStates = pathStates;
     m_wavefront.queueCounters = counters;
+    m_wavefront.cacheQueryItems = cacheQueryItems;
+    m_wavefront.cacheTrainRecords = cacheTrainRecords;
+    // Training records are valid only between a training path's shade and the train kernel, which invalidates
+    // them; a new buffer is zeroed before its first use (encodeWavefront...).
+    m_wavefront.cacheTrainRecordsNeedClear = cacheTrainRecords != nullptr;
+    m_wavefront.resolvedSurfaces = resolvedSurfaces;
     m_wavefront.indirectDispatchArgs = indirectArgs;
     m_wavefront.width = width;
     m_wavefront.height = height;
     m_wavefront.capacity = capacity;
     m_wavefront.shadowCapacity = shadowCapacity;
+    m_wavefront.cacheQueuesEnabled = cacheQueuesEnabled;
+    m_wavefront.resolvedSurfacesEnabled = resolvedSurfacesEnabled;
     m_wavefront.activeBytes = activeBytes;
     m_wavefront.nextBytes = activeBytes;
     m_wavefront.hitBytes = hitBytes;
     m_wavefront.shadowBytes = shadowBytes;
+    m_wavefront.shadowIndexBytes = shadowIndexBytes;
     m_wavefront.pathStateBytes = pathStateBytes;
+    m_wavefront.cacheQueryBytes = cacheWorkBytes;
+    m_wavefront.cacheTrainRecordBytes = cacheTrainRecordBytes;
+    m_wavefront.resolvedSurfaceBytes = resolvedSurfaceBytes;
     m_wavefront.indirectDispatchArgsBytes = indirectDispatchArgsBytes;
     m_wavefront.totalBytes =
         static_cast<uint64_t>(activeBytes) * 2u +
         static_cast<uint64_t>(hitBytes) +
         static_cast<uint64_t>(shadowBytes) +
+        static_cast<uint64_t>(shadowIndexBytes) +
         static_cast<uint64_t>(pathStateBytes) +
+        static_cast<uint64_t>(cacheWorkBytes) * 2u +
+        static_cast<uint64_t>(resolvedSurfaceBytes) +
         static_cast<uint64_t>(counterBytes) +
         static_cast<uint64_t>(indirectDispatchArgsBytes);
     m_wavefront.budgetBytes = scene.recommendedMaxWorkingSetSizeBytes();
@@ -2101,17 +2955,50 @@ bool RenderLoop::ensureWavefrontResources(const SceneResources& scene,
                static_cast<double>(m_wavefront.budgetBytes)) * 100.0
             : 0.0;
     NSLog(@"[Wavefront] queueFootprint active=%.2f MiB next=%.2f MiB hit=%.2f MiB shadow=%.2f MiB "
-          "path=%.2f MiB indirect=%.2f KiB total=%.2f MiB recommendedMaxWorkingSetSize=%.2f MiB usage=%.2f%%",
+          "shadowIndex=%.2f MiB path=%.2f MiB cache=%.2f MiB resolved=%.2f MiB indirect=%.2f KiB total=%.2f MiB "
+          "recommendedMaxWorkingSetSize=%.2f MiB usage=%.2f%%",
           BytesToMiB(m_wavefront.activeBytes),
           BytesToMiB(m_wavefront.nextBytes),
           BytesToMiB(m_wavefront.hitBytes),
           BytesToMiB(m_wavefront.shadowBytes),
+          BytesToMiB(m_wavefront.shadowIndexBytes),
           BytesToMiB(m_wavefront.pathStateBytes),
+          BytesToMiB(m_wavefront.cacheQueryBytes + m_wavefront.cacheTrainRecordBytes),
+          BytesToMiB(m_wavefront.resolvedSurfaceBytes),
           static_cast<double>(m_wavefront.indirectDispatchArgsBytes) / 1024.0,
           BytesToMiB(m_wavefront.totalBytes),
           BytesToMiB(m_wavefront.budgetBytes),
           budgetUsagePct);
     return true;
+}
+
+uint32_t RenderLoop::encodeWavefrontMegakernelFallback(const char* reason,
+                                                      MTLCommandBufferHandle commandBuffer,
+                                                      Accumulation& accumulation,
+                                                      const Pipelines& pipelines,
+                                                      const SceneResources& scene,
+                                                      const RenderSettings& settings) {
+    if (m_loggedWavefrontMegakernelFallback != reason) {
+        m_loggedWavefrontMegakernelFallback = reason;
+        NSLog(@"[Wavefront] %s; falling back to megakernel", reason);
+    }
+    m_wavefrontMegakernelFallback = reason;
+    m_wavefrontMegakernelFallbackThisFrame = true;
+    // The wavefront's explicit ReSTIR DI stage does not run on the megakernel; encodeIntegration shades the fused
+    // direct light instead (an unbiased estimate of the same light). Say so in the log and the render metadata.
+    m_wavefrontExplicitRestirDiRanFused = m_restirDiWavefrontStageActiveThisFrame;
+    if (m_wavefrontExplicitRestirDiRanFused) {
+        // No explicit stage runs this frame: encodeIntegration must not ask ensureRestirStateResources for its
+        // reservoirs (their allocation may be what failed) or leave direct light to it.
+        m_explicitRestirDiActiveThisFrame = false;
+        m_restirDiPathStatus = "fused_megakernel_wavefront_fallback";
+        if (!m_loggedWavefrontExplicitRestirDiRanFused) {
+            m_loggedWavefrontExplicitRestirDiRanFused = true;
+            NSLog(@"[Wavefront] the explicit ReSTIR DI stage does not run on the megakernel fallback; rendering "
+                  @"the megakernel's fused direct light for this mode");
+        }
+    }
+    return encodeIntegration(commandBuffer, accumulation, pipelines, scene, settings);
 }
 
 uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
@@ -2120,7 +3007,8 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                                      const SceneResources& scene,
                                      const RenderSettings& settings) {
     const auto makeEncoder = [&](GpuTimingBucket bucket,
-                                 NSString* label) -> id<MTLComputeCommandEncoder> {
+                                 NSString* label,
+                                 const char* passName = nullptr) -> id<MTLComputeCommandEncoder> {
         id<MTLComputeCommandEncoder> encoder = nil;
         if (m_gpuTiming.active &&
             m_gpuTiming.nextSample + 2u <= m_gpuTiming.sampleCapacity &&
@@ -2133,7 +3021,13 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
             const uint32_t endSample = m_gpuTiming.nextSample++;
             attachment.startOfEncoderSampleIndex = startSample;
             attachment.endOfEncoderSampleIndex = endSample;
-            m_gpuTiming.ranges.push_back({bucket, startSample, endSample});
+            std::string timingPassName;
+            if (passName && passName[0] != '\0') {
+                timingPassName = passName;
+            } else if (label) {
+                timingPassName = std::string([label UTF8String]);
+            }
+            m_gpuTiming.ranges.push_back({bucket, timingPassName, startSample, endSample});
             encoder = [commandBuffer computeCommandEncoderWithDescriptor:passDescriptor];
         } else {
             encoder = [commandBuffer computeCommandEncoder];
@@ -2149,28 +3043,69 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
         !pipelines.wavefrontGeneratePrimary() ||
         !pipelines.wavefrontIntersect() ||
         !pipelines.wavefrontShade() ||
+        !pipelines.wavefrontShadeResolveSurface() ||
+        !pipelines.wavefrontShadeResolved() ||
+        !pipelines.wavefrontShadeIndirectProbe() ||
+        !pipelines.wavefrontShadeSurfaceProbe() ||
+        !pipelines.wavefrontShadeMetadataProbe() ||
+        !pipelines.wavefrontShadeScalarProbe() ||
+        !pipelines.wavefrontShadeClosureProbe() ||
+        !pipelines.wavefrontShadeBsdfProbe() ||
+        !pipelines.wavefrontBuildShadowIndices() ||
         !pipelines.wavefrontShadow() ||
+        !pipelines.wavefrontShadowIndexed() ||
         !pipelines.wavefrontSwapQueues() ||
+        !pipelines.wavefrontRadianceCacheTrain() ||
         !pipelines.wavefrontAccumulate()) {
-        NSLog(@"[Wavefront] required pipelines missing; falling back to megakernel");
-        return encodeIntegration(commandBuffer, accumulation, pipelines, scene, settings);
+        return encodeWavefrontMegakernelFallback("required pipelines missing", commandBuffer, accumulation,
+                                                 pipelines, scene, settings);
     }
-    if (m_explicitRestirDiActiveThisFrame && !pipelines.wavefrontRestirDiDirectLighting()) {
-        NSLog(@"[Wavefront] explicit ReSTIR DI direct-lighting pipeline missing; frame not dispatched");
-        return 0u;
+    // Test hook: takes the fallback above with every pipeline present, so the megakernel's handling of a
+    // wavefront frame can be measured.
+    static const bool forceMegakernelFallback = EnvFlagEnabled("PT_WAVEFRONT_FORCE_MEGAKERNEL_FALLBACK");
+    if (forceMegakernelFallback) {
+        return encodeWavefrontMegakernelFallback("forced by PT_WAVEFRONT_FORCE_MEGAKERNEL_FALLBACK", commandBuffer,
+                                                 accumulation, pipelines, scene, settings);
+    }
+    if (m_restirDiWavefrontStageActiveThisFrame && !pipelines.wavefrontRestirDiDirectLighting()) {
+        return encodeWavefrontMegakernelFallback("explicit ReSTIR DI direct-lighting pipeline missing", commandBuffer,
+                                                 accumulation, pipelines, scene, settings);
     }
 
     const CGSize currentSize = accumulation.currentSize();
     const uint32_t width = static_cast<uint32_t>(std::max<CGFloat>(1.0, currentSize.width));
     const uint32_t height = static_cast<uint32_t>(std::max<CGFloat>(1.0, currentSize.height));
     if (!ensureRestirStateResources(width, height, settings, commandBuffer)) {
-        NSLog(@"[Wavefront] ReSTIR state allocation failed; falling back to megakernel");
-        return encodeIntegration(commandBuffer, accumulation, pipelines, scene, settings);
+        return encodeWavefrontMegakernelFallback("ReSTIR state allocation failed", commandBuffer, accumulation,
+                                                 pipelines, scene, settings);
     }
-    if (!ensureWavefrontResources(scene, width, height)) {
-        NSLog(@"[Wavefront] queue allocation failed; falling back to megakernel");
-        return encodeIntegration(commandBuffer, accumulation, pipelines, scene, settings);
+    if (!ensureWavefrontResources(scene, settings, width, height)) {
+        return encodeWavefrontMegakernelFallback("queue allocation failed", commandBuffer, accumulation,
+                                                 pipelines, scene, settings);
     }
+    // The wavefront has no same-frame spatial reuse: under ris_spatial its fused direct light is plain RIS
+    // (shaders/wavefront/kernels.metal). Say so when that starts, and in the render metadata.
+    const bool risSpatialRanAsRis =
+        settings.directLightMode == RenderSettings::DirectLightMode::RisSpatialReuse;
+    if (risSpatialRanAsRis && !m_wavefrontRisSpatialRanAsRis) {
+        NSLog(@"[Wavefront] directLightMode=ris_spatial is not implemented on the wavefront (no same-frame spatial "
+              @"reuse); it runs plain ris. Use executionMode=megakernel for ris_spatial.");
+    }
+    m_wavefrontRisSpatialRanAsRis = risSpatialRanAsRis;
+    if (m_wavefront.cacheTrainRecordsNeedClear && m_wavefront.cacheTrainRecords) {
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        if (!blit) {
+            NSLog(@"[Wavefront] radiance cache training records not cleared; frame not dispatched");
+            return 0u;
+        }
+        blit.label = @"Wavefront Clear Radiance Cache Train Records";
+        [blit fillBuffer:m_wavefront.cacheTrainRecords
+                   range:NSMakeRange(0u, static_cast<NSUInteger>(m_wavefront.cacheTrainRecordBytes))
+                   value:0u];
+        [blit endEncoding];
+        m_wavefront.cacheTrainRecordsNeedClear = false;
+    }
+    rebuildTransportMemoryRegistry(settings);
 
     const auto& provider = scene.intersectionProvider();
     const auto& materialTextures = scene.materialTextures();
@@ -2202,6 +3137,26 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
     const bool canHardwareShadow = shadowTraversal.usesHardware;
     const uint32_t requestedSamples = std::max<uint32_t>(1u, settings.samplesPerFrame);
     const bool wavefrontCompactionEnabled = WavefrontCompactionEnabled(settings);
+    const bool guardedShadeIndirect =
+        settings.wavefrontShadeIndirectEnabled || WavefrontShadeIndirectEnabled();
+    const bool guardedShadeIndirectProbe =
+        settings.wavefrontShadeIndirectProbeEnabled || WavefrontShadeIndirectProbeEnabled();
+    const bool guardedShadeSurfaceProbe =
+        settings.wavefrontShadeSurfaceProbeEnabled || WavefrontShadeSurfaceProbeEnabled();
+    const bool guardedShadeMetadataProbe =
+        settings.wavefrontShadeMetadataProbeEnabled || WavefrontShadeMetadataProbeEnabled();
+    const bool guardedShadeScalarProbe =
+        settings.wavefrontShadeScalarProbeEnabled || WavefrontShadeScalarProbeEnabled();
+    const bool guardedShadeBsdfProbe =
+        settings.wavefrontShadeBsdfProbeEnabled || WavefrontShadeBsdfProbeEnabled();
+    const bool guardedShadeClosureProbe =
+        settings.wavefrontShadeClosureProbeEnabled || WavefrontShadeClosureProbeEnabled();
+    // Indexed shadow threads write whole PathState objects and can race when
+    // several exact points target one path. Use the existing serial per-path
+    // shadow kernel for this option; default/no-point dispatch is unchanged.
+    const bool guardedShadowIndirect =
+        (settings.wavefrontShadowIndirectEnabled || WavefrontShadowIndirectEnabled()) &&
+        !(settings.referencePointExactNee && scene.zeroRadiusReferencePointLightCount() > 0u);
     uint32_t samplesThisFrame = requestedSamples;
     if (!canHardwareIntersect) {
         samplesThisFrame = 1u;
@@ -2215,7 +3170,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
             return false;
         }
         id<MTLComputeCommandEncoder> encoder =
-            makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Build Dispatch Args");
+            makeEncoder(GpuTimingBucket::ShadowQueue,
+                        @"Wavefront Build Dispatch Args",
+                        "Wavefront Prepare Intersections");
         [encoder setComputePipelineState:pipelines.wavefrontBuildDispatchArgs()];
         uint32_t args[2] = {
             queueType,
@@ -2256,6 +3213,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
             settings, accumulation, scene, accumulation.currentSize());
         uniforms.explicitRestirDiLightingStage =
             m_explicitRestirDiActiveThisFrame ? 1u : 0u;
+        if (m_explicitRestirDiActiveThisFrame && !m_restirDiWavefrontStageActiveThisFrame) {
+            uniforms.emissivePrimitiveCount = 0u;
+        }
         uniforms.executionMode =
             static_cast<uint32_t>(PathTracerShaderTypes::RenderExecutionMode::Wavefront);
         uniforms.intersectionMode = static_cast<uint32_t>(
@@ -2269,8 +3229,15 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                                   length:sizeof(PathtraceUniforms)
                                  options:MTLResourceStorageModeShared];
         if (!sampleUniformBuffer) {
-            NSLog(@"[Wavefront] per-sample uniform allocation failed; falling back to megakernel");
-            return encodeIntegration(commandBuffer, accumulation, pipelines, scene, settings);
+            if (sample == 0u) {
+                return encodeWavefrontMegakernelFallback("per-sample uniform allocation failed", commandBuffer,
+                                                         accumulation, pipelines, scene, settings);
+            }
+            // Samples 0..sample-1 are fully encoded (each ends with its accumulate dispatch); handing the whole
+            // frame to the megakernel now would render them twice.
+            NSLog(@"[Wavefront] per-sample uniform allocation failed after %u of %u samples; the frame ends early",
+                  sample, samplesThisFrame);
+            return sample;
         }
         [sampleUniformBuffers addObject:sampleUniformBuffer];
 
@@ -2279,7 +3246,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
 
         {
             id<MTLComputeCommandEncoder> encoder =
-                makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Reset");
+                makeEncoder(GpuTimingBucket::ShadowQueue,
+                            @"Wavefront Reset",
+                            "Wavefront Reset Queues");
             [encoder setComputePipelineState:pipelines.wavefrontReset()];
             [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
             [encoder setBuffer:m_wavefront.activeRays[0] offset:0 atIndex:1];
@@ -2296,7 +3265,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
 
         {
             id<MTLComputeCommandEncoder> encoder =
-                makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Generate Primary");
+                makeEncoder(GpuTimingBucket::ShadowQueue,
+                            @"Wavefront Generate Primary",
+                            "Wavefront Generate Primary");
             [encoder setComputePipelineState:pipelines.wavefrontGeneratePrimary()];
             [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
             [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
@@ -2313,7 +3284,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
         for (uint32_t depth = 0; depth < std::max<uint32_t>(1u, settings.maxDepth); ++depth) {
             {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Prepare Iteration");
+                    makeEncoder(GpuTimingBucket::ShadowQueue,
+                                @"Wavefront Prepare Iteration",
+                                "Wavefront Prepare Intersections");
                 [encoder setComputePipelineState:pipelines.wavefrontPrepareIteration()];
                 [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:0];
                 [encoder setBuffer:m_statsBuffer offset:0 atIndex:1];
@@ -2327,7 +3300,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
 
             if (wavefrontCompactionEnabled) {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::Compaction, @"Wavefront Compact Queue");
+                    makeEncoder(GpuTimingBucket::Compaction,
+                                @"Wavefront Compact Queue",
+                                "Wavefront Compact Queue");
                 [encoder setComputePipelineState:pipelines.wavefrontCompactQueue()];
                 [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:0];
                 [encoder setBuffer:m_statsBuffer offset:0 atIndex:1];
@@ -2346,9 +3321,60 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                     static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
                     intersectThreadsPerThreadgroup);
 
+            auto bindIntersectionAlphaResources = [&](id<MTLComputeCommandEncoder> encoder) {
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder && argumentEncoder.encodedLength > 0u) {
+                    const NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (!m_materialResourcesArgumentBuffer ||
+                        m_materialResourcesArgumentBuffer.length < encodedLength) {
+                        m_materialResourcesArgumentBuffer =
+                            [m_device newBufferWithLength:encodedLength
+                                                 options:MTLResourceStorageModeShared];
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                        }
+                    }
+                    if (m_materialResourcesArgumentBuffer) {
+                        [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                        if (!materialTextures.empty()) {
+                            const NSUInteger textureCount =
+                                std::min<NSUInteger>(materialTextures.size(),
+                                                     PathTracerShaderTypes::kMaxMaterialTextures);
+                            [argumentEncoder setTextures:materialTextures.data()
+                                               withRange:NSMakeRange(0, textureCount)];
+                        }
+                        if (!materialSamplers.empty()) {
+                            const NSUInteger samplerCount =
+                                std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                            [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                    withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                          samplerCount)];
+                        }
+                    }
+                }
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:18];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0 atIndex:19];
+                [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                    if (m_materialResourcesArgumentBuffer) {
+                        [encoder useResource:m_materialResourcesArgumentBuffer usage:MTLResourceUsageRead];
+                    }
+                    if (!SkipTextureUseResources()) {
+                        for (id<MTLTexture> texture : materialTextures) {
+                            if (texture) {
+                                [encoder useResource:texture usage:MTLResourceUsageRead];
+                            }
+                        }
+                    }
+                }
+            };
+
             if (canHardwareIntersect) {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::Intersect, @"Wavefront Intersect (HW)");
+                    makeEncoder(GpuTimingBucket::Intersect,
+                                @"Wavefront Intersect (HW)",
+                                "Wavefront Intersect");
                 [encoder setComputePipelineState:pipelines.wavefrontIntersectHardware()];
                 if ([encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {
                     [encoder setAccelerationStructure:provider.hardware.tlas atBufferIndex:1];
@@ -2387,11 +3413,14 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder setBuffer:BufferOrDummy(provider.software.primitiveIndices, m_dummyBuffer) offset:0 atIndex:12];
                 [encoder setBuffer:BufferOrDummy(m_statsBuffer, m_dummyBuffer) offset:0 atIndex:13];
                 [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:14];
+                bindIntersectionAlphaResources(encoder);
                 dispatchWavefrontStage(encoder, intersectThreadsPerThreadgroup, useIndirectIntersect);
                 [encoder endEncoding];
             } else {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::Intersect, @"Wavefront Intersect");
+                    makeEncoder(GpuTimingBucket::Intersect,
+                                @"Wavefront Intersect",
+                                "Wavefront Intersect");
                 [encoder setComputePipelineState:pipelines.wavefrontIntersect()];
                 [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
                 [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
@@ -2411,17 +3440,21 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
                 [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
                 [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:17];
+                bindIntersectionAlphaResources(encoder);
                 dispatchWavefrontStage(encoder, intersectThreadsPerThreadgroup, useIndirectIntersect);
                 [encoder endEncoding];
             }
 
-            if (m_explicitRestirDiActiveThisFrame) {
+            if (m_restirDiWavefrontStageActiveThisFrame) {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::Shade, @"Wavefront ReSTIR DI Direct Lighting");
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront ReSTIR DI Direct Lighting",
+                                "Wavefront ReSTIR DI Direct Lighting");
                 [encoder setComputePipelineState:pipelines.wavefrontRestirDiDirectLighting()];
-                if ([encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {
-                    [encoder setAccelerationStructure:(canHardwareIntersect ? provider.hardware.tlas : nil)
-                                        atBufferIndex:18];
+                if (canHardwareIntersect &&
+                    provider.hardware.tlas &&
+                    [encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {
+                    [encoder setAccelerationStructure:provider.hardware.tlas atBufferIndex:18];
                 }
                 if (canHardwareIntersect &&
                     [encoder respondsToSelector:@selector(useResource:usage:)]) {
@@ -2482,8 +3515,40 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                             [argumentEncoder setBuffer:BufferOrDummy(m_restirState.radianceCache, m_dummyBuffer)
                                                 offset:0
                                                atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheStateIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(m_wavefront.cacheQueryItems, m_dummyBuffer)
+                                                offset:0
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheQueryItemIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(m_wavefront.cacheTrainRecords, m_dummyBuffer)
+                                                offset:0
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheTrainRecordIndex];
+                            MTLBufferHandle causticTransport =
+                                m_transportAllocator.bufferForName("CausticTransport.PathSpacePrototype");
+                            const NSUInteger causticVertexCount =
+                                causticTransport ? static_cast<NSUInteger>(m_restirState.causticMaxVertices) : 0u;
+                            const NSUInteger causticLightOffset =
+                                causticVertexCount * sizeof(PathTracerShaderTypes::EyeSubpathVertex);
+                            const NSUInteger causticConnectionOffset =
+                                causticLightOffset +
+                                causticVertexCount * sizeof(PathTracerShaderTypes::LightSubpathVertex);
+                            const NSUInteger causticResultOffset =
+                                causticConnectionOffset +
+                                causticVertexCount * sizeof(PathTracerShaderTypes::PathConnection);
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:0
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticEyeVertexIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:(causticTransport ? causticLightOffset : 0u)
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticLightVertexIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:(causticTransport ? causticConnectionOffset : 0u)
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticConnectionIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:(causticTransport ? causticResultOffset : 0u)
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticConnectionResultIndex];
                             [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
                             if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
                                 if (m_restirState.pathGuiding) {
                                     [encoder useResource:m_restirState.pathGuiding
                                                    usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
@@ -2494,6 +3559,18 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                                 }
                                 if (m_restirState.radianceCache) {
                                     [encoder useResource:m_restirState.radianceCache
+                                                   usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                                }
+                                if (m_wavefront.cacheQueryItems) {
+                                    [encoder useResource:m_wavefront.cacheQueryItems
+                                                   usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                                }
+                                if (m_wavefront.cacheTrainRecords) {
+                                    [encoder useResource:m_wavefront.cacheTrainRecords
+                                                   usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                                }
+                                if (causticTransport) {
+                                    [encoder useResource:causticTransport
                                                    usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
                                 }
                             }
@@ -2566,13 +3643,492 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder endEncoding];
             }
 
-            {
+            const MTLSize shadeThreadsPerThreadgroup =
+                PreferredLinearThreadgroupSize(pipelines.wavefrontShade());
+            const MTLSize shadeResolveSurfaceThreadsPerThreadgroup =
+                PreferredLinearThreadgroupSize(pipelines.wavefrontShadeResolveSurface());
+            const MTLSize shadeResolvedThreadsPerThreadgroup =
+                PreferredLinearThreadgroupSize(pipelines.wavefrontShadeResolved());
+            const bool useIndirectShadeProbe =
+                guardedShadeIndirectProbe &&
+                encodeWavefrontDispatchArgs(
+                    static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                    shadeThreadsPerThreadgroup);
+            const bool useIndirectShadeSurfaceProbe =
+                guardedShadeSurfaceProbe &&
+                encodeWavefrontDispatchArgs(
+                    static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                    shadeThreadsPerThreadgroup);
+            const bool useIndirectShadeMetadataProbe =
+                guardedShadeMetadataProbe &&
+                encodeWavefrontDispatchArgs(
+                    static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                    shadeThreadsPerThreadgroup);
+            const bool useIndirectShadeScalarProbe =
+                guardedShadeScalarProbe &&
+                encodeWavefrontDispatchArgs(
+                    static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                    shadeThreadsPerThreadgroup);
+            const bool useIndirectShadeBsdfProbe =
+                guardedShadeBsdfProbe &&
+                encodeWavefrontDispatchArgs(
+                    static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                    shadeThreadsPerThreadgroup);
+            const bool useIndirectShadeClosureProbe =
+                guardedShadeClosureProbe &&
+                encodeWavefrontDispatchArgs(
+                    static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                    shadeThreadsPerThreadgroup);
+            const bool useIndirectShade =
+                guardedShadeIndirect && m_wavefront.resolvedSurfaces != nil;
+
+            if (useIndirectShadeProbe) {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::Shade, @"Wavefront Shade");
-                [encoder setComputePipelineState:pipelines.wavefrontShade()];
-                if ([encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {
-                    [encoder setAccelerationStructure:(canHardwareIntersect ? provider.hardware.tlas : nil)
-                                        atBufferIndex:18];
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade Indirect Probe",
+                                "Wavefront Shade");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeIndirectProbe()];
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                dispatchWavefrontStage(encoder, shadeThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            if (useIndirectShadeSurfaceProbe) {
+                id<MTLComputeCommandEncoder> encoder =
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade Surface Probe",
+                                "Wavefront Shade");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeSurfaceProbe()];
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder) {
+                    NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (encodedLength > 0u) {
+                        if (!m_materialResourcesArgumentBuffer ||
+                            m_materialResourcesArgumentBuffer.length < encodedLength) {
+                            m_materialResourcesArgumentBuffer =
+                                [m_device newBufferWithLength:encodedLength
+                                                      options:MTLResourceStorageModeShared];
+                        }
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                            [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                            if (!materialTextures.empty()) {
+                                NSUInteger textureCount =
+                                    std::min<NSUInteger>(materialTextures.size(),
+                                                         PathTracerShaderTypes::kMaxMaterialTextures);
+                                [argumentEncoder setTextures:materialTextures.data()
+                                                   withRange:NSMakeRange(0, textureCount)];
+                            }
+                            if (!materialSamplers.empty()) {
+                                NSUInteger samplerCount =
+                                    std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                                [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                        withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                              samplerCount)];
+                            }
+                            [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                            if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
+                            }
+                            if (!SkipTextureUseResources() &&
+                                [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                for (id<MTLTexture> texture : materialTextures) {
+                                    if (texture) {
+                                        [encoder useResource:texture usage:MTLResourceUsageRead];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    [encoder setBuffer:nil offset:0 atIndex:23];
+                }
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:8];
+                [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
+                [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
+                [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0
+                          atIndex:17];
+                dispatchWavefrontStage(encoder, shadeThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            if (useIndirectShadeMetadataProbe) {
+                id<MTLComputeCommandEncoder> encoder =
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade Metadata Probe",
+                                "Wavefront Shade");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeMetadataProbe()];
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder) {
+                    NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (encodedLength > 0u) {
+                        if (!m_materialResourcesArgumentBuffer ||
+                            m_materialResourcesArgumentBuffer.length < encodedLength) {
+                            m_materialResourcesArgumentBuffer =
+                                [m_device newBufferWithLength:encodedLength
+                                                      options:MTLResourceStorageModeShared];
+                        }
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                            [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                            if (!materialTextures.empty()) {
+                                NSUInteger textureCount =
+                                    std::min<NSUInteger>(materialTextures.size(),
+                                                         PathTracerShaderTypes::kMaxMaterialTextures);
+                                [argumentEncoder setTextures:materialTextures.data()
+                                                   withRange:NSMakeRange(0, textureCount)];
+                            }
+                            if (!materialSamplers.empty()) {
+                                NSUInteger samplerCount =
+                                    std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                                [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                        withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                              samplerCount)];
+                            }
+                            [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                            if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
+                            }
+                            if (!SkipTextureUseResources() &&
+                                [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                for (id<MTLTexture> texture : materialTextures) {
+                                    if (texture) {
+                                        [encoder useResource:texture usage:MTLResourceUsageRead];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    [encoder setBuffer:nil offset:0 atIndex:23];
+                }
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:8];
+                [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
+                [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
+                [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0
+                          atIndex:17];
+                dispatchWavefrontStage(encoder, shadeThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            if (useIndirectShadeScalarProbe) {
+                id<MTLComputeCommandEncoder> encoder =
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade Scalar Probe",
+                                "Wavefront Shade");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeScalarProbe()];
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder) {
+                    NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (encodedLength > 0u) {
+                        if (!m_materialResourcesArgumentBuffer ||
+                            m_materialResourcesArgumentBuffer.length < encodedLength) {
+                            m_materialResourcesArgumentBuffer =
+                                [m_device newBufferWithLength:encodedLength
+                                                      options:MTLResourceStorageModeShared];
+                        }
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                            [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                            if (!materialTextures.empty()) {
+                                NSUInteger textureCount =
+                                    std::min<NSUInteger>(materialTextures.size(),
+                                                         PathTracerShaderTypes::kMaxMaterialTextures);
+                                [argumentEncoder setTextures:materialTextures.data()
+                                                   withRange:NSMakeRange(0, textureCount)];
+                            }
+                            if (!materialSamplers.empty()) {
+                                NSUInteger samplerCount =
+                                    std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                                [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                        withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                              samplerCount)];
+                            }
+                            [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                            if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
+                            }
+                            if (!SkipTextureUseResources() &&
+                                [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                for (id<MTLTexture> texture : materialTextures) {
+                                    if (texture) {
+                                        [encoder useResource:texture usage:MTLResourceUsageRead];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    [encoder setBuffer:nil offset:0 atIndex:23];
+                }
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:8];
+                [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
+                [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
+                [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0
+                          atIndex:17];
+                dispatchWavefrontStage(encoder, shadeThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            if (useIndirectShadeBsdfProbe) {
+                id<MTLComputeCommandEncoder> encoder =
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade BSDF Probe",
+                                "Wavefront Shade");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeBsdfProbe()];
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder) {
+                    NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (encodedLength > 0u) {
+                        if (!m_materialResourcesArgumentBuffer ||
+                            m_materialResourcesArgumentBuffer.length < encodedLength) {
+                            m_materialResourcesArgumentBuffer =
+                                [m_device newBufferWithLength:encodedLength
+                                                      options:MTLResourceStorageModeShared];
+                        }
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                            [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                            if (!materialTextures.empty()) {
+                                NSUInteger textureCount =
+                                    std::min<NSUInteger>(materialTextures.size(),
+                                                         PathTracerShaderTypes::kMaxMaterialTextures);
+                                [argumentEncoder setTextures:materialTextures.data()
+                                                   withRange:NSMakeRange(0, textureCount)];
+                            }
+                            if (!materialSamplers.empty()) {
+                                NSUInteger samplerCount =
+                                    std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                                [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                        withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                              samplerCount)];
+                            }
+                            [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                            if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
+                            }
+                            if (!SkipTextureUseResources() &&
+                                [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                for (id<MTLTexture> texture : materialTextures) {
+                                    if (texture) {
+                                        [encoder useResource:texture usage:MTLResourceUsageRead];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    [encoder setBuffer:nil offset:0 atIndex:23];
+                }
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:8];
+                [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
+                [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
+                [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0
+                          atIndex:17];
+                dispatchWavefrontStage(encoder, shadeThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            if (useIndirectShadeClosureProbe) {
+                id<MTLComputeCommandEncoder> encoder =
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade Closure Probe",
+                                "Wavefront Shade");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeClosureProbe()];
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder) {
+                    NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (encodedLength > 0u) {
+                        if (!m_materialResourcesArgumentBuffer ||
+                            m_materialResourcesArgumentBuffer.length < encodedLength) {
+                            m_materialResourcesArgumentBuffer =
+                                [m_device newBufferWithLength:encodedLength
+                                                      options:MTLResourceStorageModeShared];
+                        }
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                            [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                            if (!materialTextures.empty()) {
+                                NSUInteger textureCount =
+                                    std::min<NSUInteger>(materialTextures.size(),
+                                                         PathTracerShaderTypes::kMaxMaterialTextures);
+                                [argumentEncoder setTextures:materialTextures.data()
+                                                   withRange:NSMakeRange(0, textureCount)];
+                            }
+                            if (!materialSamplers.empty()) {
+                                NSUInteger samplerCount =
+                                    std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                                [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                        withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                              samplerCount)];
+                            }
+                            [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                            if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
+                            }
+                            if (!SkipTextureUseResources() &&
+                                [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                for (id<MTLTexture> texture : materialTextures) {
+                                    if (texture) {
+                                        [encoder useResource:texture usage:MTLResourceUsageRead];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    [encoder setBuffer:nil offset:0 atIndex:23];
+                }
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:8];
+                [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
+                [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
+                [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0
+                          atIndex:17];
+                dispatchWavefrontStage(encoder, shadeThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            if (useIndirectShade) {
+                if (!encodeWavefrontDispatchArgs(
+                        static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                        shadeResolveSurfaceThreadsPerThreadgroup)) {
+                    NSLog(@"[Wavefront] guarded shade indirect requested but resolver dispatch args unavailable");
+                    return sample;
+                }
+                id<MTLComputeCommandEncoder> encoder =
+                    makeEncoder(GpuTimingBucket::Shade,
+                                @"Wavefront Shade Resolve Surface",
+                                "Wavefront Shade Resolve Surface");
+                [encoder setComputePipelineState:pipelines.wavefrontShadeResolveSurface()];
+                if (auto argumentEncoder = pipelines.materialResourcesArgumentEncoder();
+                    argumentEncoder) {
+                    NSUInteger encodedLength = argumentEncoder.encodedLength;
+                    if (encodedLength > 0u) {
+                        if (!m_materialResourcesArgumentBuffer ||
+                            m_materialResourcesArgumentBuffer.length < encodedLength) {
+                            m_materialResourcesArgumentBuffer =
+                                [m_device newBufferWithLength:encodedLength
+                                                      options:MTLResourceStorageModeShared];
+                        }
+                        if (m_materialResourcesArgumentBuffer) {
+                            std::memset([m_materialResourcesArgumentBuffer contents], 0, encodedLength);
+                            [argumentEncoder setArgumentBuffer:m_materialResourcesArgumentBuffer offset:0];
+                            if (!materialTextures.empty()) {
+                                NSUInteger textureCount =
+                                    std::min<NSUInteger>(materialTextures.size(),
+                                                         PathTracerShaderTypes::kMaxMaterialTextures);
+                                [argumentEncoder setTextures:materialTextures.data()
+                                                   withRange:NSMakeRange(0, textureCount)];
+                            }
+                            if (!materialSamplers.empty()) {
+                                NSUInteger samplerCount =
+                                    std::min<NSUInteger>(materialSamplers.size(), kMaxMaterialSamplers);
+                                [argumentEncoder setSamplerStates:materialSamplers.data()
+                                                        withRange:NSMakeRange(PathTracerShaderTypes::kMaxMaterialTextures,
+                                                                              samplerCount)];
+                            }
+                            [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                            if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
+                            }
+                            if (!SkipTextureUseResources() &&
+                                [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                for (id<MTLTexture> texture : materialTextures) {
+                                    if (texture) {
+                                        [encoder useResource:texture usage:MTLResourceUsageRead];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    [encoder setBuffer:nil offset:0 atIndex:23];
+                }
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                [encoder setBuffer:m_wavefront.activeRays[currentQueueIndex] offset:0 atIndex:1];
+                [encoder setBuffer:m_wavefront.hitRecords offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:5];
+                [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:6];
+                [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:8];
+                [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
+                [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
+                [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0
+                          atIndex:17];
+                [encoder setBuffer:m_wavefront.resolvedSurfaces offset:0 atIndex:30];
+                if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                    [encoder useResource:m_wavefront.resolvedSurfaces usage:MTLResourceUsageWrite];
+                }
+                dispatchWavefrontStage(encoder, shadeResolveSurfaceThreadsPerThreadgroup, true);
+                [encoder endEncoding];
+            }
+
+            {
+                const bool useResolvedShade = useIndirectShade;
+                if (useResolvedShade &&
+                    !encodeWavefrontDispatchArgs(
+                        static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::PrimaryRay),
+                        shadeResolvedThreadsPerThreadgroup)) {
+                    NSLog(@"[Wavefront] guarded shade indirect requested but continuation dispatch args unavailable");
+                    return sample;
+                }
+                id<MTLComputeCommandEncoder> encoder =
+                makeEncoder(GpuTimingBucket::Shade,
+                            useResolvedShade ? @"Wavefront Shade Resolved" : @"Wavefront Shade",
+                            "Wavefront Shade");
+                [encoder setComputePipelineState:(useResolvedShade
+                                                      ? pipelines.wavefrontShadeResolved()
+                                                      : pipelines.wavefrontShade())];
+                if (canHardwareIntersect &&
+                    provider.hardware.tlas &&
+                    [encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {
+                    [encoder setAccelerationStructure:provider.hardware.tlas atBufferIndex:18];
                 }
                 if (canHardwareIntersect &&
                     [encoder respondsToSelector:@selector(useResource:usage:)]) {
@@ -2633,8 +4189,40 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                             [argumentEncoder setBuffer:BufferOrDummy(m_restirState.radianceCache, m_dummyBuffer)
                                                 offset:0
                                                atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheStateIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(m_wavefront.cacheQueryItems, m_dummyBuffer)
+                                                offset:0
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheQueryItemIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(m_wavefront.cacheTrainRecords, m_dummyBuffer)
+                                                offset:0
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceRadianceCacheTrainRecordIndex];
+                            MTLBufferHandle causticTransport =
+                                m_transportAllocator.bufferForName("CausticTransport.PathSpacePrototype");
+                            const NSUInteger causticVertexCount =
+                                causticTransport ? static_cast<NSUInteger>(m_restirState.causticMaxVertices) : 0u;
+                            const NSUInteger causticLightOffset =
+                                causticVertexCount * sizeof(PathTracerShaderTypes::EyeSubpathVertex);
+                            const NSUInteger causticConnectionOffset =
+                                causticLightOffset +
+                                causticVertexCount * sizeof(PathTracerShaderTypes::LightSubpathVertex);
+                            const NSUInteger causticResultOffset =
+                                causticConnectionOffset +
+                                causticVertexCount * sizeof(PathTracerShaderTypes::PathConnection);
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:0
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticEyeVertexIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:(causticTransport ? causticLightOffset : 0u)
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticLightVertexIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:(causticTransport ? causticConnectionOffset : 0u)
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticConnectionIndex];
+                            [argumentEncoder setBuffer:BufferOrDummy(causticTransport, m_dummyBuffer)
+                                                offset:(causticTransport ? causticResultOffset : 0u)
+                                               atIndex:PathTracerShaderTypes::kMaterialResourceCausticConnectionResultIndex];
                             [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
                             if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                                [encoder useResource:m_materialResourcesArgumentBuffer
+                                               usage:MTLResourceUsageRead];
                                 if (m_restirState.pathGuiding) {
                                     [encoder useResource:m_restirState.pathGuiding
                                                    usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
@@ -2645,6 +4233,18 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                                 }
                                 if (m_restirState.radianceCache) {
                                     [encoder useResource:m_restirState.radianceCache
+                                                   usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                                }
+                                if (m_wavefront.cacheQueryItems) {
+                                    [encoder useResource:m_wavefront.cacheQueryItems
+                                                   usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                                }
+                                if (m_wavefront.cacheTrainRecords) {
+                                    [encoder useResource:m_wavefront.cacheTrainRecords
+                                                   usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+                                }
+                                if (causticTransport) {
+                                    [encoder useResource:causticTransport
                                                    usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
                                 }
                             }
@@ -2685,7 +4285,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:14];
                 [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:15];
                 [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:16];
-                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                [encoder setBuffer:(useResolvedShade
+                                        ? m_wavefront.resolvedSurfaces
+                                        : BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer))
                            offset:0
                           atIndex:17];
                 [encoder setBuffer:BufferOrDummy(scene.sphereBuffer(), m_dummyBuffer) offset:0 atIndex:19];
@@ -2711,16 +4313,82 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder setBuffer:BufferOrDummy(scene.emissivePrimitivesBuffer(), m_dummyBuffer)
                            offset:0
                           atIndex:30];
-                const MTLSize threadsPerThreadgroup =
-                    PreferredLinearThreadgroupSize(pipelines.wavefrontShade());
-                [encoder dispatchThreads:fullGrid threadsPerThreadgroup:threadsPerThreadgroup];
+                if (useResolvedShade && [encoder respondsToSelector:@selector(useResource:usage:)]) {
+                    [encoder useResource:m_wavefront.resolvedSurfaces usage:MTLResourceUsageRead];
+                }
+                dispatchWavefrontStage(encoder,
+                                       useResolvedShade
+                                           ? shadeResolvedThreadsPerThreadgroup
+                                           : shadeThreadsPerThreadgroup,
+                                       useResolvedShade);
                 [encoder endEncoding];
+            }
+
+            bool useIndirectShadow = false;
+            // Reuse the material resources already encoded for this shade pass.
+            auto bindShadowAlphaResources = [&](id<MTLComputeCommandEncoder> encoder, bool hardware) {
+                [encoder setBuffer:m_materialResourcesArgumentBuffer offset:0 atIndex:23];
+                if (m_wavefront.cacheTrainRecords) {
+                    // The shadow kernels add each training vertex's NEE to its record.
+                    [encoder useResource:m_wavefront.cacheTrainRecords
+                                   usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                }
+                [encoder setBuffer:BufferOrDummy(scene.materialTextureInfoBuffer(), m_dummyBuffer)
+                           offset:0 atIndex:24];
+                if (!hardware) {
+                    [encoder setBuffer:BufferOrDummy(scene.meshInfoBuffer(), m_dummyBuffer) offset:0 atIndex:19];
+                    [encoder setBuffer:BufferOrDummy(scene.meshVertexBuffer(), m_dummyBuffer) offset:0 atIndex:20];
+                    [encoder setBuffer:BufferOrDummy(scene.meshIndexBuffer(), m_dummyBuffer) offset:0 atIndex:21];
+                }
+                if ([encoder respondsToSelector:@selector(useResource:usage:)]) {
+                    if (m_materialResourcesArgumentBuffer) {
+                        [encoder useResource:m_materialResourcesArgumentBuffer usage:MTLResourceUsageRead];
+                    }
+                    if (!SkipTextureUseResources()) {
+                        for (id<MTLTexture> texture : materialTextures) {
+                            if (texture) [encoder useResource:texture usage:MTLResourceUsageRead];
+                        }
+                    }
+                }
+            };
+            const MTLSize shadowThreadsPerThreadgroup =
+                PreferredLinearThreadgroupSize(canHardwareShadow
+                                                   ? (guardedShadowIndirect
+                                                          ? pipelines.wavefrontShadowIndexedHardware()
+                                                          : pipelines.wavefrontShadowHardware())
+                                                   : (guardedShadowIndirect
+                                                          ? pipelines.wavefrontShadowIndexed()
+                                                          : pipelines.wavefrontShadow()));
+            if (guardedShadowIndirect) {
+                {
+                    id<MTLComputeCommandEncoder> encoder =
+                        makeEncoder(GpuTimingBucket::ShadowQueue,
+                                    @"Wavefront Build Shadow Indices",
+                                    "Wavefront Shadow");
+                    [encoder setComputePipelineState:pipelines.wavefrontBuildShadowIndices()];
+                    [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+                    [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:1];
+                    [encoder setBuffer:m_wavefront.shadowIndices offset:0 atIndex:2];
+                    [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:3];
+                    const MTLSize threadsPerThreadgroup =
+                        PreferredLinearThreadgroupSize(pipelines.wavefrontBuildShadowIndices());
+                    [encoder dispatchThreads:fullGrid threadsPerThreadgroup:threadsPerThreadgroup];
+                    [encoder endEncoding];
+                }
+                useIndirectShadow =
+                    encodeWavefrontDispatchArgs(
+                        static_cast<uint32_t>(PathTracerShaderTypes::WavefrontQueueType::ShadowRay),
+                        shadowThreadsPerThreadgroup);
             }
 
             if (canHardwareShadow) {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Shadow (HW)");
-                [encoder setComputePipelineState:pipelines.wavefrontShadowHardware()];
+                    makeEncoder(GpuTimingBucket::ShadowQueue,
+                                @"Wavefront Shadow (HW)",
+                                "Wavefront Shadow");
+                [encoder setComputePipelineState:guardedShadowIndirect
+                                                  ? pipelines.wavefrontShadowIndexedHardware()
+                                                  : pipelines.wavefrontShadowHardware()];
                 if ([encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {
                     [encoder setAccelerationStructure:provider.hardware.tlas atBufferIndex:1];
                 }
@@ -2771,14 +4439,20 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder setBuffer:BufferOrDummy(provider.software.instanceInfoBuffer, m_dummyBuffer)
                            offset:0
                           atIndex:20];
-                const MTLSize threadsPerThreadgroup =
-                    PreferredLinearThreadgroupSize(pipelines.wavefrontShadowHardware());
-                [encoder dispatchThreads:fullGrid threadsPerThreadgroup:threadsPerThreadgroup];
+                if (guardedShadowIndirect) {
+                    [encoder setBuffer:m_wavefront.shadowIndices offset:0 atIndex:21];
+                }
+                bindShadowAlphaResources(encoder, true);
+                dispatchWavefrontStage(encoder, shadowThreadsPerThreadgroup, useIndirectShadow);
                 [encoder endEncoding];
             } else {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Shadow");
-                [encoder setComputePipelineState:pipelines.wavefrontShadow()];
+                    makeEncoder(GpuTimingBucket::ShadowQueue,
+                                @"Wavefront Shadow",
+                                "Wavefront Shadow");
+                [encoder setComputePipelineState:guardedShadowIndirect
+                                                  ? pipelines.wavefrontShadowIndexed()
+                                                  : pipelines.wavefrontShadow()];
                 [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
                 [encoder setTexture:scene.environmentTexture() atIndex:0];
                 [encoder setBuffer:m_wavefront.shadowRays offset:0 atIndex:1];
@@ -2796,18 +4470,24 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder setBuffer:BufferOrDummy(provider.software.nodes, m_dummyBuffer) offset:0 atIndex:13];
                 [encoder setBuffer:BufferOrDummy(provider.software.primitiveIndices, m_dummyBuffer) offset:0 atIndex:14];
                 [encoder setBuffer:BufferOrDummy(scene.materialBuffer(), m_dummyBuffer) offset:0 atIndex:15];
-                const MTLSize threadsPerThreadgroup =
-                    PreferredLinearThreadgroupSize(pipelines.wavefrontShadow());
-                [encoder dispatchThreads:fullGrid threadsPerThreadgroup:threadsPerThreadgroup];
+                if (guardedShadowIndirect) {
+                    [encoder setBuffer:m_wavefront.shadowIndices offset:0 atIndex:16];
+                }
+                bindShadowAlphaResources(encoder, false);
+                dispatchWavefrontStage(encoder, shadowThreadsPerThreadgroup, useIndirectShadow);
                 [encoder endEncoding];
             }
 
             {
                 id<MTLComputeCommandEncoder> encoder =
-                    makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Swap Queues");
+                    makeEncoder(GpuTimingBucket::ShadowQueue,
+                                @"Wavefront Swap Queues",
+                                "Wavefront Swap Queues");
                 [encoder setComputePipelineState:pipelines.wavefrontSwapQueues()];
                 [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:0];
                 [encoder setBuffer:BufferOrDummy(m_statsBuffer, m_dummyBuffer) offset:0 atIndex:1];
+                [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:2];
+                [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:3];
                 [encoder dispatchThreads:resetThreads threadsPerThreadgroup:resetThreads];
                 [encoder endEncoding];
             }
@@ -2815,9 +4495,32 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
             std::swap(currentQueueIndex, nextQueueIndex);
         }
 
+        if (m_wavefront.cacheTrainRecords && m_restirState.radianceCache) {
+            // Every shadow ray has resolved: train the radiance cache from this sample's training paths.
+            id<MTLComputeCommandEncoder> encoder =
+                makeEncoder(GpuTimingBucket::ShadowQueue,
+                            @"Wavefront Radiance Cache Train",
+                            "Wavefront Radiance Cache Train");
+            [encoder setComputePipelineState:pipelines.wavefrontRadianceCacheTrain()];
+            [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
+            [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:1];
+            [encoder setBuffer:m_restirState.radianceCache offset:0 atIndex:2];
+            [encoder setBuffer:m_wavefront.cacheTrainRecords offset:0 atIndex:3];
+            [encoder setBuffer:BufferOrDummy(m_statsBuffer, m_dummyBuffer) offset:0 atIndex:4];
+            const NSUInteger groups =
+                (static_cast<NSUInteger>(m_wavefront.capacity) + PathTracerShaderTypes::kRadianceCacheTrainingPathStride - 1u) /
+                PathTracerShaderTypes::kRadianceCacheTrainingPathStride;
+            const MTLSize threadsPerThreadgroup =
+                PreferredLinearThreadgroupSize(pipelines.wavefrontRadianceCacheTrain());
+            [encoder dispatchThreads:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:threadsPerThreadgroup];
+            [encoder endEncoding];
+        }
+
         {
             id<MTLComputeCommandEncoder> encoder =
-                makeEncoder(GpuTimingBucket::ShadowQueue, @"Wavefront Accumulate");
+                makeEncoder(GpuTimingBucket::ShadowQueue,
+                            @"Wavefront Accumulate",
+                            "Wavefront Accumulate");
             [encoder setComputePipelineState:pipelines.wavefrontAccumulate()];
             [encoder setTexture:accumulation.radianceSum() atIndex:0];
             [encoder setTexture:accumulation.sampleCountTexture() atIndex:1];
@@ -2826,6 +4529,10 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
             [encoder setTexture:accumulation.positionBuffer() atIndex:4];
             [encoder setTexture:accumulation.materialFeatureBuffer() atIndex:5];
             [encoder setTexture:accumulation.motionVectorBuffer() atIndex:6];
+            [encoder setTexture:accumulation.directRadianceSum() atIndex:7];
+            [encoder setTexture:accumulation.indirectRadianceSum() atIndex:8];
+            [encoder setTexture:accumulation.radianceMomentSum() atIndex:9];
+            [encoder setTexture:accumulation.reconstructionMetricBuffer() atIndex:10];
             [encoder setBuffer:sampleUniformBuffer offset:0 atIndex:0];
             [encoder setBuffer:m_wavefront.pathStates offset:0 atIndex:1];
             [encoder setBuffer:m_wavefront.queueCounters offset:0 atIndex:2];
@@ -2839,6 +4546,9 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
         accumulation.incrementFrame();
     }
 
+    // The wavefront rendered this frame, so a fallback that comes back later is logged again.
+    m_loggedWavefrontMegakernelFallback = nullptr;
+    m_loggedWavefrontExplicitRestirDiRanFused = false;
     return samplesThisFrame;
 }
 
@@ -2944,78 +4654,134 @@ void RenderLoop::encodeSvgfDenoising(MTLCommandBufferHandle commandBuffer,
                                      Accumulation& accumulation,
                                      const Pipelines& pipelines,
                                      const RenderSettings& settings) {
-    if (!settings.svgfDenoiseEnabled || !pipelines.svgfTemporal() || !pipelines.svgfAtrous()) {
+    if (!settings.svgfDenoiseEnabled || !pipelines.svgfTemporal() || !pipelines.svgfAtrous() ||
+        !pipelines.svgfCompositeSplit()) {
         return;
     }
     MTLTextureHandle present = accumulation.present();
+    MTLTextureHandle directPresent = accumulation.directPresent();
+    MTLTextureHandle indirectPresent = accumulation.indirectPresent();
     MTLTextureHandle albedo = accumulation.albedoBuffer();
     MTLTextureHandle normal = accumulation.normalBuffer();
     MTLTextureHandle position = accumulation.positionBuffer();
     MTLTextureHandle materialFeatures = accumulation.materialFeatureBuffer();
     MTLTextureHandle motionVectors = accumulation.motionVectorBuffer();
+    MTLTextureHandle reconstructionMetrics = accumulation.reconstructionMetricBuffer();
     MTLTextureHandle denoised = accumulation.denoisedBuffer();
     MTLTextureHandle scratch = accumulation.svgfScratchBuffer();
     MTLTextureHandle momentsA = accumulation.svgfMomentsBufferA();
     MTLTextureHandle momentsB = accumulation.svgfMomentsBufferB();
+    MTLTextureHandle indirectMomentsA = accumulation.svgfIndirectMomentsBufferA();
+    MTLTextureHandle indirectMomentsB = accumulation.svgfIndirectMomentsBufferB();
     MTLTextureHandle guideA = accumulation.svgfGuideBufferA();
     MTLTextureHandle guideB = accumulation.svgfGuideBufferB();
     MTLTextureHandle colorA = accumulation.svgfColorBufferA();
     MTLTextureHandle colorB = accumulation.svgfColorBufferB();
-    if (!commandBuffer || !present || !albedo || !normal || !position ||
-        !materialFeatures || !motionVectors || !denoised || !scratch ||
-        !momentsA || !momentsB || !guideA || !guideB || !colorA || !colorB ||
+    MTLTextureHandle indirectColorA = accumulation.svgfIndirectColorBufferA();
+    MTLTextureHandle indirectColorB = accumulation.svgfIndirectColorBufferB();
+    MTLTextureHandle directComponent = accumulation.svgfDirectComponentBuffer();
+    MTLTextureHandle indirectComponent = accumulation.svgfIndirectComponentBuffer();
+    MTLTextureHandle materialHistoryA = accumulation.svgfMaterialHistoryBufferA();
+    MTLTextureHandle materialHistoryB = accumulation.svgfMaterialHistoryBufferB();
+    if (!commandBuffer || !present || !directPresent || !indirectPresent ||
+        !albedo || !normal || !position ||
+        !materialFeatures || !motionVectors || !reconstructionMetrics || !denoised || !scratch ||
+        !momentsA || !momentsB || !indirectMomentsA || !indirectMomentsB ||
+        !guideA || !guideB || !colorA || !colorB || !indirectColorA || !indirectColorB ||
+        !directComponent || !indirectComponent ||
+        !materialHistoryA || !materialHistoryB ||
         !m_hasCurrentPathtraceUniforms) {
         m_hasDenoisedOutput = false;
         return;
     }
 
-    const uint32_t width = static_cast<uint32_t>(
-        std::min({present.width, albedo.width, normal.width, position.width,
-                  materialFeatures.width, motionVectors.width, denoised.width,
-                  scratch.width, momentsA.width, momentsB.width, guideA.width, guideB.width,
-                  colorA.width, colorB.width}));
-    const uint32_t height = static_cast<uint32_t>(
-        std::min({present.height, albedo.height, normal.height, position.height,
-                  materialFeatures.height, motionVectors.height, denoised.height,
-                  scratch.height, momentsA.height, momentsB.height, guideA.height, guideB.height,
-                  colorA.height, colorB.height}));
+    auto matchesPresentExtent = ^BOOL(MTLTextureHandle texture) {
+        return texture && texture.width == present.width && texture.height == present.height;
+    };
+    if (!matchesPresentExtent(directPresent) || !matchesPresentExtent(indirectPresent) ||
+        !matchesPresentExtent(albedo) || !matchesPresentExtent(normal) ||
+        !matchesPresentExtent(position) || !matchesPresentExtent(materialFeatures) ||
+        !matchesPresentExtent(motionVectors) || !matchesPresentExtent(reconstructionMetrics) ||
+        !matchesPresentExtent(denoised) ||
+        !matchesPresentExtent(scratch) || !matchesPresentExtent(momentsA) ||
+        !matchesPresentExtent(momentsB) || !matchesPresentExtent(indirectMomentsA) ||
+        !matchesPresentExtent(indirectMomentsB) || !matchesPresentExtent(guideA) ||
+        !matchesPresentExtent(guideB) || !matchesPresentExtent(colorA) ||
+        !matchesPresentExtent(colorB) || !matchesPresentExtent(indirectColorA) ||
+        !matchesPresentExtent(indirectColorB) || !matchesPresentExtent(directComponent) ||
+        !matchesPresentExtent(indirectComponent) || !matchesPresentExtent(materialHistoryA) ||
+        !matchesPresentExtent(materialHistoryB)) {
+        static bool sLoggedSvgfExtentMismatch = false;
+        if (!sLoggedSvgfExtentMismatch) {
+            sLoggedSvgfExtentMismatch = true;
+            NSLog(@"[SVGF] Required textures do not match present extent %zux%zu; "
+                  "skipping denoised output until accumulation resources are rebuilt.",
+                  static_cast<size_t>(present.width),
+                  static_cast<size_t>(present.height));
+        }
+        m_hasDenoisedOutput = false;
+        return;
+    }
+
+    const uint32_t width = static_cast<uint32_t>(present.width);
+    const uint32_t height = static_cast<uint32_t>(present.height);
     if (width == 0u || height == 0u) {
         m_hasDenoisedOutput = false;
         return;
     }
 
-    MTLTextureHandle previousMoments = (m_frameCounter & 1u) ? momentsB : momentsA;
-    MTLTextureHandle currentMoments = (m_frameCounter & 1u) ? momentsA : momentsB;
     MTLTextureHandle previousGuide = (m_frameCounter & 1u) ? guideB : guideA;
     MTLTextureHandle currentGuide = (m_frameCounter & 1u) ? guideA : guideB;
-    MTLTextureHandle previousColor = (m_frameCounter & 1u) ? colorB : colorA;
-    MTLTextureHandle currentColor = (m_frameCounter & 1u) ? colorA : colorB;
+    MTLTextureHandle previousMaterialHistory = (m_frameCounter & 1u) ? materialHistoryB : materialHistoryA;
+    MTLTextureHandle currentMaterialHistory = (m_frameCounter & 1u) ? materialHistoryA : materialHistoryB;
     const PathtraceUniforms& previousCamera =
         m_hasPreviousSvgfCameraUniforms ? m_previousSvgfCameraUniforms : m_currentPathtraceUniforms;
-    {
-        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        if (!encoder) {
-            m_hasDenoisedOutput = false;
-            return;
-        }
-        encoder.label = @"SVGF Temporal Moments";
-        [encoder setComputePipelineState:pipelines.svgfTemporal()];
+
+    auto makeSvgfUniforms = [&](uint32_t step) {
         SvgfDenoiseUniforms uniforms{};
         uniforms.width = width;
         uniforms.height = height;
-        uniforms.step = 1u;
+        uniforms.step = step;
         uniforms.reprojectionEnabled = m_hasPreviousSvgfCameraUniforms ? 1u : 0u;
         uniforms.normalSigma = std::max(settings.svgfNormalSigma, 1.0e-4f);
         uniforms.albedoSigma = std::max(settings.svgfAlbedoSigma, 1.0e-4f);
         uniforms.luminanceSigma = std::max(settings.svgfLuminanceSigma, 1.0e-4f);
         uniforms.historyValid = m_hasPreviousSvgfCameraUniforms ? 1u : 0u;
+        uniforms.denoiseDirect = settings.svgfDenoiseDirect ? 1u : 0u;
+        uniforms.denoiseIndirect = settings.svgfDenoiseIndirect ? 1u : 0u;
         uniforms.currentCameraOrigin = simd_make_float4(m_currentPathtraceUniforms.cameraOrigin, 0.0f);
         uniforms.previousCameraOrigin = simd_make_float4(previousCamera.cameraOrigin, 0.0f);
         uniforms.previousLowerLeftCorner = simd_make_float4(previousCamera.lowerLeftCorner, 0.0f);
         uniforms.previousHorizontal = simd_make_float4(previousCamera.horizontal, 0.0f);
         uniforms.previousVertical = simd_make_float4(previousCamera.vertical, 0.0f);
+        return uniforms;
+    };
+
+    auto encodeSvgfComponent = [&](NSString* label,
+                                   MTLTextureHandle sourceTexture,
+                                   MTLTextureHandle componentOutput,
+                                   MTLTextureHandle momentsTextureA,
+                                   MTLTextureHandle momentsTextureB,
+                                   MTLTextureHandle colorTextureA,
+                                   MTLTextureHandle colorTextureB,
+                                   bool enabled) -> bool {
+        if (!enabled) {
+            return true;
+        }
+        MTLTextureHandle previousMoments = (m_frameCounter & 1u) ? momentsTextureB : momentsTextureA;
+        MTLTextureHandle currentMoments = (m_frameCounter & 1u) ? momentsTextureA : momentsTextureB;
+        MTLTextureHandle previousColor = (m_frameCounter & 1u) ? colorTextureB : colorTextureA;
+        MTLTextureHandle currentColor = (m_frameCounter & 1u) ? colorTextureA : colorTextureB;
+
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        if (!encoder) {
+            return false;
+        }
+        encoder.label = [NSString stringWithFormat:@"SVGF Temporal Moments %@", label];
+        [encoder setComputePipelineState:pipelines.svgfTemporal()];
+        SvgfDenoiseUniforms uniforms = makeSvgfUniforms(1u);
         [encoder setBytes:&uniforms length:sizeof(SvgfDenoiseUniforms) atIndex:0];
-        [encoder setTexture:present atIndex:0];
+        [encoder setTexture:sourceTexture atIndex:0];
         [encoder setTexture:previousMoments atIndex:1];
         [encoder setTexture:currentMoments atIndex:2];
         [encoder setTexture:position atIndex:3];
@@ -3026,62 +4792,95 @@ void RenderLoop::encodeSvgfDenoising(MTLCommandBufferHandle commandBuffer,
         [encoder setTexture:currentColor atIndex:8];
         [encoder setTexture:materialFeatures atIndex:9];
         [encoder setTexture:motionVectors atIndex:10];
+        [encoder setTexture:previousMaterialHistory atIndex:11];
+        [encoder setTexture:currentMaterialHistory atIndex:12];
+        [encoder setTexture:reconstructionMetrics atIndex:13];
 
         const MTLSize threadsPerThreadgroup =
             PreferredLinearThreadgroupSize(pipelines.svgfTemporal());
         MTLSize threadsPerGrid = MTLSizeMake(width * height, 1u, 1u);
         [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
         [encoder endEncoding];
+
+        const uint32_t iterations = std::clamp(settings.svgfAtrousIterations, 1u, 5u);
+        MTLTextureHandle source = currentColor;
+
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
+            const bool finalIteration = (iteration + 1u == iterations);
+            MTLTextureHandle target = finalIteration
+                ? componentOutput
+                : (((iterations - iteration) % 2u == 0u) ? scratch : componentOutput);
+            if (target == source) {
+                return false;
+            }
+
+            id<MTLComputeCommandEncoder> atrousEncoder = [commandBuffer computeCommandEncoder];
+            if (!atrousEncoder) {
+                return false;
+            }
+            atrousEncoder.label = [NSString stringWithFormat:@"SVGF A-Trous %@ %u", label, iteration];
+            [atrousEncoder setComputePipelineState:pipelines.svgfAtrous()];
+            SvgfDenoiseUniforms atrousUniforms = makeSvgfUniforms(1u << iteration);
+            [atrousEncoder setBytes:&atrousUniforms length:sizeof(SvgfDenoiseUniforms) atIndex:0];
+            [atrousEncoder setTexture:source atIndex:0];
+            [atrousEncoder setTexture:albedo atIndex:1];
+            [atrousEncoder setTexture:normal atIndex:2];
+            [atrousEncoder setTexture:target atIndex:3];
+            [atrousEncoder setTexture:currentMoments atIndex:4];
+            [atrousEncoder setTexture:position atIndex:5];
+            [atrousEncoder setTexture:materialFeatures atIndex:6];
+
+            const MTLSize atrousThreadsPerThreadgroup =
+                PreferredLinearThreadgroupSize(pipelines.svgfAtrous());
+            [atrousEncoder dispatchThreads:threadsPerGrid
+                     threadsPerThreadgroup:atrousThreadsPerThreadgroup];
+            [atrousEncoder endEncoding];
+
+            source = target;
+        }
+        return true;
+    };
+
+    if (!encodeSvgfComponent(@"Direct",
+                             directPresent,
+                             directComponent,
+                             momentsA,
+                             momentsB,
+                             colorA,
+                             colorB,
+                             settings.svgfDenoiseDirect) ||
+        !encodeSvgfComponent(@"Indirect",
+                             indirectPresent,
+                             indirectComponent,
+                             indirectMomentsA,
+                             indirectMomentsB,
+                             indirectColorA,
+                             indirectColorB,
+                             settings.svgfDenoiseIndirect)) {
+        m_hasDenoisedOutput = false;
+        return;
     }
 
-    const uint32_t iterations = std::clamp(settings.svgfAtrousIterations, 1u, 5u);
-    MTLTextureHandle source = currentColor;
-
-    for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
-        const bool finalIteration = (iteration + 1u == iterations);
-        MTLTextureHandle target = finalIteration
-            ? denoised
-            : ((source == denoised) ? scratch : denoised);
-        if (target == source) {
-            m_hasDenoisedOutput = false;
-            return;
-        }
-
+    {
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         if (!encoder) {
             m_hasDenoisedOutput = false;
             return;
         }
-        encoder.label = [NSString stringWithFormat:@"SVGF A-Trous Filter %u", iteration];
-        [encoder setComputePipelineState:pipelines.svgfAtrous()];
-        SvgfDenoiseUniforms uniforms{};
-        uniforms.width = width;
-        uniforms.height = height;
-        uniforms.step = 1u << iteration;
-        uniforms.reprojectionEnabled = m_hasPreviousSvgfCameraUniforms ? 1u : 0u;
-        uniforms.normalSigma = std::max(settings.svgfNormalSigma, 1.0e-4f);
-        uniforms.albedoSigma = std::max(settings.svgfAlbedoSigma, 1.0e-4f);
-        uniforms.luminanceSigma = std::max(settings.svgfLuminanceSigma, 1.0e-4f);
-        uniforms.historyValid = m_hasPreviousSvgfCameraUniforms ? 1u : 0u;
-        uniforms.currentCameraOrigin = simd_make_float4(m_currentPathtraceUniforms.cameraOrigin, 0.0f);
-        uniforms.previousCameraOrigin = simd_make_float4(previousCamera.cameraOrigin, 0.0f);
-        uniforms.previousLowerLeftCorner = simd_make_float4(previousCamera.lowerLeftCorner, 0.0f);
-        uniforms.previousHorizontal = simd_make_float4(previousCamera.horizontal, 0.0f);
-        uniforms.previousVertical = simd_make_float4(previousCamera.vertical, 0.0f);
+        encoder.label = @"SVGF Direct/Indirect Composite";
+        [encoder setComputePipelineState:pipelines.svgfCompositeSplit()];
+        SvgfDenoiseUniforms uniforms = makeSvgfUniforms(1u);
         [encoder setBytes:&uniforms length:sizeof(SvgfDenoiseUniforms) atIndex:0];
-        [encoder setTexture:source atIndex:0];
-        [encoder setTexture:albedo atIndex:1];
-        [encoder setTexture:normal atIndex:2];
-        [encoder setTexture:target atIndex:3];
-        [encoder setTexture:currentMoments atIndex:4];
-
+        [encoder setTexture:directPresent atIndex:0];
+        [encoder setTexture:indirectPresent atIndex:1];
+        [encoder setTexture:directComponent atIndex:2];
+        [encoder setTexture:indirectComponent atIndex:3];
+        [encoder setTexture:denoised atIndex:4];
         const MTLSize threadsPerThreadgroup =
-            PreferredLinearThreadgroupSize(pipelines.svgfAtrous());
+            PreferredLinearThreadgroupSize(pipelines.svgfCompositeSplit());
         MTLSize threadsPerGrid = MTLSizeMake(width * height, 1u, 1u);
         [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
         [encoder endEncoding];
-
-        source = target;
     }
 
     m_lastDenoisedFrame = m_frameCounter;
@@ -3106,7 +4905,8 @@ void RenderLoop::encodePresentation(MTLCommandBufferHandle commandBuffer,
         const uint32_t endSample = m_gpuTiming.nextSample++;
         attachment.startOfEncoderSampleIndex = startSample;
         attachment.endOfEncoderSampleIndex = endSample;
-        m_gpuTiming.ranges.push_back({GpuTimingBucket::Presentation, startSample, endSample});
+        m_gpuTiming.ranges.push_back(
+            {GpuTimingBucket::Presentation, "Path Tracer Present", startSample, endSample});
         encoder = [commandBuffer computeCommandEncoderWithDescriptor:passDescriptor];
     } else {
         encoder = [commandBuffer computeCommandEncoder];
@@ -3116,6 +4916,12 @@ void RenderLoop::encodePresentation(MTLCommandBufferHandle commandBuffer,
     [encoder setTexture:accumulation.radianceSum() atIndex:0];
     [encoder setTexture:accumulation.sampleCountTexture() atIndex:1];
     [encoder setTexture:accumulation.present() atIndex:2];
+    [encoder setTexture:accumulation.directRadianceSum() atIndex:3];
+    [encoder setTexture:accumulation.indirectRadianceSum() atIndex:4];
+    [encoder setTexture:accumulation.radianceMomentSum() atIndex:5];
+    [encoder setTexture:accumulation.directPresent() atIndex:6];
+    [encoder setTexture:accumulation.indirectPresent() atIndex:7];
+    [encoder setTexture:accumulation.reconstructionMetricBuffer() atIndex:8];
 
     NSUInteger threadWidth = pipelines.present().threadExecutionWidth;
     NSUInteger threadHeight = std::max<NSUInteger>(
@@ -3125,6 +4931,68 @@ void RenderLoop::encodePresentation(MTLCommandBufferHandle commandBuffer,
                                         accumulation.present().height, 1);
     [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
     [encoder endEncoding];
+}
+
+bool RenderLoop::encodeMlReconstructionTiny(MTLCommandBufferHandle commandBuffer,
+                                            Accumulation& accumulation,
+                                            const Pipelines& pipelines,
+                                            const RenderSettings& settings) {
+    m_mlState.activeThisFrame = false;
+    m_mlState.dispatchCount = 0u;
+    m_mlState.lastConfidence = 0.0f;
+
+    if (settings.mlBackendMode != RenderSettings::MlBackendMode::ReconstructionTiny) {
+        return true;
+    }
+    if (!pipelines.mlReconstructionTiny()) {
+        m_mlState.modelValid = false;
+        m_mlState.fallbackReason = "ML reconstruction pipeline unavailable";
+        return true;
+    }
+
+    MTLTextureHandle source = accumulation.present();
+    MTLTextureHandle albedo = accumulation.albedoBuffer();
+    MTLTextureHandle normal = accumulation.normalBuffer();
+    MTLTextureHandle position = accumulation.positionBuffer();
+    MTLTextureHandle motion = accumulation.motionVectorBuffer();
+    MTLTextureHandle metrics = accumulation.reconstructionMetricBuffer();
+    MTLTextureHandle output = accumulation.denoisedBuffer();
+    if (!source || !albedo || !normal || !position || !motion || !metrics || !output) {
+        m_mlState.modelValid = false;
+        m_mlState.fallbackReason = "ML reconstruction tensor textures unavailable";
+        return true;
+    }
+
+    const uint32_t width = static_cast<uint32_t>(source.width);
+    const uint32_t height = static_cast<uint32_t>(source.height);
+    if (!ensureMlBackendResources(width, height, settings, commandBuffer) ||
+        !m_mlState.modelValid || !m_mlState.modelBuffer) {
+        return true;
+    }
+
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    encoder.label = @"ML Reconstruction Tiny";
+    [encoder setComputePipelineState:pipelines.mlReconstructionTiny()];
+    [encoder setBuffer:m_mlState.modelBuffer offset:0 atIndex:0];
+    [encoder setTexture:source atIndex:0];
+    [encoder setTexture:albedo atIndex:1];
+    [encoder setTexture:normal atIndex:2];
+    [encoder setTexture:position atIndex:3];
+    [encoder setTexture:motion atIndex:4];
+    [encoder setTexture:metrics atIndex:5];
+    [encoder setTexture:output atIndex:6];
+    MTLSize threadsPerThreadgroup = PreferredLinearThreadgroupSize(pipelines.mlReconstructionTiny());
+    MTLSize threadsPerGrid = MTLSizeMake(source.width, source.height, 1u);
+    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+    [encoder endEncoding];
+
+    m_mlState.activeThisFrame = true;
+    m_mlState.dispatchCount = 1u;
+    m_mlState.lastConfidence = 1.0f;
+    m_mlState.biasRisk = 0.05f;
+    m_mlState.fallbackReason.clear();
+    m_hasDenoisedOutput = true;
+    return true;
 }
 
 void RenderLoop::encodeDisplay(MTLRenderCommandEncoderHandle renderEncoder,
@@ -3144,7 +5012,9 @@ void RenderLoop::encodeDisplay(MTLRenderCommandEncoderHandle renderEncoder,
         [renderEncoder setFragmentBuffer:m_displayUniformBuffer offset:0 atIndex:0];
     }
     MTLTextureHandle displayTexture = accumulation.present();
-    if ((settings.denoiseEnabled || settings.svgfDenoiseEnabled) && m_hasDenoisedOutput) {
+    if ((settings.denoiseEnabled || settings.svgfDenoiseEnabled ||
+         settings.mlBackendMode == RenderSettings::MlBackendMode::ReconstructionTiny) &&
+        m_hasDenoisedOutput) {
         MTLTextureHandle denoised = accumulation.denoisedBuffer();
         if (denoised) {
             displayTexture = denoised;
@@ -3165,28 +5035,94 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
                                     const RenderSettings& settings) {
 
     FrameResult result{};
+    m_wavefrontMegakernelFallback = "none";
+    m_wavefrontMegakernelFallbackThisFrame = false;
+    m_wavefrontExplicitRestirDiRanFused = false;
+    bool hardwareDebugSoftwareFallbackEnabled = false;
+#if PT_DEBUG_TOOLS
+    hardwareDebugSoftwareFallbackEnabled =
+        settings.enablePathDebug || settings.debugDirectLightAudit || settings.parityAssertEnabled;
+#endif
+    scene.setHardwareDebugSoftwareFallbackEnabled(hardwareDebugSoftwareFallbackEnabled);
     const bool willClearAccumulation = accumulation.needsClear() && pipelines.clear();
     const bool willRebuildScene = scene.isDirty();
     const bool hasDisplayPass = (renderPassDescriptor && drawable && pipelines.display());
     const bool restirDiRequested = ExplicitRestirDiEnabled(settings);
     const bool fusedRestirDiReference =
-        context.headless() && restirDiRequested && HeadlessFusedRestirDiReferenceEnabled();
-    const bool restirDiEnabled =
+        context.headless() && restirDiRequested &&
+        (!settings.restirDebugEnabled || HeadlessFusedRestirDiReferenceEnabled());
+    const bool explicitRestirDiRequested =
         restirDiRequested && !fusedRestirDiReference &&
         (context.headless() || InteractiveExplicitRestirDiEnabled());
+    // On the megakernel, restir_di's explicit passes would run as screen passes, which read no material textures,
+    // normal maps or occlusion and give wrong light (0.0625 of the exact value on an analytic case). They are refused:
+    // headless runs stop before rendering (main_headless.mm), and the window logs it once and keeps the fused
+    // restir_di. The hybrid's explicit stage on the megakernel and the wavefront's explicit stage are exact.
+    const bool megakernelExplicitRestirDiRefused =
+        explicitRestirDiRequested &&
+        settings.executionMode == RenderSettings::ExecutionMode::Megakernel &&
+        settings.directLightMode == RenderSettings::DirectLightMode::RestirDi;
+    if (megakernelExplicitRestirDiRefused && !m_loggedMegakernelExplicitRestirDiRefusal) {
+        m_loggedMegakernelExplicitRestirDiRefusal = true;
+        NSLog(@"[ReSTIR DI] Explicit passes refused on the megakernel (its screen passes ignore material textures, "
+              @"normal maps and occlusion); rendering the fused restir_di. The wavefront runs the explicit passes.");
+    }
+    const bool restirDiEnabled = explicitRestirDiRequested && !megakernelExplicitRestirDiRefused;
     const bool restirDiWavefrontStageEnabled =
-        restirDiEnabled && settings.executionMode == RenderSettings::ExecutionMode::Wavefront;
-    const bool restirDiScreenPassesEnabled = restirDiEnabled && !restirDiWavefrontStageEnabled;
+        restirDiEnabled &&
+        settings.executionMode == RenderSettings::ExecutionMode::Wavefront;
+    const bool restirDiMegakernelIntegratedStageEnabled =
+        restirDiEnabled &&
+        settings.executionMode == RenderSettings::ExecutionMode::Megakernel &&
+        settings.directLightMode == RenderSettings::DirectLightMode::RestirDiRegirHybrid;
+    const bool restirDiScreenPassesEnabled =
+        restirDiEnabled &&
+        !restirDiWavefrontStageEnabled &&
+        !restirDiMegakernelIntegratedStageEnabled;
     m_explicitRestirDiActiveThisFrame = restirDiEnabled;
+    m_restirDiWavefrontStageActiveThisFrame = restirDiWavefrontStageEnabled;
+    m_restirDiMegakernelIntegratedStageActiveThisFrame =
+        restirDiMegakernelIntegratedStageEnabled;
     m_restirDiHardwareTraceActiveThisFrame = false;
+    // Homogeneous volumes run restir_di and the hybrid as baseline_emissive (UniformBuilder); say so when that starts.
+    const bool restirDiDemotedByVolume = RestirDiDemotedByVolume(settings);
+    if (restirDiDemotedByVolume && !m_restirDiDemotedByVolume) {
+        NSLog(@"[ReSTIR DI] directLightMode=%s does not run with volumeTransportMode=homogeneous (its reservoirs "
+              @"carry no medium state); rendering baseline_emissive instead.",
+              settings.directLightMode == RenderSettings::DirectLightMode::RestirDi ? "restir_di"
+                                                                                     : "restir_di_regir_hybrid");
+    }
+    m_restirDiDemotedByVolume = restirDiDemotedByVolume;
+    if (restirDiDemotedByVolume) {
+        m_restirDiPathStatus = "volume_baseline_emissive";
+    } else if (!restirDiRequested) {
+        m_restirDiPathStatus = "off";
+    } else if (restirDiEnabled) {
+        m_restirDiPathStatus = restirDiWavefrontStageEnabled
+            ? "explicit_wavefront"
+            : (restirDiMegakernelIntegratedStageEnabled ? "explicit_megakernel_integrated"
+                                                        : "explicit_graph");
+    } else if (fusedRestirDiReference) {
+        m_restirDiPathStatus = "fused_reference";
+    } else if (megakernelExplicitRestirDiRefused) {
+        m_restirDiPathStatus = "fused_megakernel_explicit_refused";
+    } else {
+        m_restirDiPathStatus = "fused_default";
+    }
+    if (settings.executionMode != RenderSettings::ExecutionMode::Wavefront &&
+        m_wavefront.totalBytes > 0u) {
+        m_wavefront = {};
+        m_transportAllocator.releaseOwner(TransportMemoryOwner::Wavefront);
+    }
     static bool sLoggedInteractiveExplicitRestirFallback = false;
-    if (restirDiRequested && !restirDiEnabled && !sLoggedInteractiveExplicitRestirFallback) {
+    if (restirDiRequested && !restirDiEnabled && !megakernelExplicitRestirDiRefused &&
+        !sLoggedInteractiveExplicitRestirFallback) {
         sLoggedInteractiveExplicitRestirFallback = true;
         if (fusedRestirDiReference) {
             NSLog(@"[ReSTIR DI] headless validation is rendering the fused/reference shader path "
-                  "because PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE is set.");
+                  "because ReSTIR debug is disabled or PT_RESTIR_DI_VALIDATE_FUSED_REFERENCE is set.");
         } else {
-            NSLog(@"[ReSTIR DI] interactive explicit D passes disabled for responsiveness; "
+            NSLog(@"[ReSTIR DI] interactive explicit DI passes disabled for responsiveness; "
                   "set PT_ENABLE_INTERACTIVE_EXPLICIT_RESTIR_DI=1 to profile the explicit pass graph in the GUI.");
         }
     }
@@ -3195,7 +5131,7 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
                              willClearAccumulation,
                              willRebuildScene,
                              hasDisplayPass,
-                             restirDiEnabled);
+                             restirDiScreenPassesEnabled);
     if (commandBuffer) {
         commandBuffer.label = @"PathTracer FrameGraph";
         [commandBuffer pushDebugGroup:@"FrameGraph"];
@@ -3251,9 +5187,10 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
         m_gpuTiming.active = (m_gpuTiming.sampleBuffer != nil);
     }
 
-    // Clear stats buffer
+    // Clear the per-frame stats. The radiance cache counters at the end of PathtraceStats accumulate over
+    // the render and are cleared in resetHistory().
     if (m_statsBuffer) {
-        memset([m_statsBuffer contents], 0, m_statsBuffer.length);
+        memset([m_statsBuffer contents], 0, offsetof(PathtraceStats, radianceCacheStats));
     }
 #if PT_DEBUG_TOOLS
     if (m_debugBuffer) {
@@ -3262,7 +5199,8 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
         if (debugData) {
             debugData->writeIndex = 0;
             uint32_t allowed = 0;
-            if (settings.enablePathDebug && settings.debugMaxEntries > 0) {
+            if ((settings.enablePathDebug || settings.debugDirectLightAudit) &&
+                settings.debugMaxEntries > 0) {
                 allowed = std::min(settings.debugMaxEntries,
                                    PathTracerShaderTypes::kPathtraceDebugMaxEntries);
                 allowed = std::max<uint32_t>(1u, allowed);
@@ -3387,6 +5325,20 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
                         encodeDenoising(commandBuffer, accumulation, settings, m_frameCounter);
                     }
                     break;
+                case RenderPassExecutionId::MlBackendNoOp: {
+                    const CGSize currentSize = accumulation.currentSize();
+                    const uint32_t width =
+                        static_cast<uint32_t>(std::max<CGFloat>(1.0, currentSize.width));
+                    const uint32_t height =
+                        static_cast<uint32_t>(std::max<CGFloat>(1.0, currentSize.height));
+                    passOk = ensureMlBackendResources(width, height, settings, commandBuffer);
+                    rebuildTransportMemoryRegistry(settings);
+                    break;
+                }
+                case RenderPassExecutionId::MlBackendReconstructionTiny:
+                    passOk = encodeMlReconstructionTiny(commandBuffer, accumulation, pipelines, settings);
+                    rebuildTransportMemoryRegistry(settings);
+                    break;
                 case RenderPassExecutionId::Display:
                     if (renderPassDescriptor && drawable && pipelines.display()) {
                         id<MTLRenderCommandEncoder> renderEncoder =
@@ -3424,24 +5376,59 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
     result.restirDiApplyLightingDispatchCount = restirDiApplyLightingDispatchCount;
     result.restirDiDebugAovDispatchCount = restirDiDebugAovDispatchCount;
     result.presentationDispatchCount = 1u;
-    if (settings.executionMode == RenderSettings::ExecutionMode::Wavefront) {
+    // A frame the wavefront handed to the megakernel counts as megakernel dispatches.
+    if (settings.executionMode == RenderSettings::ExecutionMode::Wavefront && !m_wavefrontMegakernelFallbackThisFrame) {
         const uint32_t depthCount = std::max<uint32_t>(1u, settings.maxDepth);
+        const bool shadeIndirectActive =
+            settings.wavefrontShadeIndirectEnabled || WavefrontShadeIndirectEnabled();
+        const uint32_t buildArgsPerDepth =
+            1u +
+            (shadeIndirectActive ? 2u : 0u) +
+            ((settings.wavefrontShadeIndirectProbeEnabled || WavefrontShadeIndirectProbeEnabled()) ? 1u : 0u) +
+            ((settings.wavefrontShadeSurfaceProbeEnabled || WavefrontShadeSurfaceProbeEnabled()) ? 1u : 0u) +
+            ((settings.wavefrontShadeMetadataProbeEnabled || WavefrontShadeMetadataProbeEnabled()) ? 1u : 0u) +
+            ((settings.wavefrontShadeScalarProbeEnabled || WavefrontShadeScalarProbeEnabled()) ? 1u : 0u) +
+            ((settings.wavefrontShadeClosureProbeEnabled || WavefrontShadeClosureProbeEnabled()) ? 1u : 0u) +
+            ((settings.wavefrontShadeBsdfProbeEnabled || WavefrontShadeBsdfProbeEnabled()) ? 1u : 0u) +
+            (((settings.wavefrontShadowIndirectEnabled || WavefrontShadowIndirectEnabled()) &&
+        !(settings.referencePointExactNee && scene.zeroRadiusReferencePointLightCount() > 0u)) ? 1u : 0u);
         result.wavefrontResetDispatchCount = samplesDispatched;
         result.wavefrontGenerateDispatchCount = samplesDispatched;
-        result.wavefrontBuildDispatchArgsDispatchCount = samplesDispatched * depthCount;
+        result.wavefrontBuildDispatchArgsDispatchCount = samplesDispatched * depthCount * buildArgsPerDepth;
         result.wavefrontCompactQueueDispatchCount =
             WavefrontCompactionEnabled(settings) ? (samplesDispatched * depthCount) : 0u;
         result.wavefrontPrepareDispatchCount = samplesDispatched * depthCount;
         result.wavefrontIntersectDispatchCount = samplesDispatched * depthCount;
         result.wavefrontShadeDispatchCount =
-            samplesDispatched * depthCount * (restirDiWavefrontStageEnabled ? 2u : 1u);
-        result.wavefrontShadowDispatchCount = samplesDispatched * depthCount;
+            samplesDispatched * depthCount *
+            ((shadeIndirectActive ? 2u : 1u) +
+             (restirDiWavefrontStageEnabled ? 1u : 0u) +
+             ((settings.wavefrontShadeIndirectProbeEnabled || WavefrontShadeIndirectProbeEnabled()) ? 1u : 0u) +
+             ((settings.wavefrontShadeSurfaceProbeEnabled || WavefrontShadeSurfaceProbeEnabled()) ? 1u : 0u) +
+             ((settings.wavefrontShadeMetadataProbeEnabled || WavefrontShadeMetadataProbeEnabled()) ? 1u : 0u) +
+             ((settings.wavefrontShadeScalarProbeEnabled || WavefrontShadeScalarProbeEnabled()) ? 1u : 0u) +
+             ((settings.wavefrontShadeClosureProbeEnabled || WavefrontShadeClosureProbeEnabled()) ? 1u : 0u) +
+             ((settings.wavefrontShadeBsdfProbeEnabled || WavefrontShadeBsdfProbeEnabled()) ? 1u : 0u));
+        result.wavefrontShadowDispatchCount =
+            samplesDispatched * depthCount *
+            (1u + (((settings.wavefrontShadowIndirectEnabled || WavefrontShadowIndirectEnabled()) &&
+        !(settings.referencePointExactNee && scene.zeroRadiusReferencePointLightCount() > 0u)) ? 1u : 0u));
         result.wavefrontSwapDispatchCount = samplesDispatched * depthCount;
         result.wavefrontAccumulateDispatchCount = samplesDispatched;
     } else {
         result.integrationDispatchCount = samplesDispatched;
     }
-    result.totalComputeDispatchCount =
+    const uint64_t svgfComponentCount =
+        settings.svgfDenoiseEnabled
+            ? static_cast<uint64_t>((settings.svgfDenoiseDirect ? 1u : 0u) +
+                                    (settings.svgfDenoiseIndirect ? 1u : 0u))
+            : 0u;
+    const uint64_t svgfDispatchCount =
+        settings.svgfDenoiseEnabled
+            ? (svgfComponentCount * (static_cast<uint64_t>(std::clamp(settings.svgfAtrousIterations, 1u, 5u)) + 1u) + 1u)
+            : 0u;
+    // Per-frame counts: the 64-bit SVGF and ML terms are small (the ML term is 0 or 1).
+    result.totalComputeDispatchCount = static_cast<uint32_t>(
         result.restirDiInitializeDispatchCount +
         result.restirDiInitialCandidateDispatchCount +
         result.restirDiTemporalReuseDispatchCount +
@@ -3461,7 +5448,8 @@ FrameResult RenderLoop::encodeFrame(MTLCommandBufferHandle commandBuffer,
         result.wavefrontShadowDispatchCount +
         result.wavefrontSwapDispatchCount +
         result.wavefrontAccumulateDispatchCount +
-        (settings.svgfDenoiseEnabled ? (std::clamp(settings.svgfAtrousIterations, 1u, 5u) + 1u) : 0u);
+        svgfDispatchCount +
+        m_mlState.dispatchCount);
     result.passGraph = m_lastPassGraph;
     result.passGraphExecution = m_lastPassGraphExecution;
     result.historyResetReason = frameHistoryResetReason;
@@ -3498,6 +5486,9 @@ void RenderLoop::resolveGpuTiming(double totalGpuTimeMs) {
     m_gpuTiming.lastCompactionMs = 0.0;
     m_gpuTiming.lastFusedIntegrateMs = 0.0;
     m_gpuTiming.lastPresentationMs = 0.0;
+    m_lastPassGraphExecution.passTimingAvailable = false;
+    m_lastPassGraphExecution.passTimingNames.clear();
+    m_lastPassGraphExecution.passTimingMs.clear();
     if (!m_gpuTiming.active ||
         !m_gpuTiming.sampleBuffer ||
         m_gpuTiming.nextSample == 0u ||
@@ -3518,6 +5509,7 @@ void RenderLoop::resolveGpuTiming(double totalGpuTimeMs) {
     uint64_t fusedIntegrateTicks = 0u;
     uint64_t presentationTicks = 0u;
     uint64_t totalTicks = 0u;
+    std::vector<std::pair<std::string, uint64_t>> passTicks;
     for (const GpuTimingSampleRange& range : m_gpuTiming.ranges) {
         if (range.endSample >= m_gpuTiming.nextSample) {
             continue;
@@ -3529,6 +5521,19 @@ void RenderLoop::resolveGpuTiming(double totalGpuTimeMs) {
         }
         const uint64_t deltaTicks = end - start;
         totalTicks += deltaTicks;
+        if (!range.passName.empty()) {
+            auto passIt = std::find_if(
+                passTicks.begin(),
+                passTicks.end(),
+                [&range](const std::pair<std::string, uint64_t>& candidate) {
+                    return candidate.first == range.passName;
+                });
+            if (passIt == passTicks.end()) {
+                passTicks.emplace_back(range.passName, deltaTicks);
+            } else {
+                passIt->second += deltaTicks;
+            }
+        }
         switch (range.bucket) {
             case GpuTimingBucket::Intersect:
                 intersectTicks += deltaTicks;
@@ -3560,6 +5565,13 @@ void RenderLoop::resolveGpuTiming(double totalGpuTimeMs) {
     m_gpuTiming.lastCompactionMs = static_cast<double>(compactionTicks) * scale;
     m_gpuTiming.lastFusedIntegrateMs = static_cast<double>(fusedIntegrateTicks) * scale;
     m_gpuTiming.lastPresentationMs = static_cast<double>(presentationTicks) * scale;
+    m_lastPassGraphExecution.passTimingAvailable = !passTicks.empty();
+    m_lastPassGraphExecution.passTimingNames.reserve(passTicks.size());
+    m_lastPassGraphExecution.passTimingMs.reserve(passTicks.size());
+    for (const auto& passTick : passTicks) {
+        m_lastPassGraphExecution.passTimingNames.push_back(passTick.first);
+        m_lastPassGraphExecution.passTimingMs.push_back(static_cast<double>(passTick.second) * scale);
+    }
 }
 
 void RenderLoop::shutdown() {
@@ -3571,8 +5583,11 @@ void RenderLoop::shutdown() {
     m_gpuTiming.timestampCounterSet = nullptr;
     m_gpuTiming.ranges.clear();
     m_wavefront.queueCounters = nullptr;
+    m_wavefront.cacheTrainRecords = nullptr;
+    m_wavefront.cacheQueryItems = nullptr;
     m_wavefront.pathStates = nullptr;
     m_wavefront.shadowRays = nullptr;
+    m_wavefront.shadowIndices = nullptr;
     m_wavefront.hitRecords = nullptr;
     m_wavefront.activeRays[1] = nullptr;
     m_wavefront.activeRays[0] = nullptr;
@@ -3580,6 +5595,7 @@ void RenderLoop::shutdown() {
     m_restirState.restirPt = nullptr;
     m_restirState.pathGuiding = nullptr;
     m_restirState = RestirStateResources{};
+    m_transportAllocator.clear();
     m_transportMemory.clear();
     m_statsBuffer = nullptr;
     m_debugBuffer = nullptr;

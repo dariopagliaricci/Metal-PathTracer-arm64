@@ -4,8 +4,12 @@ inline uint2 wavefront_pixel_coord(const uint pixelIndex,
     return uint2(pixelIndex % width, pixelIndex / width);
 }
 
+inline uint wavefront_shadow_stride(constant PathtraceUniforms& uniforms) {
+    return kWavefrontShadowCapacityMultiplier + uniforms.referencePointNeeShadowExtra;
+}
+
 inline uint wavefront_shadow_capacity(constant PathtraceUniforms& uniforms) {
-    return max(uniforms.width * uniforms.height * kWavefrontShadowCapacityMultiplier, 1u);
+    return max(uniforms.width * uniforms.height * wavefront_shadow_stride(uniforms), 1u);
 }
 
 inline void wavefront_init_queue_header(device WavefrontQueueHeader& header,
@@ -65,7 +69,7 @@ inline uint wavefront_reserve_shadow_slot(constant PathtraceUniforms& uniforms,
 
     const uint localSlot = state.reserved0;
     state.reserved0 += 1u;
-    if (localSlot >= kWavefrontShadowCapacityMultiplier) {
+    if (localSlot >= wavefront_shadow_stride(uniforms)) {
         if (queueCounters) {
             atomic_store_explicit(&queueCounters->overflowFlag, 1u, memory_order_relaxed);
             wavefront_note_queue_overflow(queueCounters->shadowRayQueue);
@@ -75,7 +79,7 @@ inline uint wavefront_reserve_shadow_slot(constant PathtraceUniforms& uniforms,
     if (queueCounters) {
         wavefront_note_queue_enqueue(queueCounters->shadowRayQueue);
     }
-    return pathIndex * kWavefrontShadowCapacityMultiplier + localSlot;
+    return pathIndex * wavefront_shadow_stride(uniforms) + localSlot;
 }
 
 inline void wavefront_store_queue_stats(device QueueCounters* queueCounters,
@@ -137,6 +141,7 @@ inline WavefrontHitRecord pack_wavefront_hit(thread const HitRecord& rec,
     packed.ids = uint4(rec.materialIndex, rec.primitiveIndex, rec.meshIndex, pathIndex);
     packed.barycentric = rec.barycentric;
     packed.hit = hit ? 1u : 0u;
+    packed.padding = rec.twoSided;
     return packed;
 }
 
@@ -152,26 +157,6 @@ inline HitRecord unpack_wavefront_hit(thread const WavefrontHitRecord& packed) {
     rec.primitiveIndex = packed.ids.y;
     rec.meshIndex = packed.ids.z;
     rec.barycentric = packed.barycentric;
+    rec.twoSided = packed.padding;
     return rec;
-}
-
-inline float3 wavefront_background_radiance(constant PathtraceUniforms& uniforms,
-                                            texture2d<float, access::sample> environmentTexture,
-                                            const float3 direction) {
-    float3 background = sky_color(direction);
-    if (uniforms.backgroundMode == 1u) {
-        background = uniforms.backgroundColor;
-    } else if (uniforms.backgroundMode == 2u &&
-               environmentTexture.get_width() > 0 &&
-               environmentTexture.get_height() > 0) {
-        background = environment_color(environmentTexture,
-                                       direction,
-                                       uniforms.environmentRotation,
-                                       uniforms.environmentIntensity,
-                                       uniforms);
-    }
-    if (uniforms.backgroundMode != 2u) {
-        background = to_working_space(background, uniforms);
-    }
-    return background;
 }

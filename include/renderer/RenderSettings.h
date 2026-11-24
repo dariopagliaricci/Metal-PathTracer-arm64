@@ -59,6 +59,13 @@ struct RenderSettings {
         FirstPerson = 1,
     };
 
+    enum class ViewportQualityPreset : uint32_t {
+        Custom = 0,
+        Interactive = 1,
+        Balanced = 2,
+        FinalPreview = 3,
+    };
+
     enum class DirectLightMode : uint32_t {
         LegacyRect = 0,
         BaselineEmissive = 1,
@@ -73,7 +80,7 @@ struct RenderSettings {
 
     enum class RestirGiMode : uint32_t {
         Off = 0,
-        DiffusePrototype = 1,
+        ProductionDiffuse = 1,
     };
 
     enum class PathGuidingMode : uint32_t {
@@ -83,13 +90,16 @@ struct RenderSettings {
 
     enum class RestirPtMode : uint32_t {
         Off = 0,
-        Research = 1,
-        ExperimentalPathReuse = 2,
+        ProductionReservoirCapture = 1,
+        ProductionPathReuse = 2,
+        EnhancedUnbiased = 3,
+        EnhancedBiased = 4,
     };
 
     enum class RadianceCacheMode : uint32_t {
         Off = 0,
-        Prototype = 1,
+        Production = 1,
+        Prototype = Production,
     };
 
     enum class CausticTransportMode : uint32_t {
@@ -119,6 +129,7 @@ struct RenderSettings {
     enum class MlBackendMode : uint32_t {
         Off = 0,
         ReconstructionNoOp = 1,
+        ReconstructionTiny = 2,
     };
 
     enum class RestirDebugView : uint32_t {
@@ -132,19 +143,50 @@ struct RenderSettings {
         NaNInfMask = 7,
         QueueStageFailure = 8,
         RadianceCache = 9,
+        CausticTransport = 10,
     };
 
     // Path tracing settings
     uint32_t samplesPerFrame = 1;
     uint32_t maxDepth = 50;
+    ViewportQualityPreset viewportQualityPreset = ViewportQualityPreset::Interactive;
+    bool viewportQualityPresetOverridden = false;
     bool enableRussianRoulette = true;
+    // Add filtered normal-map variance to PBR roughness. Disable only for an
+    // explicitly calibrated scene; texture filtering and mapped normals remain active.
+    bool normalVarianceRoughness = true;
+    // Enumerate zero-radius reference points at every existing analytic NEE vertex.
+    bool referencePointExactNee = false;
+    // Shared material-texture sampling bias; negative values sharpen the
+    // existing filtered lookups without changing UVs or ray footprints.
+    float textureLodBias = 0.0f;
     uint32_t fixedRngSeed = 0;
     uint32_t renderWidth = 0;   // 0 => use default/view size
     uint32_t renderHeight = 0;  // 0 => use default/view size
     float renderScale = 1.0f;   // Internal render resolution multiplier (0.5x - 2.0x)
     ExecutionMode executionMode = ExecutionMode::Megakernel;
+    bool sourceTransport = false; // Opt-in Tungsten forward visibility and depth semantics.
+    // Tungsten TraceableScene::DefaultEpsilon (5e-4): scattered, forward-continuation and shadow rays ignore hits
+    // closer than this world distance. 0 = off (1 um precise spawning). Requires sourceTransport.
+    float sourceRayEpsilon = 0.0f;
+    bool denoiseMirrorGuides = false; // OIDN guides follow smooth source-conductor reflections (wavefront only).
+    bool denoiseTransmissionGuides = false; // OIDN guides follow delta source-dielectric interfaces (wavefront only).
+    // Set by ResolveSourceCapabilities, not a user setting: the scene or settings use Tungsten-source closures, textures
+    // or transport. Selects the compute pipeline set specialized with kSourceFeatures (Pipelines::selectSourceFeatures).
+    bool sourceFeatures = false;
+    // Set by ResolveSourceCapabilities when it switched a source scene to wavefront, not a user setting. The GUI's next
+    // scene load restores megakernel instead of carrying the forced mode over as the viewport's own choice.
+    bool sourceForcedWavefront = false;
     WavefrontSchedulingPolicy wavefrontSchedulingPolicy = WavefrontSchedulingPolicy::Preview;
     bool wavefrontCompactionEnabled = true;
+    bool wavefrontShadeIndirectEnabled = false;
+    bool wavefrontShadeIndirectProbeEnabled = false;
+    bool wavefrontShadeSurfaceProbeEnabled = false;
+    bool wavefrontShadeMetadataProbeEnabled = false;
+    bool wavefrontShadeScalarProbeEnabled = false;
+    bool wavefrontShadeClosureProbeEnabled = false;
+    bool wavefrontShadeBsdfProbeEnabled = false;
+    bool wavefrontShadowIndirectEnabled = false;
     bool enableSoftwareRayTracing = false;
     SssMode sssMode = SssMode::Off;
     uint32_t sssMaxSteps = 32;
@@ -188,6 +230,8 @@ struct RenderSettings {
     float spectralMaxWavelengthNm = 720.0f;
     float spectralDispersionStrength = 0.012f;
     bool spectralDebug = false;
+    // Wavelengths carried per path in spectral mode: 3 (hero plus two rotated) or 1 (single-wavelength baseline).
+    uint32_t spectralWavelengthsPerPath = 3;
     MlBackendMode mlBackendMode = MlBackendMode::Off;
     std::string mlModelPackagePath;
     bool mlDebug = false;
@@ -222,14 +266,16 @@ struct RenderSettings {
     bool enableHardwareShadowNearRetryReject = true;
 
     // Tonemapping settings
-    uint32_t tonemapMode = 1;        // 1=Linear, 2=ACES, 3=Reinhard, 4=Hable
-    uint32_t acesVariant = 0;        // 0=Fitted, 1=Simple
+    uint32_t tonemapMode = 1;        // 1=Linear, 2=ACES, 3=Reinhard, 4=Hable, 5=Exponential, 6=Filmic (Tungsten)
+    uint32_t acesVariant = 0;        // 0=Fitted, 1=Simple, 2=Falcor (0.6 pre-exposure, sRGB)
     float exposure = 0.0f;           // Exposure in stops
     float reinhardWhitePoint = 1.5f; // White point for Reinhard
-    bool bloomEnabled = false;       // Optional post-tonemap bloom
+    bool bloomEnabled = false;       // Optional bloom before tonemapping
     float bloomThreshold = 1.0f;     // HDR luminance threshold for bloom extraction
     float bloomIntensity = 0.12f;    // Bloom add strength
     float bloomRadius = 1.5f;        // Bloom tap radius in pixels
+    bool srgbOutputEncoding = true;        // LDR outputs and display: piecewise sRGB encode; false = gamma 2.2
+    float referenceBloomIntensity = 0.0f;  // LDR outputs: Path-Tracing reference bloom; 0 disables
     WorkingColorSpace workingColorSpace = WorkingColorSpace::LinearSRGB;
     bool gltfViewerCompatibilityMode = false;   // Opt-in glTF viewer parity behavior
     bool gltfThinWalledFallback = true;         // If transmission exists without volume, force thin dielectric
@@ -282,6 +328,12 @@ struct RenderSettings {
     std::string environmentMapPath{};
     float environmentRotation = 0.0f;   // Radians, rotates env map around world Y
     float environmentIntensity = 1.0f;  // Multiplier applied to sampled env radiance
+    // Reference capture calibration for depth-zero HDR misses only. Emerald
+    // MASK visibility holes retain depth zero; reflection/refraction stays physical.
+    float environmentBackgroundScale = 1.0f;
+    // >0: HDR texels brighter than this luminance are scaled down to it at load,
+    // so a scene can replace an HDR's blurred sun with an explicit sun light.
+    float environmentSunClamp = 0.0f;
     bool environmentMapDirty = false;   // UI flag to request an environment reload
 
     // Firefly clamping / variance control
@@ -290,16 +342,14 @@ struct RenderSettings {
     float fireflyClampFactor = 32.0f;
     float fireflyClampFloor = 4.0f;
     float throughputClamp = 32.0f;
-    float specularTailClampBase = 0.0f;
-    float specularTailClampRoughnessScale = 0.0f;
     float minSpecularPdf = 0.0f;
     float fireflyClampMaxContribution = 1000.0f;
 
     // Denoising settings
     bool denoiseEnabled = false;        // Enable OIDN denoising post-processing
     uint32_t denoiseFilterType = 0;     // 0=RT, 1=RTLightmap
-    bool denoiseUseAlbedo = true;       // Use albedo auxiliary buffer for denoising (future)
-    bool denoiseUseNormal = true;       // Use normal auxiliary buffer for denoising (future)
+    bool denoiseUseAlbedo = true;       // Use albedo auxiliary buffer for denoising
+    bool denoiseUseNormal = true;       // Use normal auxiliary buffer for denoising
     bool denoiseHdr = true;             // Treat denoise input as linear HDR radiance
     uint32_t denoiseFrequency = 4;      // Denoise every N frames (1=every frame, 4=every 4th frame, etc)
 
@@ -307,10 +357,130 @@ struct RenderSettings {
     // a-trous filtering, and normal/albedo edge stops. This is disabled by
     // default and intentionally separate from the OIDN CPU postprocess.
     bool svgfDenoiseEnabled = false;
+    bool svgfDenoiseDirect = true;
+    bool svgfDenoiseIndirect = true;
     uint32_t svgfAtrousIterations = 1;
     float svgfNormalSigma = 64.0f;
     float svgfAlbedoSigma = 16.0f;
     float svgfLuminanceSigma = 4.0f;
+
+    void markViewportQualityPresetOverride() {
+        if (viewportQualityPreset != ViewportQualityPreset::Custom) {
+            viewportQualityPresetOverridden = true;
+            viewportQualityPreset = ViewportQualityPreset::Custom;
+        }
+    }
+
+    void applyViewportQualityPreset(ViewportQualityPreset preset) {
+        viewportQualityPreset = preset;
+        viewportQualityPresetOverridden = false;
+        switch (preset) {
+            case ViewportQualityPreset::Interactive:
+                samplesPerFrame = 1u;
+                maxDepth = 32u;
+                renderScale = 0.5f;
+                executionMode = ExecutionMode::Megakernel;
+                wavefrontSchedulingPolicy = WavefrontSchedulingPolicy::Preview;
+                denoiseEnabled = true;
+                denoiseFrequency = 8u;
+                svgfDenoiseEnabled = false;
+                svgfDenoiseDirect = true;
+                svgfDenoiseIndirect = true;
+                svgfAtrousIterations = 1u;
+                break;
+            case ViewportQualityPreset::Balanced:
+                samplesPerFrame = 2u;
+                maxDepth = 50u;
+                renderScale = 0.75f;
+                executionMode = ExecutionMode::Megakernel;
+                wavefrontSchedulingPolicy = WavefrontSchedulingPolicy::Final;
+                denoiseEnabled = true;
+                denoiseFrequency = 4u;
+                svgfDenoiseEnabled = false;
+                svgfDenoiseDirect = true;
+                svgfDenoiseIndirect = true;
+                svgfAtrousIterations = 1u;
+                break;
+            case ViewportQualityPreset::FinalPreview:
+                samplesPerFrame = 4u;
+                maxDepth = 50u;
+                renderScale = 1.0f;
+                executionMode = ExecutionMode::Megakernel;
+                wavefrontSchedulingPolicy = WavefrontSchedulingPolicy::Offline;
+                denoiseEnabled = true;
+                denoiseFrequency = 2u;
+                svgfDenoiseEnabled = false;
+                svgfDenoiseDirect = true;
+                svgfDenoiseIndirect = true;
+                svgfAtrousIterations = 1u;
+                break;
+            case ViewportQualityPreset::Custom:
+            default:
+                viewportQualityPresetOverridden = true;
+                break;
+        }
+    }
 };
+
+// Radiance cache support matrix (see the README's radiance cache notes). The cache trains on the radiance a
+// plain path sample adds after a cached vertex; a feature that replaces that suffix with something else makes the
+// training target meaningless, so the cache refuses it. Returns nullptr when the cache may run with these settings
+// (or is off), otherwise a short reason code. A refused cache is off for the whole render on every backend; the
+// reason is printed and written to the metadata (radiance_cache_refusal_reason).
+inline const char* RadianceCacheRefusalReason(const RenderSettings& settings) {
+    if (settings.radianceCacheMode != RenderSettings::RadianceCacheMode::Prototype) {
+        return nullptr;
+    }
+    if (settings.restirGiMode != RenderSettings::RestirGiMode::Off) {
+        return "restir_gi";
+    }
+    if (settings.restirPtMode == RenderSettings::RestirPtMode::ProductionPathReuse ||
+        settings.restirPtMode == RenderSettings::RestirPtMode::EnhancedUnbiased ||
+        settings.restirPtMode == RenderSettings::RestirPtMode::EnhancedBiased) {
+        return "restir_pt_path_reuse";
+    }
+    return nullptr;
+}
+
+inline const char* RadianceCacheRefusalMessage(const char* reason) {
+    if (!reason) {
+        return "";
+    }
+    const std::string code(reason);
+    if (code == "restir_gi") {
+        return "ReSTIR GI replaces the BSDF sample before the cache query, so a training path's suffix is not a "
+               "plain path sample";
+    }
+    if (code == "restir_pt_path_reuse") {
+        return "ReSTIR PT path reuse substitutes reused path samples, so a training path's suffix is not a plain "
+               "path sample";
+    }
+    return "unsupported combination";
+}
+
+// The cache mode the renderers run: the requested mode unless the combination is refused.
+inline bool RadianceCacheActive(const RenderSettings& settings) {
+    return settings.radianceCacheMode == RenderSettings::RadianceCacheMode::Prototype &&
+           RadianceCacheRefusalReason(settings) == nullptr;
+}
+
+// ReSTIR DI reservoirs carry no medium state, so with volumeTransportMode=homogeneous the Metal renderers do not run
+// restir_di or restir_di_regir_hybrid: they render baseline_emissive, the plain surface NEE of every light (suns, mesh
+// emitters, rect lights; sample_direct_light_baseline). Volume NEE at scatter points does not depend on the mode.
+// Embree ignores volumes and runs the requested mode. The renderers log the demotion, and headless runs write it to
+// the render metadata (volume_direct_light_fallback), the ReSTIR DI path status (volume_baseline_emissive) and the
+// metrics JSON fallback report (volume_restir_di_interaction).
+inline bool RestirDiDemotedByVolume(const RenderSettings& settings) {
+    return settings.volumeTransportMode == RenderSettings::VolumeTransportMode::Homogeneous &&
+           (settings.directLightMode == RenderSettings::DirectLightMode::RestirDi ||
+            settings.directLightMode == RenderSettings::DirectLightMode::RestirDiRegirHybrid);
+}
+
+// The direct-light mode the Metal shaders run: the requested mode, or baseline_emissive for a ReSTIR DI mode that
+// homogeneous volumes demote.
+inline RenderSettings::DirectLightMode MetalDirectLightMode(const RenderSettings& settings) {
+    return RestirDiDemotedByVolume(settings) ? RenderSettings::DirectLightMode::BaselineEmissive
+                                             : settings.directLightMode;
+}
 
 }  // namespace PathTracer

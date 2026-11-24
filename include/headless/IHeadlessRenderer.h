@@ -6,6 +6,7 @@
 
 #include <simd/simd.h>
 
+#include "renderer/RadianceCacheTraining.h"
 #include "renderer/RenderSettings.h"
 #include "renderer/SceneResources.h"
 
@@ -93,6 +94,24 @@ struct HeadlessRenderOutput {
         DirectLightShadowPathAudit shadowPath;
     };
 
+    struct DirectLightBsdfAuditEntry {
+        uint32_t depth = 0;
+        uint32_t materialIndex = 0;
+        bool frontFace = false;
+        bool isDelta = false;
+        uint32_t closureType = 0;
+        bool usedRandomWalk = false;
+        uint32_t rngBefore = 0;
+        uint32_t rngAfter = 0;
+        simd::float3 shadingNormal = {0.0f, 0.0f, 0.0f};
+        simd::float3 incidentDirection = {0.0f, 0.0f, 0.0f};
+        simd::float3 wo = {0.0f, 0.0f, 0.0f};
+        simd::float3 sampledDirection = {0.0f, 0.0f, 0.0f};
+        float pdf = 0.0f;
+        float directionalPdf = 0.0f;
+        uint32_t lobeType = 0;
+    };
+
     struct RisAuditState {
         bool available = false;
         bool valid = false;
@@ -111,6 +130,10 @@ struct HeadlessRenderOutput {
         simd::float3 winnerContribution = {0.0f, 0.0f, 0.0f};
         float wSum = 0.0f;
         float W = 0.0f;
+        uint32_t rngBefore = 0u;
+        uint32_t rngAfter = 0u;
+        uint32_t rngTemporalBefore = 0u;
+        uint32_t rngTemporalAfter = 0u;
         bool spatialReuseAttempted = false;
         uint32_t spatialNeighborTarget = 0u;
         uint32_t spatialNeighborsConsidered = 0u;
@@ -170,6 +193,19 @@ struct HeadlessRenderOutput {
         float cacheLastMergeWeight = 0.0f;
     };
 
+    struct RisCandidateAuditEntry {
+        uint32_t candidateIndex = 0u;
+        uint32_t primitiveIndex = 0xFFFFFFFFu;
+        uint32_t rngBefore = 0u;
+        uint32_t rngAfter = 0u;
+        uint32_t reservoirM = 0u;
+        bool valid = false;
+        float pdf = 0.0f;
+        float phat = 0.0f;
+        float weight = 0.0f;
+        float reservoirWSum = 0.0f;
+    };
+
     struct DirectLightAuditDump {
         bool available = false;
         uint32_t pixelX = 0;
@@ -179,6 +215,7 @@ struct HeadlessRenderOutput {
         uint32_t materialIndex = 0;
         uint32_t materialType = 0;
         uint32_t primitiveIndex = 0;
+        uint32_t rawMaterialType = 0;
         simd::float3 hitPosition = {0.0f, 0.0f, 0.0f};
         simd::float3 shadingNormal = {0.0f, 0.0f, 0.0f};
         simd::float3 wo = {0.0f, 0.0f, 0.0f};
@@ -187,7 +224,13 @@ struct HeadlessRenderOutput {
         float roughness = 0.0f;
         float baseColorLod = 0.0f;
         uint32_t baseColorTextureIndex = 0xFFFFFFFFu;
+        simd::float4 pbrParams = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 pbrExtras = {0.0f, 0.0f, 0.0f, 0.0f};
+        simd::float4 typeEta = {0.0f, 0.0f, 0.0f, 0.0f};
+        float diffuseOcclusion = 1.0f;
         RisAuditState ris;
+        std::vector<RisCandidateAuditEntry> risCandidates;
+        std::vector<DirectLightBsdfAuditEntry> bsdfPath;
         std::vector<DirectLightAuditEntry> entries;
     };
 
@@ -234,10 +277,11 @@ struct HeadlessRenderOutput {
         simd::float3 finalSpecularContribution = {0.0f, 0.0f, 0.0f};
         simd::float3 directContribution = {0.0f, 0.0f, 0.0f};
         float directContributionKind = 0.0f; // 0 none, 1 env, 2 rect
-        float envLod = 0.0f;
     };
 
     struct PbrMetrics {
+        static constexpr uint32_t kRestirPtEnhancedHistogramBins = 8;
+
         bool available = false;
         uint64_t throughputNanInfCount = 0;
         uint64_t radianceNanInfCount = 0;
@@ -254,6 +298,9 @@ struct HeadlessRenderOutput {
         uint64_t mneeEnvChainMaxBounceCount = 0;
         uint64_t mneeRectAddedCount = 0;
         uint64_t mneeContributionCount = 0;
+        uint64_t restirDiRegirCandidateCount = 0;
+        uint64_t restirDiRegirAcceptedCount = 0;
+        uint64_t restirDiRegirFallbackCount = 0;
         uint64_t restirGiCandidateCount = 0;
         uint64_t restirGiReservoirUpdateCount = 0;
         uint64_t restirGiAcceptCount = 0;
@@ -272,12 +319,35 @@ struct HeadlessRenderOutput {
         uint64_t restirPtReuseAppliedCount = 0;
         uint64_t restirPtReuseRejectedInvalidCount = 0;
         uint64_t restirPtReuseFallbackCount = 0;
+        uint64_t restirPtEnhancedCandidateCount = 0;
+        uint64_t restirPtEnhancedInitialSelectedCount = 0;
+        uint64_t restirPtEnhancedTemporalAcceptedCount = 0;
+        uint64_t restirPtEnhancedTemporalRejectedCount = 0;
+        uint64_t restirPtEnhancedSpatialAcceptedCount = 0;
+        uint64_t restirPtEnhancedSpatialRejectedCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftGeometryCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftMaterialCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftPdfCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftVisibilityCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftInvertibilityCount = 0;
+        uint64_t restirPtEnhancedInvalidShiftUnsupportedCount = 0;
+        uint64_t restirPtEnhancedDuplicateScoreSum = 0;
+        uint64_t restirPtEnhancedBiasedCCapApplicationCount = 0;
+        uint64_t restirPtEnhancedVectorWeightUseCount = 0;
+        uint64_t restirPtEnhancedReplayCompactionInputCount = 0;
+        uint64_t restirPtEnhancedReplayCompactionOutputCount = 0;
+        uint64_t restirPtEnhancedFallbackCount = 0;
+        uint64_t restirPtEnhancedCanonicalSampleCount = 0;
+        uint64_t restirPtEnhancedPathLengthHistogram[kRestirPtEnhancedHistogramBins] = {};
+        uint64_t restirPtEnhancedReconnectionDepthHistogram[kRestirPtEnhancedHistogramBins] = {};
         uint64_t radianceCacheQueryCount = 0;
         uint64_t radianceCacheHitCount = 0;
         uint64_t radianceCacheMissCount = 0;
         uint64_t radianceCacheTrainCount = 0;
         uint64_t radianceCacheFallbackCount = 0;
         uint64_t radianceCacheInvalidCount = 0;
+        // Whole-render radiance cache counters, RadianceCacheTraining::RadianceCacheStat layout.
+        uint64_t radianceCacheStats[PathTracer::RadianceCacheTraining::kStatCount] = {};
         uint64_t causticEyeVertexCount = 0;
         uint64_t causticLightVertexCount = 0;
         uint64_t causticConnectionCandidateCount = 0;
@@ -293,6 +363,8 @@ struct HeadlessRenderOutput {
         uint64_t spectralMaterialLookupCount = 0;
         uint64_t spectralDispersionEventCount = 0;
         uint64_t spectralFallbackCount = 0;
+        uint64_t spectralCollapseCount = 0;
+        uint64_t spectralWavelengthChannelSampleCount = 0;
         std::vector<float> maxThroughputByBounce;
     };
 
@@ -319,6 +391,18 @@ struct HeadlessRenderOutput {
         bool hardwareRaytracingActive = false;
         bool hardwareRaytracingFallbackActive = false;
         std::string hardwareRaytracingFallbackReason;
+        std::string megakernelIntegratePipeline;
+        // Random-walk subsurface over the whole render: walks, exits, absorbed, open mesh, step limit.
+        uint64_t sssWalkStats[5] = {};
+        // The same counts per material that walked, with the material's name and the render's step limit.
+        struct SssWalkMaterialStats {
+            std::string material;
+            uint64_t stats[5] = {};
+        };
+        std::vector<SssWalkMaterialStats> sssWalkMaterials;
+        uint32_t sssMaxSteps = 0;
+        std::string wavefrontDirectLightFallback = "none";
+        std::string wavefrontMegakernelFallback = "none";
         std::string deviceName;
         uint64_t deviceRecommendedMaxWorkingSetBytes = 0;
         bool deviceSupportsRaytracing = false;
@@ -328,11 +412,16 @@ struct HeadlessRenderOutput {
         bool deviceSupportsMetalFX = false;
         bool deviceSupportsMLBackend = false;
         std::string accelerationBuildPolicy;
+        std::string accelerationBuildPolicyReason;
+        std::string accelerationCompactionPolicy;
         std::string accelerationIdentityStrategy;
         std::string accelerationIntersectionFunctionStrategy;
         bool accelerationIdentityStable = false;
         bool accelerationCustomIntersectionFunctionsSupported = false;
         bool accelerationCustomIntersectionFunctionsEnabled = false;
+        double accelerationBlasCompactionRatio = 0.0;
+        double accelerationTlasCompactionRatio = 0.0;
+        std::string accelerationTraversalCoverage;
         uint32_t intersectionMode = 0;
         uint32_t accelerationPrimitiveCount = 0;
         uint32_t accelerationInstanceCount = 0;
@@ -372,11 +461,15 @@ struct HeadlessRenderOutput {
         uint64_t restirDiReservoirBytesEach = 0;
         uint64_t restirDiVisibilityBytes = 0;
         uint64_t restirDiDebugBytes = 0;
+        std::string restirDiPathStatus;
         uint64_t transportMemoryBytesTotal = 0;
         uint64_t transportMemoryBytesPrivate = 0;
         uint64_t transportMemoryBytesShared = 0;
         uint64_t transportMemoryBytesStaging = 0;
         uint32_t transportMemoryRecordCount = 0;
+        uint32_t transportMemoryAllocatorBackedRecordCount = 0;
+        uint32_t transportMemoryFrameGraphBackedRecordCount = 0;
+        uint32_t transportMemoryOwnershipGapRecordCount = 0;
         uint32_t transportMemoryInvalidatedRecordCount = 0;
         uint64_t wavefrontPrimaryGeneratedCount = 0;
         uint64_t wavefrontIntersectProcessedCount = 0;
@@ -412,6 +505,9 @@ struct HeadlessRenderOutput {
         std::vector<std::string> passGraphExecutedPasses;
         std::vector<std::string> passGraphSkippedPasses;
         std::vector<std::string> passGraphFailedPasses;
+        bool passGraphTimingAvailable = false;
+        std::vector<std::string> passGraphTimingNames;
+        std::vector<double> passGraphTimingMs;
         std::vector<std::string> passGraphNames;
         std::vector<std::string> passGraphTypes;
         std::vector<std::string> passGraphExecutions;
@@ -431,6 +527,7 @@ struct HeadlessRenderOutput {
         std::vector<std::string> passGraphResourceTargetOwners;
         std::vector<std::string> passGraphResourceFeatureGates;
         std::vector<std::string> passGraphResourceDebugReadbackPolicies;
+        std::vector<std::string> passGraphResourceClearLoadPolicies;
         std::vector<std::string> passGraphResourceMigrationRisks;
         std::vector<int32_t> passGraphResourceFirstPasses;
         std::vector<int32_t> passGraphResourceLastPasses;
@@ -466,6 +563,8 @@ struct HeadlessRenderOutput {
         std::vector<uint32_t> transportMemoryInvalidationCounts;
         std::vector<uint32_t> transportMemoryHotPath;
         std::vector<uint32_t> transportMemoryTemporaryShared;
+        std::vector<uint32_t> transportMemoryFrameGraphOwned;
+        std::vector<uint32_t> transportMemoryAllocatorOwned;
         uint32_t mlBackendMode = 0;
         bool mlBackendRequested = false;
         bool mlBackendActive = false;
@@ -482,6 +581,7 @@ struct HeadlessRenderOutput {
         bool pipelineRuntimeSourceCompilation = true;
         bool pipelineFunctionConstantsUsed = false;
         bool pipelineMetalBinaryArchiveUsed = false;
+        bool pipelineMetalBinaryArchiveSerialized = false;
         bool pipelineHarvestedCompilationReady = false;
         uint64_t pipelineShaderSourceBytes = 0;
         double pipelineLibraryCompileMs = 0.0;
@@ -490,6 +590,7 @@ struct HeadlessRenderOutput {
         uint32_t pipelineFailedPipelineCount = 0;
         std::string pipelineCacheStrategy;
         std::string pipelineSpecializationStrategy;
+        std::string pipelineBinaryArchivePath;
         std::vector<std::string> pipelineCompileKeys;
         std::vector<std::string> pipelineCompileFunctions;
         std::vector<std::string> pipelineCompileStages;
