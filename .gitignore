@@ -160,3 +160,6 @@ validation/baselines/*
 !validation/baselines/r3_spatial_thresholds.json
 !validation/baselines/r3_final_thresholds.json
 !validation/baselines/r4_temporal_thresholds.json
+
+# README gallery images (the rules above ignore *.jpg).
+!Images/Gallery/*.jpg
