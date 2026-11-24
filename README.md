@@ -977,7 +977,7 @@ tests/public/headless_smoke_test.sh
 
 ## Release
 
-[![Latest Release](https://img.shields.io/badge/latest-v4.0.0-blue)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases/latest)
+[![Latest Release](Images/badges/latest-release.svg)](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases/latest)
 
 Release notes, source archives, and asset-pack links are published through
 [GitHub Releases](https://github.com/dariopagliaricci/Metal-PathTracer-arm64/releases).
