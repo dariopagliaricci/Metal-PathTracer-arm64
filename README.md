@@ -997,7 +997,7 @@ build/PathTracerHeadless --scene=ajax --width=640 --height=360 --spp=64 \
 The other scenes in this README, including every gallery scene, need the v4
 asset pack, which is distributed separately because of its size.
 
-- Download the v4 asset pack from [this link](ASSET_PACK_V4_LINK).
+- Download the v4 asset pack from [this link](https://drive.google.com/file/d/1N7OLGjs4FPK57eoMsdOd8tS2iHmQTO7X/view).
 - Unzip it.
 - Copy or replace the `assets` folder in the root of your clone before you
   render a scene from the pack. The headless renderer resolves scenes from the
