@@ -291,7 +291,7 @@ metrics in the PR and explain why the new result is correct.
 5. Open a pull request against `main`. The PR description should summarize what
    changed, why it changed, which paths are affected, and any remaining risk.
 
-6. CI currently builds a source-only public headless configuration on `macos-14`
+6. CI currently builds a source-only public headless configuration on `macos-26`
    with OIDN disabled and runs `PathTracerHeadless --help`. PRs should pass CI
    before review proceeds.
 
