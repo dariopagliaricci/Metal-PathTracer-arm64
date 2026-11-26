@@ -385,7 +385,10 @@ id<MTLTexture> PromoteTextureToPrivate(id<MTLDevice> device,
                                        id<MTLCommandQueue> commandQueue,
                                        id<MTLTexture> source);
 
+// Guarded by `mutex`: Embree's texture copies (materialTextureCpuData) resolve DDS sources on several threads.
+// The returned map pointers stay valid: unordered_map keeps its nodes when it grows.
 struct ManifestTextureSourceCache {
+    std::mutex mutex;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> manifestToTextureSources;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> manifestToTextureHashes;
     std::unordered_set<std::string> failedManifests;
@@ -479,6 +482,7 @@ bool LoadManifestTextureMetadata(const std::string& manifestPath) {
 
 const std::unordered_map<std::string, std::string>* LoadManifestTextureSources(const std::string& manifestPath) {
     auto& cache = TextureSourceCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
     if (!LoadManifestTextureMetadata(manifestPath)) {
         return nullptr;
     }
@@ -488,6 +492,7 @@ const std::unordered_map<std::string, std::string>* LoadManifestTextureSources(c
 
 const std::unordered_map<std::string, std::string>* LoadManifestTextureOutputHashes(const std::string& manifestPath) {
     auto& cache = TextureSourceCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
     if (!LoadManifestTextureMetadata(manifestPath)) {
         return nullptr;
     }
@@ -970,7 +975,8 @@ id<MTLTexture> CreateTextureFromDecodedRgba8(id<MTLDevice> device,
                                              MTLPixelFormat pixelFormat,
                                              bool buildMipmaps,
                                              MTLStorageMode storageMode,
-                                             std::string& errorMessage) {
+                                             std::string& errorMessage,
+                                             std::vector<std::vector<uint8_t>>* levelsAhead = nullptr) {
     if (!device || image.width == 0 || image.height == 0 || image.rgba.empty()) {
         errorMessage = "Material texture load failed: decoded image is empty";
         return nil;
@@ -1026,38 +1032,59 @@ id<MTLTexture> CreateTextureFromDecodedRgba8(id<MTLDevice> device,
            destinationOrigin:MTLOriginMake(0, 0, 0)];
         id<MTLBuffer> mipStagingBuffer = nil;
         if (buildMipmaps && texture.mipmapLevelCount > 1u) {
-            if (MipChain::BoxChainKeepsMean(image.width, image.height)) {
-                [blit generateMipmapsForTexture:texture];
-            } else {
-                // Not a power of two: the blit's filter does not keep the texture mean at the coarse levels. Upload
-                // the footprint-filtered levels (MipChain.h); Embree's CPU copy decodes the same levels.
-                const std::vector<MipChain::Rgba8Level> levels = MipChain::BuildRgba8MipLevels(
-                    image.rgba.data(), image.width, image.height, pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB);
-                size_t levelBytes = 0u;
-                for (const auto& level : levels) levelBytes += level.rgba.size();
-                mipStagingBuffer = levelBytes > 0u
-                    ? [device newBufferWithLength:levelBytes options:MTLResourceStorageModeShared] : nil;
-                if (!mipStagingBuffer || levels.size() + 1u != texture.mipmapLevelCount) {
-                    [blit endEncoding];
-                    errorMessage = "Material texture load failed: unable to stage the mip levels";
-                    return nil;
+            // The blit's levels do not keep the texture mean: at odd sizes its filter drops texels, and on sRGB
+            // textures its per-level rounding raises the mean. Upload MipChain.h's footprint-filtered levels at every
+            // size; Embree's CPU copy decodes the same levels. `levelsAhead`, the prefetch's levels built from the same
+            // bytes as an sRGB colour image, are used when their sizes fit (and moved out, so the caller sees them used).
+            const bool srgb = pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
+            std::vector<MipChain::Rgba8Level> levels;
+            if (srgb && levelsAhead && !levelsAhead->empty()) {
+                uint32_t levelWidth = image.width;
+                uint32_t levelHeight = image.height;
+                bool fits = true;
+                for (const std::vector<uint8_t>& bytes : *levelsAhead) {
+                    levelWidth = MipChain::NextLevelSize(levelWidth);
+                    levelHeight = MipChain::NextLevelSize(levelHeight);
+                    fits = fits && bytes.size() == static_cast<size_t>(levelWidth) * levelHeight * 4u;
                 }
-                size_t offset = 0u;
-                for (size_t level = 0u; level < levels.size(); ++level) {
-                    const MipChain::Rgba8Level& mip = levels[level];
-                    std::memcpy(static_cast<uint8_t*>([mipStagingBuffer contents]) + offset, mip.rgba.data(),
-                                mip.rgba.size());
-                    [blit copyFromBuffer:mipStagingBuffer
-                            sourceOffset:offset
-                       sourceBytesPerRow:static_cast<NSUInteger>(mip.width) * 4u
-                     sourceBytesPerImage:mip.rgba.size()
-                              sourceSize:MTLSizeMake(mip.width, mip.height, 1)
-                               toTexture:texture
-                        destinationSlice:0
-                        destinationLevel:level + 1u
-                       destinationOrigin:MTLOriginMake(0, 0, 0)];
-                    offset += mip.rgba.size();
+                if (fits) {
+                    levelWidth = image.width;
+                    levelHeight = image.height;
+                    for (std::vector<uint8_t>& bytes : *levelsAhead) {
+                        levelWidth = MipChain::NextLevelSize(levelWidth);
+                        levelHeight = MipChain::NextLevelSize(levelHeight);
+                        levels.push_back({levelWidth, levelHeight, std::move(bytes)});
+                    }
+                    levelsAhead->clear();
                 }
+            }
+            if (levels.empty()) {
+                levels = MipChain::BuildRgba8MipLevels(image.rgba.data(), image.width, image.height, srgb);
+            }
+            size_t levelBytes = 0u;
+            for (const auto& level : levels) levelBytes += level.rgba.size();
+            mipStagingBuffer = levelBytes > 0u
+                ? [device newBufferWithLength:levelBytes options:MTLResourceStorageModeShared] : nil;
+            if (!mipStagingBuffer || levels.size() + 1u != texture.mipmapLevelCount) {
+                [blit endEncoding];
+                errorMessage = "Material texture load failed: unable to stage the mip levels";
+                return nil;
+            }
+            size_t offset = 0u;
+            for (size_t level = 0u; level < levels.size(); ++level) {
+                const MipChain::Rgba8Level& mip = levels[level];
+                std::memcpy(static_cast<uint8_t*>([mipStagingBuffer contents]) + offset, mip.rgba.data(),
+                            mip.rgba.size());
+                [blit copyFromBuffer:mipStagingBuffer
+                        sourceOffset:offset
+                   sourceBytesPerRow:static_cast<NSUInteger>(mip.width) * 4u
+                 sourceBytesPerImage:mip.rgba.size()
+                          sourceSize:MTLSizeMake(mip.width, mip.height, 1)
+                           toTexture:texture
+                    destinationSlice:0
+                    destinationLevel:level + 1u
+                   destinationOrigin:MTLOriginMake(0, 0, 0)];
+                offset += mip.rgba.size();
             }
         }
         [blit endEncoding];
@@ -1246,9 +1273,16 @@ NSUInteger BytesPerCompressedBlock(MTLPixelFormat format) {
     }
 }
 
+// Whether Metal decodes the format's colour from sRGB when it samples it. The block-compressed sRGB formats count:
+// a DDS-backed colour texture is resident as BC1 or BC3 sRGB, and its CPU copy (the converted KTX2) must be decoded
+// to linear as Metal samples it.
 bool IsSrgbPixelFormat(MTLPixelFormat format) {
     return format == MTLPixelFormatRGBA8Unorm_sRGB ||
-           format == MTLPixelFormatBGRA8Unorm_sRGB;
+           format == MTLPixelFormatBGRA8Unorm_sRGB ||
+           format == MTLPixelFormatBC1_RGBA_sRGB ||
+           format == MTLPixelFormatBC2_RGBA_sRGB ||
+           format == MTLPixelFormatBC3_RGBA_sRGB ||
+           format == MTLPixelFormatBC7_RGBAUnorm_sRGB;
 }
 
 NSUInteger MipDimension(NSUInteger base, NSUInteger level) {
@@ -1474,38 +1508,6 @@ bool WriteTextureLevelFromFloat(id<MTLTexture> texture,
                  withBytes:rawData.data()
                bytesPerRow:bytesPerRow];
     return true;
-}
-
-// The next level of a power-of-two texture's CPU copy: the 2x2 box, which Metal's generateMipmapsForTexture also runs on
-// exact halvings. Textures of other sizes take MipChain.h's footprint-filtered levels on both backends instead
-// (populateRgba8 in materialTextureCpuData); they replace the emulation of the blit's filter for odd sizes that this
-// function held before.
-void DownsampleMipLevelBox(const std::vector<float>& src,
-                           uint32_t srcWidth,
-                           uint32_t srcHeight,
-                           std::vector<float>& dst,
-                           uint32_t dstWidth,
-                           uint32_t dstHeight) {
-    dst.assign(static_cast<size_t>(dstWidth) * static_cast<size_t>(dstHeight) * 4u, 0.0f);
-    for (uint32_t y = 0; y < dstHeight; ++y) {
-        for (uint32_t x = 0; x < dstWidth; ++x) {
-            simd::float4 accum = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            for (uint32_t oy = 0; oy < 2u; ++oy) {
-                for (uint32_t ox = 0; ox < 2u; ++ox) {
-                    const uint32_t sx = std::min(x * 2u + ox, srcWidth - 1u);
-                    const uint32_t sy = std::min(y * 2u + oy, srcHeight - 1u);
-                    const size_t idx = (static_cast<size_t>(sy) * srcWidth + static_cast<size_t>(sx)) * 4u;
-                    accum += simd_make_float4(src[idx + 0u], src[idx + 1u], src[idx + 2u], src[idx + 3u]);
-                }
-            }
-            accum /= 4.0f;
-            const size_t out = (static_cast<size_t>(y) * dstWidth + static_cast<size_t>(x)) * 4u;
-            dst[out + 0u] = accum.x;
-            dst[out + 1u] = accum.y;
-            dst[out + 2u] = accum.z;
-            dst[out + 3u] = accum.w;
-        }
-    }
 }
 
 void DownsampleOrmMipLevel(const std::vector<float>& src,
@@ -1776,9 +1778,9 @@ id<MTLTexture> PromoteTextureToPrivate(id<MTLDevice> device,
     return CopyTextureLevels(device, commandQueue, source, MTLStorageModePrivate);
 }
 
-// Mips for a single-level material texture, such as a KTX2 image. Power-of-two textures take the blit. Other sizes take
-// MipChain.h's footprint-filtered levels, which keep the texture mean (the blit's filter does not); decoded images
-// get the same levels in CreateTextureFromDecodedRgba8, and Embree's CPU copy decodes them.
+// Mips for a single-level material texture, such as a KTX2 image. 8-bit RGBA textures take MipChain.h's
+// footprint-filtered levels at every size, which keep the texture mean (the blit's levels do not); decoded images get
+// the same levels in CreateTextureFromDecodedRgba8, and Embree's CPU copy decodes them. Other formats take the blit.
 id<MTLTexture> BuildMaterialTextureWithMips(id<MTLDevice> device,
                                             id<MTLCommandQueue> commandQueue,
                                             id<MTLTexture> source,
@@ -1788,12 +1790,12 @@ id<MTLTexture> BuildMaterialTextureWithMips(id<MTLDevice> device,
     }
     const uint32_t width = static_cast<uint32_t>(source.width);
     const uint32_t height = static_cast<uint32_t>(source.height);
-    if (MipChain::BoxChainKeepsMean(width, height)) {
-        return BuildTextureWithBlitMips(device, commandQueue, source, storageMode);
-    }
     const MTLPixelFormat format = source.pixelFormat;
     const bool rgba8 = format == MTLPixelFormatRGBA8Unorm || format == MTLPixelFormatRGBA8Unorm_sRGB ||
                        format == MTLPixelFormatBGRA8Unorm || format == MTLPixelFormatBGRA8Unorm_sRGB;
+    if (!rgba8 && MipChain::BoxChainKeepsMean(width, height)) {
+        return BuildTextureWithBlitMips(device, commandQueue, source, storageMode);
+    }
     if (!rgba8) {
         std::cerr << "[MaterialTexture] warning: " << width << "x" << height << " texture in pixel format "
                   << static_cast<unsigned long>(format)
@@ -2424,6 +2426,10 @@ inline simd::float3 ClampPositive(const simd::float3& value) {
 // buffers take about 75 bytes per texel at their peak, so chains in parallel would multiply that. The request uploads the
 // levels (CreateNormalMipTexture) instead of running BuildTextureWithNormalMips on the loading thread. A request that
 // changes the decoded bytes first (FlipDecodedImageRows), or that is not a mipmapped normal map, does not use the chain.
+// An image listed as an sRGB colour texture (srgbColor) also gets its MipChain.h levels built ahead, by the worker that
+// decoded it, so the chains build in parallel: about 21 bytes per texel at their peak, within the window of 6. A request
+// that uploads the same decoded bytes as a mipmapped sRGB texture uses them (CreateTextureFromDecodedRgba8); they are the
+// levels it would build itself.
 struct MaterialImagePrefetch {
     static constexpr size_t kWindow = 6u;
     static constexpr size_t kMaxHeldBytes = size_t{384} << 20;
@@ -2438,16 +2444,19 @@ struct MaterialImagePrefetch {
         DecodedImageRgba8 image;
         Ktx2::ImageData ktx2Image;
         std::vector<std::vector<uint8_t>> normalLevels;  // built ahead for a normal map, or empty
+        std::vector<std::vector<uint8_t>> colorLevels;  // levels 1 and up built ahead for an sRGB colour image, or empty
         std::string error;
         size_t bytes() const {
             size_t total = image.rgba.size() + ktx2Image.rgba.size();
             for (const std::vector<uint8_t>& level : normalLevels) total += level.size();
+            for (const std::vector<uint8_t>& level : colorLevels) total += level.size();
             return total;
         }
         void clearResults() {
             image = DecodedImageRgba8{};
             ktx2Image = Ktx2::ImageData{};
             normalLevels = {};
+            colorLevels = {};
         }
     };
     struct State {
@@ -2466,6 +2475,8 @@ struct MaterialImagePrefetch {
         double waitedSeconds = 0.0;  // time requests spent waiting for decodes in flight
         size_t normalChainsAhead = 0u;
         size_t normalChainsUnused = 0u;  // built ahead, then not used by their request
+        size_t colorChainsAhead = 0u;
+        size_t colorChainsUnused = 0u;  // built ahead, then not used by their request
         bool buildNormalChains = false;
         dispatch_queue_t chainQueue = nil;  // serial: the normal-map chains built ahead
         bool stopped = false;
@@ -2541,6 +2552,7 @@ struct MaterialImagePrefetch {
                 }
                 item.source.path = canonicalPath;
                 item.source.normalMap = source.normalMap;
+                item.source.srgbColor = source.srgbColor;
                 state->byPath[canonicalPath] = state->items.size();
             }
             ktx2Listed += item.ktx2 ? 1u : 0u;
@@ -2598,12 +2610,20 @@ struct MaterialImagePrefetch {
                                           : BuildNormalMipLevelsRgba8(decoded->rgba.data(), decoded->width,
                                                                       decoded->height);
                         }
-                        Finish(shared, index, true, std::move(*decoded), std::move(*parsed), std::move(levels),
+                        Finish(shared, index, true, std::move(*decoded), std::move(*parsed), std::move(levels), {},
                                std::string{});
                     });
                     return;
                 }
-                Finish(shared, index, ok, std::move(image), std::move(ktx2Image), {}, std::move(error));
+                std::vector<std::vector<uint8_t>> colorLevels;
+                if (ok && !ktx2 && !source.normalMap && source.srgbColor && shared->buildNormalChains) {
+                    for (MipChain::Rgba8Level& level :
+                         MipChain::BuildRgba8MipLevels(image.rgba.data(), image.width, image.height, /*srgb=*/true)) {
+                        colorLevels.push_back(std::move(level.rgba));
+                    }
+                }
+                Finish(shared, index, ok, std::move(image), std::move(ktx2Image), {}, std::move(colorLevels),
+                       std::move(error));
             });
         }
     }
@@ -2611,7 +2631,7 @@ struct MaterialImagePrefetch {
     // Stores a finished item's results, or frees them if the item was dropped while it ran.
     static void Finish(const std::shared_ptr<State>& shared, size_t index, bool ok, DecodedImageRgba8&& image,
                        Ktx2::ImageData&& ktx2Image, std::vector<std::vector<uint8_t>>&& normalLevels,
-                       std::string&& error) {
+                       std::vector<std::vector<uint8_t>>&& colorLevels, std::string&& error) {
         std::lock_guard<std::mutex> lock(shared->mutex);
         Item& item = shared->items[index];
         ++shared->decodedAhead;
@@ -2625,8 +2645,10 @@ struct MaterialImagePrefetch {
             item.image = std::move(image);
             item.ktx2Image = std::move(ktx2Image);
             item.normalLevels = std::move(normalLevels);
+            item.colorLevels = std::move(colorLevels);
             shared->heldBytes += item.bytes();
             shared->normalChainsAhead += item.normalLevels.empty() ? 0u : 1u;
+            shared->colorChainsAhead += item.colorLevels.empty() ? 0u : 1u;
             item.error = std::move(error);
             item.stage = Stage::Done;
         }
@@ -2635,16 +2657,19 @@ struct MaterialImagePrefetch {
 
     // True when the prefetch owns this image: then `ok`, `out` and `error` are the decoder's results. False when the
     // caller must decode it itself. `normalLevels`, when given, receives the mip chain built ahead for a normal map
-    // (BuildNormalMipLevelsRgba8 of `out`), or is left empty.
+    // (BuildNormalMipLevelsRgba8 of `out`), or is left empty. `colorLevels`, when given, receives the levels 1 and up
+    // built ahead for an sRGB colour image (MipChain::BuildRgba8MipLevels of `out` with srgb set), or is left empty.
     bool take(const std::string& path, const uint8_t* data, size_t size,
               DecodedImageRgba8& out, bool& ok, std::string& error,
-              std::vector<std::vector<uint8_t>>* normalLevels = nullptr) {
+              std::vector<std::vector<uint8_t>>* normalLevels = nullptr,
+              std::vector<std::vector<uint8_t>>* colorLevels = nullptr) {
         std::unique_lock<std::mutex> lock(state->mutex);
         Item* item = claim(lock, path, data, size, /*ktx2=*/false);
         if (!item) return false;
         const size_t bytes = item->bytes();
         out = std::move(item->image);
         if (normalLevels) *normalLevels = std::move(item->normalLevels);
+        if (colorLevels) *colorLevels = std::move(item->colorLevels);
         ok = item->ok;
         error = std::move(item->error);
         release(*item, bytes);
@@ -2671,6 +2696,12 @@ struct MaterialImagePrefetch {
     void noteNormalChainUnused() {
         std::lock_guard<std::mutex> lock(state->mutex);
         ++state->normalChainsUnused;
+    }
+
+    // Counts a colour chain built ahead that its request did not use, for the [TexturePrefetch] line.
+    void noteColorChainUnused() {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        ++state->colorChainsUnused;
     }
 
 private:
@@ -2752,9 +2783,10 @@ namespace {
 
 bool DecodeMaterialImageFile(MaterialImagePrefetch* prefetch, const std::string& canonicalPath,
                              DecodedImageRgba8& out, std::string& error,
-                             std::vector<std::vector<uint8_t>>* normalLevels = nullptr) {
+                             std::vector<std::vector<uint8_t>>* normalLevels = nullptr,
+                             std::vector<std::vector<uint8_t>>* colorLevels = nullptr) {
     bool ok = false;
-    if (prefetch && prefetch->take(canonicalPath, nullptr, 0u, out, ok, error, normalLevels)) {
+    if (prefetch && prefetch->take(canonicalPath, nullptr, 0u, out, ok, error, normalLevels, colorLevels)) {
         return ok;
     }
     return DecodeImageFileToRgba8(canonicalPath, out, error);
@@ -2762,9 +2794,10 @@ bool DecodeMaterialImageFile(MaterialImagePrefetch* prefetch, const std::string&
 
 bool DecodeMaterialImageData(MaterialImagePrefetch* prefetch, const uint8_t* data, size_t size,
                              DecodedImageRgba8& out, std::string& error,
-                             std::vector<std::vector<uint8_t>>* normalLevels = nullptr) {
+                             std::vector<std::vector<uint8_t>>* normalLevels = nullptr,
+                             std::vector<std::vector<uint8_t>>* colorLevels = nullptr) {
     bool ok = false;
-    if (prefetch && prefetch->take(std::string(), data, size, out, ok, error, normalLevels)) {
+    if (prefetch && prefetch->take(std::string(), data, size, out, ok, error, normalLevels, colorLevels)) {
         return ok;
     }
     return DecodeImageDataToRgba8(data, size, out, error);
@@ -3508,11 +3541,13 @@ void SceneResources::endMaterialImagePrefetch() {
     NSLog(@"[TexturePrefetch] %zu images listed (%zu of them KTX2 files to parse; %zu duplicates of a listed image not "
           @"listed), %zu decoded ahead (window %zu, %zu MiB held at most), %zu taken by requests; the rest were skipped "
           @"by the loader or decoded by their request; %zu normal-map mip chains built ahead (%zu not used by their "
-          @"request); listing took %.0f ms, requests waited %.0f ms for decodes",
+          @"request); %zu colour mip chains built ahead (%zu not used by their request); listing took %.0f ms, "
+          @"requests waited %.0f ms for decodes",
           state.items.size(), m_materialImagePrefetch->ktx2Listed, m_materialImagePrefetch->duplicatesSkipped,
           state.decodedAhead,
           MaterialImagePrefetch::kWindow, MaterialImagePrefetch::kMaxHeldBytes >> 20, state.taken,
-          state.normalChainsAhead, state.normalChainsUnused, m_materialImagePrefetch->listingSeconds * 1000.0,
+          state.normalChainsAhead, state.normalChainsUnused, state.colorChainsAhead, state.colorChainsUnused,
+          m_materialImagePrefetch->listingSeconds * 1000.0,
           state.waitedSeconds * 1000.0);
     m_materialImagePrefetch.reset();
 }
@@ -3665,6 +3700,7 @@ uint32_t SceneResources::addMaterialTextureFromFile(const std::string& path,
 
     id<MTLTexture> texture = nil;
     std::vector<std::vector<uint8_t>> normalLevels;  // a normal map's mip chain, built ahead by the prefetch
+    std::vector<std::vector<uint8_t>> colorLevels;  // an sRGB colour image's levels 1 and up, built ahead by the prefetch
     bool levelZeroTransformed = false;  // the decoded bytes were changed after the chain was built from them
     if (HasExtensionCaseInsensitive(canonicalPath, ".ktx2")) {
         std::string loadError;
@@ -3702,7 +3738,7 @@ uint32_t SceneResources::addMaterialTextureFromFile(const std::string& path,
     } else {
         DecodedImageRgba8 decoded{};
         std::string loadError;
-        if (!(IsNativeScalarTexture(semantic) ? DecodeRawScalarFile(canonicalPath, decoded, loadError) : DecodeMaterialImageFile(m_materialImagePrefetch.get(), canonicalPath, decoded, loadError, &normalLevels))) {
+        if (!(IsNativeScalarTexture(semantic) ? DecodeRawScalarFile(canonicalPath, decoded, loadError) : DecodeMaterialImageFile(m_materialImagePrefetch.get(), canonicalPath, decoded, loadError, &normalLevels, &colorLevels))) {
             if (errorMessage) {
                 *errorMessage = loadError;
             }
@@ -3735,7 +3771,8 @@ uint32_t SceneResources::addMaterialTextureFromFile(const std::string& path,
                                                srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm,
                                                buildMipmaps,
                                                finalStorage,
-                                               loadError);
+                                               loadError,
+                                               (srgb && !levelZeroTransformed) ? &colorLevels : nullptr);
         if (!texture) {
             if (errorMessage) {
                 *errorMessage = loadError;
@@ -3791,6 +3828,7 @@ uint32_t SceneResources::addMaterialTextureFromFile(const std::string& path,
         if (chainAhead) normalLevels.clear();
     }
     if (!normalLevels.empty() && m_materialImagePrefetch) m_materialImagePrefetch->noteNormalChainUnused();
+    if (!colorLevels.empty() && m_materialImagePrefetch) m_materialImagePrefetch->noteColorChainUnused();
     std::string budgetReason;
     const uint64_t estimatedBytes = EstimateTextureMemoryBytes(texture);
     if (shouldSkipTextureForBudget(semantic, estimatedBytes, budgetReason)) {
@@ -3936,6 +3974,7 @@ uint32_t SceneResources::addMaterialTextureFromData(const uint8_t* data,
 
     id<MTLTexture> texture = nil;
     std::vector<std::vector<uint8_t>> normalLevels;  // a normal map's mip chain, built ahead by the prefetch
+    std::vector<std::vector<uint8_t>> colorLevels;  // an sRGB colour image's levels 1 and up, built ahead by the prefetch
     bool levelZeroTransformed = false;  // the decoded bytes were changed after the chain was built from them
     if (IsKtx2Data(data, size)) {
         std::string loadError;
@@ -3949,7 +3988,7 @@ uint32_t SceneResources::addMaterialTextureFromData(const uint8_t* data,
     } else {
         DecodedImageRgba8 decoded{};
         std::string loadError;
-        if (!(IsNativeScalarTexture(semantic) ? DecodeRawScalarData(data, size, decoded, loadError) : DecodeMaterialImageData(m_materialImagePrefetch.get(), data, size, decoded, loadError, &normalLevels))) {
+        if (!(IsNativeScalarTexture(semantic) ? DecodeRawScalarData(data, size, decoded, loadError) : DecodeMaterialImageData(m_materialImagePrefetch.get(), data, size, decoded, loadError, &normalLevels, &colorLevels))) {
             if (errorMessage) {
                 *errorMessage = loadError;
             }
@@ -3982,7 +4021,8 @@ uint32_t SceneResources::addMaterialTextureFromData(const uint8_t* data,
                                                srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm,
                                                buildMipmaps,
                                                finalStorage,
-                                               loadError);
+                                               loadError,
+                                               (srgb && !levelZeroTransformed) ? &colorLevels : nullptr);
         if (!texture) {
             if (errorMessage) {
                 *errorMessage = loadError;
@@ -4038,6 +4078,7 @@ uint32_t SceneResources::addMaterialTextureFromData(const uint8_t* data,
         if (chainAhead) normalLevels.clear();
     }
     if (!normalLevels.empty() && m_materialImagePrefetch) m_materialImagePrefetch->noteNormalChainUnused();
+    if (!colorLevels.empty() && m_materialImagePrefetch) m_materialImagePrefetch->noteColorChainUnused();
     std::string budgetReason;
     const uint64_t estimatedBytes = EstimateTextureMemoryBytes(texture);
     if (shouldSkipTextureForBudget(semantic, estimatedBytes, budgetReason)) {
@@ -4099,7 +4140,7 @@ bool SceneResources::materialTextureCpuData(uint32_t index, MaterialTextureCpuDa
 
     auto populateRgba8 = [&](const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height,
                              bool srgb, const MaterialTextureSamplerDesc& sampler, bool flipRows, bool orm,
-                             bool normal) {
+                             bool normal, bool scalar) {
         out.width = width;
         out.height = height;
         out.srgb = srgb;
@@ -4122,9 +4163,15 @@ bool SceneResources::materialTextureCpuData(uint32_t index, MaterialTextureCpuDa
         out.mipLevels[0].height = out.height;
         out.mipLevels[0].rgba = out.rgba;
         out.mipLevels[0].rgba8 = std::move(level0Bytes);
-        if (!orm && !MipChain::BoxChainKeepsMean(width, height)) {
-            // Not a power of two: decode the same 8-bit levels Metal uploads (CreateTextureFromDecodedRgba8,
-            // BuildMaterialTextureWithMips). Row flips commute with the filter: footprints are symmetric.
+        if (scalar) {
+            // A source opacity or bump texture keeps one level, as Metal's does (no mips for native scalar textures);
+            // both backends read it at level 0.
+            out.footprintMipChain = false;
+            return true;
+        }
+        if (!orm) {
+            // Decode the same 8-bit levels Metal uploads (CreateTextureFromDecodedRgba8, BuildMaterialTextureWithMips).
+            // Row flips commute with the filter: footprints are symmetric.
             for (MipChain::Rgba8Level& level : MipChain::BuildRgba8MipLevels(rgba.data(), width, height, srgb)) {
                 MaterialTextureCpuData::MipLevel next{level.width, level.height, {}, {}};
                 decodeTexels(level.rgba, static_cast<size_t>(level.width) * level.height, srgb, next.rgba);
@@ -4143,15 +4190,11 @@ bool SceneResources::materialTextureCpuData(uint32_t index, MaterialTextureCpuDa
             MaterialTextureCpuData::MipLevel next{};
             next.width = std::max(src.width / 2u, 1u);
             next.height = std::max(src.height / 2u, 1u);
-            if (orm) {
-                const MaterialTextureSamplerDesc effectiveSampler = EffectiveSamplerDesc(&sampler);
-                DownsampleOrmMipLevel(src.rgba, src.width, src.height,
-                                      next.rgba, next.width, next.height,
-                                      effectiveSampler.wrapS, effectiveSampler.wrapT);
-                out.mipLevels.push_back(std::move(next));
-                continue;
-            }
-            DownsampleMipLevelBox(src.rgba, src.width, src.height, next.rgba, next.width, next.height);
+            // Only ORM textures reach this loop: colour textures return with MipChain.h's levels above.
+            const MaterialTextureSamplerDesc effectiveSampler = EffectiveSamplerDesc(&sampler);
+            DownsampleOrmMipLevel(src.rgba, src.width, src.height,
+                                  next.rgba, next.width, next.height,
+                                  effectiveSampler.wrapS, effectiveSampler.wrapT);
             out.mipLevels.push_back(std::move(next));
         }
         return true;
@@ -4171,7 +4214,8 @@ bool SceneResources::materialTextureCpuData(uint32_t index, MaterialTextureCpuDa
                 ? m_materialTextureCpuSamplers[index] : MaterialTextureSamplerDesc{};
             return populateRgba8(source.rgba, source.width, source.height,
                                  IsSrgbPixelFormat(texture.pixelFormat), sampler, true, false,
-                                 m_textureInventory[index].semantic == MaterialTextureSemantic::Normal);
+                                 m_textureInventory[index].semantic == MaterialTextureSemantic::Normal,
+                                 IsNativeScalarTexture(m_textureInventory[index].semantic));
         };
         // Compressed resident formats cannot be read as individual texels by
         // CopyTextureLevelToFloat. Decode their converted RGBA8 source instead.
@@ -4226,7 +4270,8 @@ bool SceneResources::materialTextureCpuData(uint32_t index, MaterialTextureCpuDa
     if (deferred.decodedWidth != 0u && deferred.decodedHeight != 0u && !deferred.decodedRgba.empty()) {
         return populateRgba8(deferred.decodedRgba, deferred.decodedWidth, deferred.decodedHeight,
                              deferred.srgb, sampler, false, deferred.semantic == MaterialTextureSemantic::Orm,
-                             deferred.semantic == MaterialTextureSemantic::Normal);
+                             deferred.semantic == MaterialTextureSemantic::Normal,
+                             IsNativeScalarTexture(deferred.semantic));
     }
     // Metal samples a non-normal texture that has a DDS source (named in import_manifest.json) through that DDS and its
     // own mip levels; see the texture loader. This copy, which Embree reads, decodes the same levels: they can be far
@@ -4267,7 +4312,8 @@ bool SceneResources::materialTextureCpuData(uint32_t index, MaterialTextureCpuDa
     if (!parsed) return false;
     return populateRgba8(source.rgba, source.width, source.height, deferred.srgb, sampler, false,
                          deferred.semantic == MaterialTextureSemantic::Orm,
-                         deferred.semantic == MaterialTextureSemantic::Normal);
+                         deferred.semantic == MaterialTextureSemantic::Normal,
+                         IsNativeScalarTexture(deferred.semantic));
 }
 
 const std::string& SceneResources::materialName(uint32_t index) const {
@@ -5104,11 +5150,31 @@ uint32_t SceneResources::addMesh(const MeshVertex* vertices,
         NSLog(@"SceneResources::addMesh requires triangle indices (count must be divisible by 3)");
         return std::numeric_limits<uint32_t>::max();
     }
+    return addMesh(std::make_shared<const std::vector<MeshVertex>>(vertices, vertices + vertexCount),
+                   std::make_shared<const std::vector<uint32_t>>(indices, indices + indexCount),
+                   localToWorld, sourceLocalTransform, materialIndex, std::move(name), std::move(geometryCacheKey));
+}
+
+uint32_t SceneResources::addMesh(std::shared_ptr<const std::vector<MeshVertex>> vertices,
+                                 std::shared_ptr<const std::vector<uint32_t>> indices,
+                                 const simd::float4x4& localToWorld,
+                                 const simd::float4x4& sourceLocalTransform,
+                                 uint32_t materialIndex,
+                                 std::string name,
+                                 std::string geometryCacheKey) {
+    if (!vertices || vertices->empty() || !indices || indices->empty()) {
+        NSLog(@"SceneResources::addMesh received empty mesh data");
+        return std::numeric_limits<uint32_t>::max();
+    }
+    if (indices->size() % 3 != 0) {
+        NSLog(@"SceneResources::addMesh requires triangle indices (count must be divisible by 3)");
+        return std::numeric_limits<uint32_t>::max();
+    }
 
     uint32_t meshIndex = static_cast<uint32_t>(m_meshes.size());
     Mesh mesh{};
-    mesh.vertices.assign(vertices, vertices + vertexCount);
-    mesh.indices.assign(indices, indices + indexCount);
+    mesh.vertices = SharedMeshArray<MeshVertex>(std::move(vertices));
+    mesh.indices = SharedMeshArray<uint32_t>(std::move(indices));
     mesh.geometryCacheKey = std::move(geometryCacheKey);
     mesh.localToWorld = localToWorld;
     mesh.defaultLocalToWorld = localToWorld;
@@ -5760,15 +5826,28 @@ void SceneResources::buildPackedSceneCpuData() {
     m_packedSceneVertices.clear();
     m_packedSceneIndices.clear();
     m_packedMeshInfos.reserve(m_meshes.size());
-    m_packedTriangleData.reserve(m_triangleCount);
-    size_t totalVertexCount = 0;
+    // Reserve what the loop below appends: triangle data for every mesh, and packed vertices and indices once per
+    // geometry key (a mesh whose key came earlier reuses that range), as the loop decides it. m_triangleCount is not
+    // counted yet on a fresh load, so reserving it let the triangle data grow by doubling: on barcelona_pavilion_day
+    // (38.5 M triangles, 64 B each) to 4.29 GB of capacity, with a 2.15 GB copy at the last step. The vertices were
+    // reserved for every instance: 7.3 GB of capacity there for 21 MB of unique vertices.
     size_t totalTriangleCount = 0;
-    for (const auto& mesh : m_meshes) {
-        totalVertexCount += mesh.vertices.size();
-        totalTriangleCount += mesh.indices.size() / 3u;
+    size_t packedVertexCount = 0;
+    size_t packedTriangleCount = 0;
+    {
+        std::unordered_set<std::string> packedKeys;
+        packedKeys.reserve(m_meshes.size());
+        for (const auto& mesh : m_meshes) {
+            totalTriangleCount += mesh.indices.size() / 3u;
+            if (mesh.geometryCacheKey.empty() || packedKeys.insert(mesh.geometryCacheKey).second) {
+                packedVertexCount += mesh.vertices.size();
+                packedTriangleCount += mesh.indices.size() / 3u;
+            }
+        }
     }
-    m_packedSceneVertices.reserve(totalVertexCount);
-    m_packedSceneIndices.reserve(totalTriangleCount);
+    m_packedTriangleData.reserve(totalTriangleCount);
+    m_packedSceneVertices.reserve(packedVertexCount);
+    m_packedSceneIndices.reserve(packedTriangleCount);
     uint32_t triangleOffset = 0;
     struct SharedPackedGeometryRange {
         uint32_t vertexOffset = 0u;

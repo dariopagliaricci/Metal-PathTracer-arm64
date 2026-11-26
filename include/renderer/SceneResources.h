@@ -237,6 +237,7 @@ struct MaterialImagePrefetchSource {
     const uint8_t* data = nullptr;
     size_t size = 0;
     bool normalMap = false;  // requested as a normal map: a KTX2 file is then parsed even when it has a DDS source
+    bool srgbColor = false;  // requested as an sRGB colour texture (base colour, emissive): its mip chain is built ahead
 };
 
 /// Manages scene geometry, materials, and acceleration structures
@@ -377,6 +378,16 @@ public:
                      uint32_t materialIndex,
                      std::string name = {},
                      std::string geometryCacheKey = {});
+    /// Add a triangle mesh that shares its vertices and indices with other meshes (the instances of one decoded
+    /// primitive): the arrays are kept, not copied, and must not change afterwards.
+    /// @return Mesh index
+    uint32_t addMesh(std::shared_ptr<const std::vector<MeshVertex>> vertices,
+                     std::shared_ptr<const std::vector<uint32_t>> indices,
+                     const simd::float4x4& localToWorld,
+                     const simd::float4x4& sourceLocalTransform,
+                     uint32_t materialIndex,
+                     std::string name = {},
+                     std::string geometryCacheKey = {});
 
     /// Material inspection helpers
     const std::string& materialName(uint32_t index) const;
@@ -444,6 +455,8 @@ public:
         return static_cast<uint32_t>(m_materialTextures.size());
     }
     bool materialTextureCpuData(uint32_t index, MaterialTextureCpuData& out) const;
+    // True for a texture registered as deferred: its CPU copy is decoded from its file, not read back from Metal.
+    bool isDeferredTextureIndex(uint32_t index) const;
     const std::vector<MTLTextureHandle>& materialTextures() const {
         return m_materialTextures;
     }
@@ -538,9 +551,27 @@ public:
     const PathTracerShaderTypes::SphereData* spheresData() const { return m_spheres.data(); }
     const PathTracerShaderTypes::RectData* rectanglesData() const { return m_rectangles.data(); }
 
+    // A mesh's vertices or indices, read-only and shared: the instances of one decoded primitive hold one copy
+    // (addMesh with shared arrays). On barcelona_pavilion_day, 21,089 meshes come from 96 decodes.
+    template <typename T>
+    class SharedMeshArray {
+    public:
+        SharedMeshArray() = default;
+        explicit SharedMeshArray(std::shared_ptr<const std::vector<T>> values) : m_values(std::move(values)) {}
+        size_t size() const { return m_values ? m_values->size() : 0u; }
+        bool empty() const { return size() == 0u; }
+        const T* data() const { return m_values ? m_values->data() : nullptr; }
+        const T* begin() const { return data(); }
+        const T* end() const { return data() + size(); }
+        const T& operator[](size_t index) const { return (*m_values)[index]; }
+
+    private:
+        std::shared_ptr<const std::vector<T>> m_values;
+    };
+
     struct Mesh {
-        std::vector<MeshVertex> vertices;
-        std::vector<uint32_t> indices;
+        SharedMeshArray<MeshVertex> vertices;
+        SharedMeshArray<uint32_t> indices;
         std::string geometryCacheKey;
         simd::float4x4 localToWorld = matrix_identity_float4x4;
         simd::float4x4 defaultLocalToWorld = matrix_identity_float4x4;
@@ -716,7 +747,6 @@ private:
 
     static constexpr uint32_t kDeferredTextureIndexBase = 0x80000000u;
 
-    bool isDeferredTextureIndex(uint32_t index) const;
     uint32_t registerDeferredMaterialTexture(const std::string& key,
                                              const std::string& label,
                                              bool fromFile,

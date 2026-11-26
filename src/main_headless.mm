@@ -345,6 +345,10 @@ struct CliOptions {
     bool checkpointManifestJsonProvided = false;
     std::string resumeCheckpointJsonPath;
     bool resumeCheckpointJsonProvided = false;
+    // Sample checkpoints: export the accumulation every N samples (Metal); a partial manifest resumes from it.
+    uint32_t checkpointEverySamples = 0;
+    std::string resumeAccumulationStatePath;
+    bool resumeFromAccumulationState = false;
     std::string tileManifestJsonPath;
     bool tileManifestJsonProvided = false;
     uint32_t tileWidth = 0;
@@ -492,7 +496,8 @@ void PrintUsage(const char* exe) {
               << "  --radianceCacheMinConfidence=<float>  Minimum cache confidence in [0,1] (default 0.35)\n"
               << "  --radianceCacheTrainingInterval=<int>  Train cache every N frames (default 1)\n"
               << "  --radianceCacheMaxRadiance=<float>  Quantized cache radiance clamp (default 16)\n"
-              << "  --causticTransportMode=<off|path_space>  Gated path-space caustic connection transport (default off)\n"
+              << "  --causticTransportMode=<off|path_space>  path_space: prototype that records environment and rect-light\n"
+              << "                                next-event connections; adds no caustic paths (default off)\n"
               << "  --causticMaxVertices=<int>  Bounded caustic path vertex budget (default 4096)\n"
               << "  --volumeTransportMode=<off|homogeneous>  Gated homogeneous participating medium (default off)\n"
               << "  --volumeSigmaA=<r,g,b>       Homogeneous absorption coefficients\n"
@@ -571,7 +576,12 @@ void PrintUsage(const char* exe) {
               << "  --runRenderQueueItemJson=<path> Run a deterministic render queue item JSON\n"
               << "  --debugBundleDir=<dir>        Write metadata/settings/metrics into one debug bundle directory\n"
               << "  --checkpointManifestJson=<path> Write completed-render checkpoint manifest JSON\n"
-              << "  --resumeCheckpointJson=<path> Re-run from a completed checkpoint manifest\n"
+              << "  --resumeCheckpointJson=<path> Continue an interrupted render from a partial checkpoint manifest\n"
+              << "                                (--checkpointEverySamples); from a completed one, write the output\n"
+              << "                                from its saved accumulation, or re-run when it has none\n"
+              << "  --checkpointEverySamples=<int> Metal: every N samples, save the accumulation to <output>.accum\n"
+              << "                                and a partial checkpoint manifest, so an interrupted render resumes\n"
+              << "                                where it stopped. Needs --output; refused with temporal features\n"
               << "  --tileManifestJson=<path>     Write deterministic tiled/chunk render plan JSON\n"
               << "  --tileSize=<w,h>              Tile dimensions recorded in tile manifests\n"
               << "  --materialMrDebugJson=<path>  Write first-hit Material_MR debug JSON\n"
@@ -1288,15 +1298,21 @@ bool ApplyCheckpointJson(const fs::path& path, CliOptions& options, std::string&
         return false;
     }
     const auto kind = JsonString(root, @"checkpoint_kind");
-    if (!kind || *kind != "completed_single_frame") {
+    bool partial = kind && *kind == "partial_single_frame";
+    if (!kind || (*kind != "completed_single_frame" && !partial)) {
         error = "Unsupported checkpoint kind in " + path.string() +
-                " (expected completed_single_frame)";
+                " (expected completed_single_frame or partial_single_frame)";
         return false;
     }
     const auto resumePolicy = JsonString(root, @"resume_policy");
-    if (!resumePolicy || *resumePolicy != "full_frame_rerender_from_checkpoint_manifest") {
-        error = "Unsupported checkpoint resume_policy in " + path.string() +
-                " (expected full_frame_rerender_from_checkpoint_manifest)";
+    // A completed manifest with its finished accumulation writes the output from it (write_output_from_state); the
+    // state's sample count equals the target, so the renderer draws no frame.
+    const bool completedFromState = !partial && resumePolicy && *resumePolicy == "write_output_from_state";
+    const char* expectedPolicy =
+        partial ? "continue_accumulation_from_state" : "full_frame_rerender_from_checkpoint_manifest";
+    if (!resumePolicy || (*resumePolicy != expectedPolicy && !completedFromState)) {
+        error = "Unsupported checkpoint resume_policy in " + path.string() + " (expected " + expectedPolicy +
+                (partial ? std::string() : std::string(" or write_output_from_state")) + ")";
         return false;
     }
     NSDictionary* queueItem = JsonObject(root, @"queue_item");
@@ -1304,7 +1320,39 @@ bool ApplyCheckpointJson(const fs::path& path, CliOptions& options, std::string&
         error = "Checkpoint manifest is missing queue_item for deterministic resume: " + path.string();
         return false;
     }
-    return ApplyRenderQueueDictionary(queueItem, options, error);
+    if (!ApplyRenderQueueDictionary(queueItem, options, error)) {
+        return false;
+    }
+    if (partial || completedFromState) {
+        const auto statePath = JsonString(root, @"accumulation_state");
+        if (!statePath || statePath->empty()) {
+            error = "Checkpoint manifest is missing accumulation_state: " + path.string();
+            return false;
+        }
+        options.resumeAccumulationStatePath = *statePath;
+        options.resumeFromAccumulationState = true;
+        if (!options.checkpointManifestJsonProvided) {
+            // Later partial manifests and the completed one replace this manifest.
+            options.checkpointManifestJsonPath = path.string();
+            options.checkpointManifestJsonProvided = true;
+        }
+        if (const auto every = JsonUInt32(root, @"checkpoint_every_samples")) {
+            options.checkpointEverySamples = *every;
+        }
+        // The run flags of the interrupted render, unless the command line sets them again.
+        if (const auto hw = JsonBool(root, @"force_hardware_ray_tracing"); hw && !options.forceHardwareRayTracingSet) {
+            options.forceHardwareRayTracing = *hw;
+            options.forceHardwareRayTracingSet = true;
+        }
+        if (const auto sw = JsonBool(root, @"force_software_ray_tracing"); sw && !options.forceSoftwareRayTracingSet) {
+            options.forceSoftwareRayTracing = *sw;
+            options.forceSoftwareRayTracingSet = true;
+        }
+        if (const auto guides = JsonBool(root, @"write_denoise_guides"); guides && *guides) {
+            options.writeDenoiseGuides = true;
+        }
+    }
+    return true;
 }
 
 bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string& error) {
@@ -2953,6 +3001,16 @@ bool ParseOptions(int argc, const char** argv, CliOptions& options, std::string&
             }
             options.resumeCheckpointJsonPath = value;
             options.resumeCheckpointJsonProvided = true;
+        } else if (arg == "--checkpointEverySamples" || arg == "--checkpoint-every-samples") {
+            if (!requireValue(arg.c_str())) {
+                return false;
+            }
+            try {
+                options.checkpointEverySamples = static_cast<uint32_t>(std::stoul(value));
+            } catch (...) {
+                error = "Invalid integer for --checkpointEverySamples";
+                return false;
+            }
         } else if (arg == "--tileManifestJson" || arg == "--tile-manifest-json") {
             if (!requireValue(arg.c_str())) {
                 return false;
@@ -3231,12 +3289,12 @@ const char* DirectLightModeLabel(PathTracer::RenderSettings::DirectLightMode mod
     return "unknown";
 }
 
-// The direct-light mode the backend runs: on Metal, homogeneous volumes demote ReSTIR DI to baseline_emissive
-// (RestirDiDemotedByVolume); Embree ignores volumes and runs the requested mode.
+// The direct-light mode the backend runs: on both backends, homogeneous volumes demote ReSTIR DI to baseline_emissive
+// (RestirDiDemotedByVolume; Embree mirrors Metal since EP9).
 PathTracer::RenderSettings::DirectLightMode RunDirectLightMode(const CliOptions& options,
                                                                const PathTracer::RenderSettings& settings) {
-    return options.backend == HeadlessBackend::Metal ? PathTracer::MetalDirectLightMode(settings)
-                                                     : settings.directLightMode;
+    (void)options;
+    return PathTracer::MetalDirectLightMode(settings);
 }
 
 // Direct-light mode the backend could not run as requested because of the medium, for the render metadata: "none",
@@ -4808,12 +4866,6 @@ bool RunHeadlessDenoise(const PathTracer::RenderSettings& settings,
     return true;
 }
 
-const char* WorkingColorSpaceLabel(const PathTracer::RenderSettings& settings) {
-    return (settings.workingColorSpace == PathTracer::RenderSettings::WorkingColorSpace::ACEScg)
-        ? "ACEScg"
-        : "Linear sRGB";
-}
-
 fs::path AppendStemSuffix(const fs::path& path, const std::string& suffix) {
     fs::path result = path;
     const std::string stem = result.stem().string();
@@ -5910,7 +5962,7 @@ void WriteRenderSettingsObjectJson(std::ostream& out,
     out << "      \"output_transfer\": \""
         << (settings.tonemapMode == 6 ? "filmic" : (srgbTransfer ? "srgb" : "gamma2.2")) << "\",\n";
     out << "      \"reference_bloom_intensity\": " << settings.referenceBloomIntensity << ",\n";
-    out << "      \"working_color_space\": \"" << WorkingColorSpaceLabel(settings) << "\"\n";
+    out << "      \"working_color_space\": \"Linear sRGB\"\n";
     out << "    },\n";
     out << "    \"offline_post\": {\n";
     out << "      \"denoise_enabled\": " << (settings.denoiseEnabled ? "true" : "false") << ",\n";
@@ -6200,14 +6252,29 @@ std::string BuildCheckpointManifestJson(const CliOptions& options,
                                         const fs::path& outputPath,
                                         const fs::path* metadataPath,
                                         const fs::path* settingsPath,
-                                        const fs::path* queuePath) {
+                                        const fs::path* queuePath,
+                                        const fs::path* statePath) {
     std::ostringstream json;
     json << std::fixed << std::setprecision(9);
     json << "{\n";
     json << "  \"schema_version\": \"pathtracer.render_checkpoint.v1\",\n";
     json << "  \"checkpoint_kind\": \"completed_single_frame\",\n";
-    json << "  \"resume_policy\": \"full_frame_rerender_from_checkpoint_manifest\",\n";
-    json << "  \"sample_accumulation_resume_supported\": false,\n";
+    // With the finished accumulation kept beside the output, a resume writes the output from it without rendering;
+    // without it, a resume renders the frame again.
+    json << "  \"resume_policy\": \""
+         << (statePath ? "write_output_from_state" : "full_frame_rerender_from_checkpoint_manifest") << "\",\n";
+    json << "  \"sample_accumulation_resume_supported\": " << (statePath ? "true" : "false") << ",\n";
+    if (statePath) {
+        json << "  \"accumulation_state\": \"" << JsonEscape(statePath->string()) << "\",\n";
+        json << "  \"checkpoint_every_samples\": " << options.checkpointEverySamples << ",\n";
+        if (options.forceHardwareRayTracingSet) {
+            json << "  \"force_hardware_ray_tracing\": " << (options.forceHardwareRayTracing ? "true" : "false") << ",\n";
+        }
+        if (options.forceSoftwareRayTracingSet) {
+            json << "  \"force_software_ray_tracing\": " << (options.forceSoftwareRayTracing ? "true" : "false") << ",\n";
+        }
+        json << "  \"write_denoise_guides\": " << (options.writeDenoiseGuides ? "true" : "false") << ",\n";
+    }
     json << "  \"output\": \"" << JsonEscape(outputPath.string()) << "\",\n";
     json << "  \"completed_samples\": " << output.samples << ",\n";
     json << "  \"resolution\": {\"width\": " << output.width << ", \"height\": " << output.height << "},\n";
@@ -6228,6 +6295,63 @@ std::string BuildCheckpointManifestJson(const CliOptions& options,
     json << "  }\n";
     json << "}\n";
     return json.str();
+}
+
+std::string BuildPartialCheckpointManifestJson(const CliOptions& options,
+                                               const PathTracer::RenderSettings& settings,
+                                               const fs::path& outputPath,
+                                               const fs::path& statePath,
+                                               uint32_t completedSamples) {
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(9);
+    json << "{\n";
+    json << "  \"schema_version\": \"pathtracer.render_checkpoint.v1\",\n";
+    json << "  \"checkpoint_kind\": \"partial_single_frame\",\n";
+    json << "  \"resume_policy\": \"continue_accumulation_from_state\",\n";
+    json << "  \"sample_accumulation_resume_supported\": true,\n";
+    json << "  \"output\": \"" << JsonEscape(outputPath.string()) << "\",\n";
+    json << "  \"completed_samples\": " << completedSamples << ",\n";
+    json << "  \"target_samples\": " << options.sppTotal << ",\n";
+    json << "  \"checkpoint_every_samples\": " << options.checkpointEverySamples << ",\n";
+    json << "  \"accumulation_state\": \"" << JsonEscape(statePath.string()) << "\",\n";
+    // Run flags that the queue item does not carry but that change the samples or the outputs: a resume must trace
+    // with the same ray tracer and write the same guides.
+    if (options.forceHardwareRayTracingSet) {
+        json << "  \"force_hardware_ray_tracing\": " << (options.forceHardwareRayTracing ? "true" : "false") << ",\n";
+    }
+    if (options.forceSoftwareRayTracingSet) {
+        json << "  \"force_software_ray_tracing\": " << (options.forceSoftwareRayTracing ? "true" : "false") << ",\n";
+    }
+    json << "  \"write_denoise_guides\": " << (options.writeDenoiseGuides ? "true" : "false") << ",\n";
+    json << "  \"queue_item\": {\n";
+    json << "  \"schema_version\": \"pathtracer.render_queue_item.v1\",\n";
+    json << "  \"kind\": \"single_frame_render\",\n";
+    json << "  \"status\": \"ready\",\n";
+    WriteRenderSettingsObjectJson(json, options, settings, options.sppTotal, outputPath);
+    json << "  }\n";
+    json << "}\n";
+    return json.str();
+}
+
+// Sample checkpoints continue one accumulation, so every sample must depend only on its own counters and pixel.
+// Features that carry state from earlier frames (reservoirs, caches, guiding, SVGF history) are refused by name.
+std::optional<std::string> SampleCheckpointRefusal(const CliOptions& options, const PathTracer::RenderSettings& s) {
+    using DL = PathTracer::RenderSettings::DirectLightMode;
+    if (options.backend != HeadlessBackend::Metal) return std::string("the Embree backend");
+    if (options.outputPath.empty()) return std::string("no --output path");
+    if (options.validateRis) return std::string("--validate-ris");
+    if (s.directLightMode != DL::LegacyRect && s.directLightMode != DL::BaselineEmissive && s.directLightMode != DL::Ris) {
+        return std::string("directLightMode ") + DirectLightModeLabel(s.directLightMode) +
+               " (only legacy, baseline_emissive and ris keep no state between frames)";
+    }
+    if (s.svgfDenoiseEnabled) return std::string("SVGF denoising (temporal history)");
+    if (s.restirGiMode != PathTracer::RenderSettings::RestirGiMode::Off) return std::string("ReSTIR GI");
+    if (s.restirPtMode != PathTracer::RenderSettings::RestirPtMode::Off) return std::string("ReSTIR PT");
+    if (s.pathGuidingMode != PathTracer::RenderSettings::PathGuidingMode::Off) return std::string("path guiding");
+    if (s.radianceCacheMode != PathTracer::RenderSettings::RadianceCacheMode::Off) return std::string("the radiance cache");
+    if (s.causticTransportMode != PathTracer::RenderSettings::CausticTransportMode::Off) return std::string("caustic transport");
+    if (s.mlBackendMode != PathTracer::RenderSettings::MlBackendMode::Off) return std::string("the ML backend");
+    return std::nullopt;
 }
 
 std::string BuildTileManifestJson(const CliOptions& options,
@@ -6642,11 +6766,11 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
     outFile << "    \"radiance_cache_max_radiance\": " << settings.radianceCacheMaxRadiance << ",\n";
     const bool volumeHomogeneous =
         settings.volumeTransportMode == PathTracer::RenderSettings::VolumeTransportMode::Homogeneous;
-    const bool metalVolumeHomogeneous = options.backend == HeadlessBackend::Metal && volumeHomogeneous;
-    const bool embreeVolumeIgnored = options.backend == HeadlessBackend::Embree && volumeHomogeneous;
+    // Both backends switch off the modes whose state carries no medium (Metal's UniformBuilder; Embree since EP9).
+    const bool volumeModesDemoted = volumeHomogeneous;
     const char* radianceCacheRefusal = PathTracer::RadianceCacheRefusalReason(settings);
     const bool volumeRadianceCacheDisabled =
-        metalVolumeHomogeneous && PathTracer::RadianceCacheActive(settings);
+        volumeModesDemoted && PathTracer::RadianceCacheActive(settings);
     outFile << "    \"radiance_cache_provider\": \""
             << (settings.radianceCacheMode == PathTracer::RenderSettings::RadianceCacheMode::Off
                     ? "RadianceCache.NoOp"
@@ -7686,7 +7810,7 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                                                   : std::string("fused_reference_path"))));
     // Homogeneous volumes run ReSTIR DI as baseline_emissive on Metal (RestirDiDemotedByVolume); the path status is
     // then volume_baseline_emissive.
-    const bool volumeRestirDiDisabled = metalVolumeHomogeneous && PathTracer::RestirDiDemotedByVolume(settings);
+    const bool volumeRestirDiDisabled = volumeModesDemoted && PathTracer::RestirDiDemotedByVolume(settings);
     const std::string restirDiReason = !directRestirRequested
         ? std::string("direct light mode does not request ReSTIR DI")
         : volumeRestirDiDisabled
@@ -7726,7 +7850,7 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                         directRestirRequested && explicitRestirDiActivity == 0u);
     writeFallbackReport("path_guiding",
                         PathGuidingModeLabel(settings.pathGuidingMode),
-                        metalVolumeHomogeneous &&
+                        volumeModesDemoted &&
                                 settings.pathGuidingMode ==
                                     PathTracer::RenderSettings::PathGuidingMode::Prototype
                             ? "disabled_by_volume_fallback"
@@ -7734,21 +7858,21 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                                       PathTracer::RenderSettings::PathGuidingMode::Prototype
                             ? "production_guiding_provider"
                             : "disabled",
-                        metalVolumeHomogeneous &&
+                        volumeModesDemoted &&
                                 settings.pathGuidingMode ==
                                     PathTracer::RenderSettings::PathGuidingMode::Prototype
                             ? "path-guiding provider is surface-domain only; medium segments use phase-function sampling"
                             : output.pbrMetrics.pathGuidingFallbackCount > 0u
                             ? "guiding provider rejected or lacked confidence for some samples"
                             : "no path guiding sample fallback recorded",
-                        metalVolumeHomogeneous &&
+                        volumeModesDemoted &&
                                 settings.pathGuidingMode ==
                                     PathTracer::RenderSettings::PathGuidingMode::Prototype
                             ? 1u
                             : output.pbrMetrics.pathGuidingFallbackCount,
                         "path_guiding",
                         output.pbrMetrics.pathGuidingFallbackCount > 0u ||
-                            (metalVolumeHomogeneous &&
+                            (volumeModesDemoted &&
                              settings.pathGuidingMode ==
                                  PathTracer::RenderSettings::PathGuidingMode::Prototype));
     writeFallbackReport("radiance_cache",
@@ -7777,13 +7901,12 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                         volumeRestirDiDisabled ? "volume_baseline_emissive" : "unchanged",
                         volumeRestirDiDisabled
                             ? "ReSTIR DI does not run with homogeneous volume transport (its reservoirs carry no medium state); baseline_emissive renders instead"
-                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
                             : "no volume/ReSTIR DI fallback required",
                         volumeRestirDiDisabled ? 1u : 0u,
                         "volume_transport",
                         volumeRestirDiDisabled);
     const bool volumeRestirGiPtDisabled =
-        metalVolumeHomogeneous &&
+        volumeModesDemoted &&
         (settings.restirGiMode != PathTracer::RenderSettings::RestirGiMode::Off ||
          settings.restirPtMode != PathTracer::RenderSettings::RestirPtMode::Off);
     writeFallbackReport("volume_restir_gi_pt_interaction",
@@ -7791,20 +7914,18 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                         volumeRestirGiPtDisabled ? "path_continuation" : "unchanged",
                         volumeRestirGiPtDisabled
                             ? "ReSTIR GI/PT reservoirs do not include medium-state keys; volume paths fall back to path continuation"
-                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
                             : "no volume/ReSTIR GI/PT fallback required",
                         volumeRestirGiPtDisabled ? 1u : 0u,
                         "volume_transport",
                         volumeRestirGiPtDisabled);
     const bool volumeGuidingDisabled =
-        metalVolumeHomogeneous &&
+        volumeModesDemoted &&
         settings.pathGuidingMode == PathTracer::RenderSettings::PathGuidingMode::Prototype;
     writeFallbackReport("volume_path_guiding_interaction",
                         PathGuidingModeLabel(settings.pathGuidingMode),
                         volumeGuidingDisabled ? "phase_sampling" : "unchanged",
                         volumeGuidingDisabled
                             ? "path-guiding provider is surface-domain only; medium segments use phase-function sampling"
-                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
                             : "no volume/path-guiding fallback required",
                         volumeGuidingDisabled ? 1u : 0u,
                         "volume_transport",
@@ -7814,7 +7935,6 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                         volumeRadianceCacheDisabled ? "path_tracing" : "unchanged",
                         volumeRadianceCacheDisabled
                             ? "radiance-cache query records do not include medium-state keys; volume paths fall back to path tracing"
-                            : embreeVolumeIgnored ? "Embree ignores homogeneous volume; surface features remain unchanged"
                             : "no volume/radiance-cache fallback required",
                         volumeRadianceCacheDisabled ? 1u : 0u,
                         "volume_transport",
@@ -7824,7 +7944,7 @@ bool WritePbrMetricsJson(const fs::path& jsonPath,
                         RestirPtModeLabel(settings.restirPtMode),
                         !restirPtEnhancedRequested ? "disabled"
                             : options.backend == HeadlessBackend::Embree ? "ordinary_cpu_capture_reuse"
-                            : metalVolumeHomogeneous ? "disabled_by_volume_fallback" : "fused_directional_reuse_heuristics",
+                            : volumeModesDemoted ? "disabled_by_volume_fallback" : "fused_directional_reuse_heuristics",
                         restirPtEnhancedRequested
                             ? "configuration fallback: paired_spatial_reuse, footprint_reconnection, duplication_decorrelation/cCap, unified_di_gi, vector_shading_weights, dual_motion_vectors, replay_compaction unsupported; count is configuration-only, not a renderer counter"
                             : "ReSTIR PT Enhanced not requested",
@@ -9743,7 +9863,8 @@ int main(int argc, const char** argv) {
         }
 
         if (useMetalSceneContext) {
-            std::cout << "[MipChain] material textures with footprint-filtered mips (size not a power of two): "
+            std::cout << "[MipChain] material textures not a power of two in size (every 8-bit colour texture takes MipChain.h's "
+                         "footprint-filtered mips; these need the odd-size weights): "
                       << sceneResources.footprintMipChainCount() << " of " << sceneResources.materialTextureCount()
                       << std::endl;
         }
@@ -9854,7 +9975,8 @@ int main(int argc, const char** argv) {
                 PathTracer::IgnoredDirectionalLightsDiagnostic(*headlessScene.resources, settings);
             if (!ignoredDirectional.empty()) std::cerr << "Warning: " << ignoredDirectional << std::endl;
         }
-        if (options.backend == HeadlessBackend::Metal) {
+        // Both backends refuse the same spectral combinations (Embree runs spectral transport since EP11).
+        {
             const std::string spectralRefusal = PathTracer::SpectralUnsupportedCombination(settings);
             if (!spectralRefusal.empty()) {
                 std::cerr << "spectral mode does not support " << spectralRefusal
@@ -10212,6 +10334,52 @@ int main(int argc, const char** argv) {
             return 0;
         }
 
+        std::optional<PathTracer::AccumulationState> resumeState;
+        if (options.checkpointEverySamples > 0u || options.resumeFromAccumulationState) {
+            if (auto refusal = SampleCheckpointRefusal(options, settings)) {
+                std::cerr << "[Checkpoint] Sample checkpoints and resume are refused with " << *refusal << "." << std::endl;
+                return 2;
+            }
+            const fs::path checkpointOutput(options.outputPath);
+            const fs::path statePath(checkpointOutput.string() + ".accum");
+            const fs::path manifestPath = options.checkpointManifestJsonProvided
+                ? fs::path(options.checkpointManifestJsonPath)
+                : fs::path(checkpointOutput.string() + ".checkpoint.json");
+            HeadlessSampleCheckpointOptions checkpointOptions;
+            if (options.resumeFromAccumulationState) {
+                PathTracer::AccumulationState state;
+                std::string stateError;
+                if (!PathTracer::ReadAccumulationStateFile(options.resumeAccumulationStatePath, state, stateError)) {
+                    std::cerr << "[Checkpoint] " << stateError << std::endl;
+                    return 1;
+                }
+                resumeState = std::move(state);
+                checkpointOptions.resumeFrom = &*resumeState;
+            }
+            if (options.checkpointEverySamples > 0u) {
+                checkpointOptions.everySamples = options.checkpointEverySamples;
+                checkpointOptions.write = [&options, &settings, checkpointOutput, statePath, manifestPath](
+                                              const PathTracer::AccumulationState& state, std::string& writeError) {
+                    if (!PathTracer::WriteAccumulationStateFile(statePath.string(), state, writeError)) {
+                        return false;
+                    }
+                    const std::string manifest = BuildPartialCheckpointManifestJson(
+                        options, settings, checkpointOutput, statePath, state.sampleCount);
+                    if (!WriteTextFileAtomic(manifestPath, manifest, writeError)) {
+                        return false;
+                    }
+                    std::cout << "[Checkpoint] " << state.sampleCount << " of " << options.sppTotal
+                              << " samples saved to " << statePath << " (manifest " << manifestPath << ")" << std::endl;
+                    return true;
+                };
+            }
+            std::string checkpointError;
+            if (!renderer->setSampleCheckpointOptions(checkpointOptions, checkpointError)) {
+                std::cerr << "[Checkpoint] " << checkpointError << std::endl;
+                return 2;
+            }
+        }
+
         HeadlessRenderOutput output;
         std::string renderError;
         if (!runHeadlessRender(settings, options.sppTotal, output, renderError)) {
@@ -10401,12 +10569,23 @@ int main(int argc, const char** argv) {
             std::cout << "Render queue item written to: " << queuePath << std::endl;
         }
 
-        if (options.checkpointManifestJsonProvided || options.resumeCheckpointJsonProvided || debugBundleDir) {
+        if (options.checkpointManifestJsonProvided || options.resumeCheckpointJsonProvided ||
+            options.checkpointEverySamples > 0u || debugBundleDir) {
             const fs::path checkpointPath = options.checkpointManifestJsonProvided
                 ? fs::path(options.checkpointManifestJsonPath)
                 : (debugBundleDir ? (*debugBundleDir / "checkpoint_manifest.json")
                                   : fs::path(outputFsPath.string() + ".checkpoint.json"));
             std::string checkpointError;
+            // A sample-checkpointed render keeps its finished accumulation beside the output, so the completed
+            // manifest can write the output again without rendering.
+            std::optional<fs::path> finishedStatePath;
+            if (options.checkpointEverySamples > 0u || options.resumeFromAccumulationState) {
+                const fs::path statePath(outputFsPath.string() + ".accum");
+                std::error_code existsError;
+                if (fs::exists(statePath, existsError)) {
+                    finishedStatePath = statePath;
+                }
+            }
             const std::string checkpointJson =
                 BuildCheckpointManifestJson(options,
                                             settings,
@@ -10414,13 +10593,18 @@ int main(int argc, const char** argv) {
                                             outputFsPath,
                                             writtenMetadataPath ? &*writtenMetadataPath : nullptr,
                                             writtenSettingsPath ? &*writtenSettingsPath : nullptr,
-                                            writtenQueuePath ? &*writtenQueuePath : nullptr);
+                                            writtenQueuePath ? &*writtenQueuePath : nullptr,
+                                            finishedStatePath ? &*finishedStatePath : nullptr);
             if (!WriteTextFileAtomic(checkpointPath, checkpointJson, checkpointError)) {
                 std::cerr << checkpointError << std::endl;
                 return 1;
             }
             writtenCheckpointPath = checkpointPath;
             std::cout << "Checkpoint manifest written to: " << checkpointPath << std::endl;
+            if (finishedStatePath) {
+                std::cout << "[Checkpoint] Kept the finished accumulation " << *finishedStatePath
+                          << " for the completed manifest" << std::endl;
+            }
         }
 
         if (options.tileManifestJsonProvided || options.tileSizeSet || debugBundleDir) {

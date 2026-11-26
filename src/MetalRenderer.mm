@@ -1076,12 +1076,6 @@ inline bool MakeExplicitCameraOrbitable(PathTracer::RenderSettings& settings) {
     return true;
 }
 
-inline const char* WorkingColorSpaceLabel(const PathTracer::RenderSettings& settings) {
-    return (settings.workingColorSpace == PathTracer::RenderSettings::WorkingColorSpace::ACEScg)
-        ? "ACEScg"
-        : "Linear sRGB";
-}
-
 // The three Cpu* BRDF helpers are used only by the PT_DEBUG_TOOLS material dump.
 [[maybe_unused]] float CpuGgxG1(float alpha, float cosTheta) {
     float a2 = alpha * alpha;
@@ -1153,6 +1147,31 @@ public:
     void applySettings(const RenderSettings& settings, bool resetAccumulation);
     void setSamplesPerFrame(uint32_t samples) { m_settings.samplesPerFrame = std::max<uint32_t>(1u, samples); }
     uint32_t sampleCount() const { return m_accumulation.sampleCount(); }
+    bool exportAccumulationState(PathTracer::AccumulationState& state, std::string& error) {
+        return m_accumulation.exportState(m_context.commandQueue(), state, error);
+    }
+    void setPendingAccumulationImport(PathTracer::AccumulationState state) {
+        m_pendingAccumulationImport = std::move(state);
+        m_hasPendingAccumulationImport = true;
+        m_accumulationImportError.clear();
+    }
+    std::string accumulationImportError() const { return m_accumulationImportError; }
+    bool importAccumulationStateNow(PathTracer::AccumulationState state, std::string& error) {
+        evaluateAccumulationState();
+        serviceAccumulationReset();
+        const CGSize renderSize = targetRenderSize();
+        PathTracer::RenderPassGraphDesc allocationGraph =
+            PathTracer::BuildRenderPassGraph(m_settings,
+                                             m_accumulation.needsClear(),
+                                             activeSceneResources().isDirty(),
+                                             false,
+                                             true);
+        m_accumulation.ensureTextures(renderSize, allocationGraph);
+        return m_accumulation.importState(m_context.commandQueue(), state, error);
+    }
+    PathTracer::AccumulationState m_pendingAccumulationImport;
+    bool m_hasPendingAccumulationImport = false;
+    std::string m_accumulationImportError;
     bool captureAverageImage(std::vector<float>& outLinearRGB,
                              uint32_t& width,
                              uint32_t& height,
@@ -2264,6 +2283,15 @@ void MetalRenderer::Impl::drawFrame() {
                                              false,
                                              true);
         m_accumulation.ensureTextures(renderSize, allocationGraph);
+    }
+    if (m_hasPendingAccumulationImport) {
+        m_hasPendingAccumulationImport = false;
+        std::string importError;
+        if (!m_accumulation.importState(m_context.commandQueue(), m_pendingAccumulationImport, importError)) {
+            m_accumulationImportError = importError.empty() ? "accumulation state import failed" : importError;
+            NSLog(@"[Checkpoint] %s", m_accumulationImportError.c_str());
+        }
+        m_pendingAccumulationImport = PathTracer::AccumulationState{};
     }
 
     m_performanceStats.renderWidth = static_cast<uint32_t>(std::max<CGFloat>(renderSize.width, 0.0f));
@@ -7335,13 +7363,13 @@ void MetalRenderer::Impl::handleSaveExrRequest(const std::string& path) {
                                                                static_cast<int>(width),
                                                                static_cast<int>(height),
                                                                sampleCounts.data(),
-                                                               WorkingColorSpaceLabel(m_settings));
+                                                               "Linear sRGB");
     } else {
         success = PathTracer::ImageWriter::WriteEXR(targetPath.string().c_str(),
                                                     rgba.data(),
                                                     static_cast<int>(width),
                                                     static_cast<int>(height),
-                                                    WorkingColorSpaceLabel(m_settings));
+                                                    "Linear sRGB");
     }
 
     if (success) {
@@ -7598,6 +7626,32 @@ void MetalRenderer::setSamplesPerFrame(uint32_t samples) {
     if (m_impl) {
         m_impl->setSamplesPerFrame(samples);
     }
+}
+
+bool MetalRenderer::exportAccumulationState(PathTracer::AccumulationState& state, std::string& error) {
+    if (!m_impl) {
+        error = "Metal renderer is not initialized";
+        return false;
+    }
+    return m_impl->exportAccumulationState(state, error);
+}
+
+void MetalRenderer::setPendingAccumulationImport(PathTracer::AccumulationState state) {
+    if (m_impl) {
+        m_impl->setPendingAccumulationImport(std::move(state));
+    }
+}
+
+bool MetalRenderer::importAccumulationStateNow(PathTracer::AccumulationState state, std::string& error) {
+    if (!m_impl) {
+        error = "Metal renderer is not initialized";
+        return false;
+    }
+    return m_impl->importAccumulationStateNow(std::move(state), error);
+}
+
+std::string MetalRenderer::accumulationImportError() const {
+    return m_impl ? m_impl->accumulationImportError() : std::string("Metal renderer is not initialized");
 }
 
 uint32_t MetalRenderer::sampleCount() const {

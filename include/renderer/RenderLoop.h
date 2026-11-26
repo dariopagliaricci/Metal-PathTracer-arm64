@@ -191,14 +191,14 @@ public:
         }
     }
 
-    /// Direct-light mode the wavefront could not run as requested, for logs and render metadata: "none",
-    /// "ris_spatial ran as plain ris" (the wavefront has no same-frame spatial reuse), or the explicit restir_di stage
-    /// replaced by the megakernel's fused direct light when the frame fell back to the megakernel.
+    /// Direct-light mode the wavefront could not run as requested, for logs and render metadata: "none", or the
+    /// explicit restir_di stage replaced by the megakernel's fused direct light when the frame fell back to the
+    /// megakernel.
     const char* wavefrontDirectLightFallback() const {
         if (m_wavefrontExplicitRestirDiRanFused) {
             return "explicit restir_di stage ran as the megakernel's fused direct light";
         }
-        return m_wavefrontRisSpatialRanAsRis ? "ris_spatial ran as plain ris" : "none";
+        return "none";
     }
 
     /// Why the wavefront executor handed the last frame to the megakernel, for logs and render metadata: "none", or
@@ -363,8 +363,14 @@ private:
     // Megakernel pipeline of the last integrate dispatch: -1 none yet, 0 software,
     // 1 hardware general, 2 hardware default features.
     int m_lastIntegrateVariant = -1;
-    // The last wavefront dispatch was asked for ris_spatial, which it runs as plain RIS.
-    bool m_wavefrontRisSpatialRanAsRis = false;
+    // The wavefront shade pipeline of the last dispatch (0 general, 1 default features) and the gates that kept it
+    // general, for its log line.
+    int m_lastWavefrontShadeVariant = -1;
+    std::string m_lastWavefrontShadeLiveGates;
+    // The gates on at the last general-pipeline dispatch (UniformBuilder::liveFeatureGates), for its log line.
+    std::string m_lastLiveGates;
+    // Whether the path_space caustics note has been logged since causticTransportMode was last set to it.
+    bool m_loggedPathSpaceCausticsInert = false;
     bool m_preserveSvgfHistoryForNextClear = false;
     bool m_explicitRestirDiActiveThisFrame = false;
     bool m_loggedMegakernelExplicitRestirDiRefusal = false;
@@ -400,6 +406,8 @@ private:
                              const SceneResources& scene,
                              const RenderSettings& settings);
 
+    // Logs once per enable that causticTransportMode=path_space adds no caustic paths (RenderLoop.mm).
+    void logPathSpaceCausticsOnce(const RenderSettings& settings);
     bool ensureWavefrontResources(const SceneResources& scene,
                                   const RenderSettings& settings,
                                   uint32_t width,

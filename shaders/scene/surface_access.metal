@@ -293,10 +293,11 @@ inline float4 interpolate_tangent(constant PathtraceUniforms& uniforms,
     float3 tangentWorld = tangentRaw.xyz;
     float tangentLenSq = dot(tangentWorld, tangentWorld);
     if (!all(isfinite(tangentWorld)) || tangentLenSq <= 1.0e-12f) {
-        tangentWorld = float3(1.0f, 0.0f, 0.0f);
-    } else {
-        tangentWorld *= rsqrt(tangentLenSq);
+        // No vertex tangent here (a zero TANGENT): w = 0 tells the normal-map code to build the frame from the UVs,
+        // as Embree does. The unit x axis stays only as a direction for other readers.
+        return float4(1.0f, 0.0f, 0.0f, 0.0f);
     }
+    tangentWorld *= rsqrt(tangentLenSq);
     return float4(tangentWorld, tangentRaw.w);
 }
 
@@ -479,9 +480,10 @@ inline bool compute_tangent_basis_from_uv(constant PathtraceUniforms& uniforms,
     if (!all(isfinite(tangent)) || dot(tangent, tangent) <= 1.0e-6f) {
         return false;
     }
-    float detSign = (determinant(localToWorld) < 0.0f) ? -1.0f : 1.0f;
+    // The handedness is measured against the world-space dP/dv, which already carries a mirroring transform; a
+    // determinant sign here would flip it a second time.
     float handedness = (dot(cross(shadingNormal, tangent), bitangentWorld) < 0.0f) ? -1.0f : 1.0f;
-    bitangent = normalize(cross(shadingNormal, tangent)) * (handedness * detSign);
+    bitangent = normalize(cross(shadingNormal, tangent)) * handedness;
     return true;
 }
 

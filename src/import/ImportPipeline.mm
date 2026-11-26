@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -24,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -586,6 +588,24 @@ struct ImportContext {
     std::unordered_map<std::string, int> textureByKey;
     std::unordered_map<std::string, int> cameraByName;
     std::map<std::vector<unsigned int>, int> meshByPrimitiveSet;
+    // FBX Model visibility, read from the file itself (ReadFbxModelVisibility): Assimp does not expose it.
+    struct FbxModel {
+        std::string name;
+        bool ownHidden = false;
+        bool inheritVisibility = true;
+        int64_t parent = 0;
+    };
+    bool fbxVisibilityRead = false;
+    std::unordered_map<int64_t, FbxModel> fbxModels;
+    std::unordered_map<std::string, std::vector<int64_t>> fbxModelIdsByName;
+    uint32_t fbxHiddenModelCount = 0;
+    uint32_t fbxHiddenNodesSkipped = 0;
+    uint64_t fbxHiddenTrianglesSkipped = 0;
+    std::vector<std::string> fbxAmbiguousNodeNames;
+    std::unordered_map<const aiNode*, bool> fbxNodeHidden;  // FbxNodeHidden's answer per node, computed once
+    std::string fbxApplicationName;                         // FBXHeaderExtension SceneInfo Original|ApplicationName
+    // Cinema 4D polygon selections (ApplyC4dPolygonSelectionRule): per node and mesh slot, the faces it keeps.
+    std::unordered_map<const aiNode*, std::unordered_map<unsigned int, std::vector<uint32_t>>> c4dKeptFaces;
 };
 
 std::string OrmSourceDescription(const OrmSource& source) {
@@ -2633,6 +2653,486 @@ void ConvertCameras(ImportContext& ctx) {
     }
 }
 
+// Reads each Model's Visibility and Visibility Inheritance and the Model parent links from a binary FBX file.
+// Assimp 6 drops Visibility, so a hidden Model (an alternate state an artist switched off) would be imported and
+// rendered on top of the visible one. Returns false with `error` set when the file is not a readable binary FBX.
+bool ReadFbxModelVisibility(const fs::path& path, ImportContext& ctx, std::string& error) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        error = "cannot open " + path.string();
+        return false;
+    }
+    const std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    static const char kMagic[] = "Kaydara FBX Binary  ";
+    if (data.size() < 27 || std::memcmp(data.data(), kMagic, 20) != 0) {
+        error = "not a binary FBX file (ASCII FBX visibility is not read)";
+        return false;
+    }
+    uint32_t version = 0;
+    std::memcpy(&version, data.data() + 23, 4);
+    const bool wide = version >= 7500u;
+    const size_t headerSize = wide ? 25u : 13u;
+    bool ok = true;
+    auto readU = [&](size_t offset, size_t bytes) -> uint64_t {
+        if (offset + bytes > data.size()) {
+            ok = false;
+            return 0;
+        }
+        uint64_t value = 0;
+        std::memcpy(&value, data.data() + offset, bytes);
+        return value;
+    };
+    struct Prop {
+        char type = 0;
+        int64_t integer = 0;
+        double real = 0.0;
+        std::string text;
+    };
+    // Reads the properties of the node record at `offset`; returns the record's end offset (0 for a null record).
+    auto readRecord = [&](size_t offset, std::string& name, std::vector<Prop>* props, size_t& childrenBegin) -> uint64_t {
+        const uint64_t end = readU(offset, wide ? 8 : 4);
+        const uint64_t propCount = readU(offset + (wide ? 8 : 4), wide ? 8 : 4);
+        const uint64_t propBytes = readU(offset + (wide ? 16 : 8), wide ? 8 : 4);
+        size_t cursor = offset + (wide ? 24 : 12);
+        const uint64_t nameLength = readU(cursor, 1);
+        cursor += 1;
+        if (!ok || cursor + nameLength > data.size()) {
+            ok = false;
+            return 0;
+        }
+        name.assign(reinterpret_cast<const char*>(data.data() + cursor), nameLength);
+        cursor += nameLength;
+        childrenBegin = cursor + propBytes;
+        if (end == 0) {
+            return 0;
+        }
+        for (uint64_t i = 0; props && i < propCount && ok; ++i) {
+            Prop prop;
+            prop.type = static_cast<char>(readU(cursor, 1));
+            cursor += 1;
+            switch (prop.type) {
+                case 'Y': prop.integer = static_cast<int16_t>(readU(cursor, 2)); cursor += 2; break;
+                case 'C': prop.integer = static_cast<int64_t>(readU(cursor, 1)); cursor += 1; break;
+                case 'I': prop.integer = static_cast<int32_t>(readU(cursor, 4)); cursor += 4; break;
+                case 'L': prop.integer = static_cast<int64_t>(readU(cursor, 8)); cursor += 8; break;
+                case 'F': {
+                    const uint32_t bits = static_cast<uint32_t>(readU(cursor, 4));
+                    float value = 0.0f;
+                    std::memcpy(&value, &bits, 4);
+                    prop.real = value;
+                    cursor += 4;
+                    break;
+                }
+                case 'D': {
+                    const uint64_t bits = readU(cursor, 8);
+                    std::memcpy(&prop.real, &bits, 8);
+                    cursor += 8;
+                    break;
+                }
+                case 'S':
+                case 'R': {
+                    const uint64_t length = readU(cursor, 4);
+                    cursor += 4;
+                    if (cursor + length > data.size()) {
+                        ok = false;
+                        break;
+                    }
+                    prop.text.assign(reinterpret_cast<const char*>(data.data() + cursor), length);
+                    cursor += length;
+                    break;
+                }
+                case 'f': case 'd': case 'l': case 'i': case 'b':
+                    cursor += 12 + readU(cursor + 8, 4);
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+            if (prop.type == 'Y' || prop.type == 'C' || prop.type == 'I' || prop.type == 'L') {
+                prop.real = static_cast<double>(prop.integer);
+            }
+            props->push_back(std::move(prop));
+        }
+        return end;
+    };
+    // Visits the child records of [begin, end).
+    auto forEachChild = [&](size_t begin, uint64_t end, const std::function<void(size_t, const std::string&, uint64_t, size_t)>& visit) {
+        size_t cursor = begin;
+        while (ok && cursor + headerSize <= end) {
+            std::string name;
+            size_t childrenBegin = 0;
+            const uint64_t childEnd = readRecord(cursor, name, nullptr, childrenBegin);
+            if (!ok || childEnd == 0 || childEnd <= cursor || childEnd > end) {
+                break;
+            }
+            visit(cursor, name, childEnd, childrenBegin);
+            cursor = childEnd;
+        }
+    };
+    std::vector<std::array<int64_t, 2>> links;
+    forEachChild(27, data.size(), [&](size_t, const std::string& name, uint64_t end, size_t childrenBegin) {
+        if (name == "Objects") {
+            forEachChild(childrenBegin, end, [&](size_t modelOffset, const std::string& objectName, uint64_t modelEnd, size_t) {
+                if (objectName != "Model") {
+                    return;
+                }
+                std::string recordName;
+                std::vector<Prop> props;
+                size_t modelChildren = 0;
+                readRecord(modelOffset, recordName, &props, modelChildren);
+                if (props.size() < 2 || props[0].type != 'L' || props[1].type != 'S') {
+                    return;
+                }
+                ImportContext::FbxModel model;
+                model.name = props[1].text.substr(0, props[1].text.find('\0'));
+                forEachChild(modelChildren, modelEnd, [&](size_t, const std::string& childName, uint64_t childEnd, size_t p70Children) {
+                    if (childName != "Properties70") {
+                        return;
+                    }
+                    forEachChild(p70Children, childEnd, [&](size_t pOffset, const std::string& pName, uint64_t, size_t) {
+                        if (pName != "P") {
+                            return;
+                        }
+                        std::string unused;
+                        std::vector<Prop> p;
+                        size_t pChildren = 0;
+                        readRecord(pOffset, unused, &p, pChildren);
+                        if (p.size() < 5 || p[0].type != 'S') {
+                            return;
+                        }
+                        if (p[0].text == "Visibility") {
+                            model.ownHidden = p[4].real == 0.0;
+                        } else if (p[0].text == "Visibility Inheritance") {
+                            model.inheritVisibility = p[4].real != 0.0;
+                        }
+                    });
+                });
+                ctx.fbxModelIdsByName[model.name].push_back(props[0].integer);
+                ctx.fbxModels.emplace(props[0].integer, std::move(model));
+            });
+        } else if (name == "FBXHeaderExtension") {
+            forEachChild(childrenBegin, end, [&](size_t, const std::string& hName, uint64_t hEnd, size_t hChildren) {
+                if (hName != "SceneInfo") {
+                    return;
+                }
+                forEachChild(hChildren, hEnd, [&](size_t, const std::string& sName, uint64_t sEnd, size_t sChildren) {
+                    if (sName != "Properties70") {
+                        return;
+                    }
+                    forEachChild(sChildren, sEnd, [&](size_t pOffset, const std::string& pName, uint64_t, size_t) {
+                        if (pName != "P") {
+                            return;
+                        }
+                        std::string unused;
+                        std::vector<Prop> p;
+                        size_t pChildren = 0;
+                        readRecord(pOffset, unused, &p, pChildren);
+                        if (p.size() >= 5 && p[0].type == 'S' && p[0].text == "Original|ApplicationName" && p[4].type == 'S') {
+                            ctx.fbxApplicationName = p[4].text;
+                        }
+                    });
+                });
+            });
+        } else if (name == "Connections") {
+            forEachChild(childrenBegin, end, [&](size_t cOffset, const std::string& cName, uint64_t, size_t) {
+                if (cName != "C") {
+                    return;
+                }
+                std::string unused;
+                std::vector<Prop> p;
+                size_t cChildren = 0;
+                readRecord(cOffset, unused, &p, cChildren);
+                if (p.size() >= 3 && p[0].type == 'S' && p[0].text == "OO" && p[1].type == 'L' && p[2].type == 'L') {
+                    links.push_back({p[1].integer, p[2].integer});
+                }
+            });
+        }
+    });
+    if (!ok) {
+        error = "malformed binary FBX record";
+        ctx.fbxModels.clear();
+        ctx.fbxModelIdsByName.clear();
+        return false;
+    }
+    for (const auto& link : links) {
+        auto child = ctx.fbxModels.find(link[0]);
+        if (child != ctx.fbxModels.end() && ctx.fbxModels.count(link[1]) != 0) {
+            child->second.parent = link[1];
+        }
+    }
+    return true;
+}
+
+// A Model is hidden when its own Visibility is 0, or when it inherits visibility from a hidden parent Model.
+bool FbxModelHidden(const ImportContext& ctx, int64_t id) {
+    for (int depth = 0; depth < 4096; ++depth) {
+        auto it = ctx.fbxModels.find(id);
+        if (it == ctx.fbxModels.end()) {
+            return false;
+        }
+        if (it->second.ownHidden) {
+            return true;
+        }
+        if (!it->second.inheritVisibility || it->second.parent == 0) {
+            return false;
+        }
+        id = it->second.parent;
+    }
+    return false;
+}
+
+// Whether the FBX Model an Assimp node came from is hidden. Assimp names a node after its Model. When several Models
+// share the name and disagree, the parent's name decides (Assimp's "$AssimpFbx$" pivot nodes are skipped); a node
+// that stays ambiguous is kept visible and counted.
+bool FbxNodeHidden(ImportContext& ctx, const aiNode* node) {
+    auto found = ctx.fbxModelIdsByName.find(node->mName.C_Str());
+    if (found == ctx.fbxModelIdsByName.end()) {
+        return false;
+    }
+    size_t hiddenCount = 0;
+    for (int64_t id : found->second) {
+        hiddenCount += FbxModelHidden(ctx, id) ? 1u : 0u;
+    }
+    if (hiddenCount == 0u || hiddenCount == found->second.size()) {
+        return hiddenCount != 0u;
+    }
+    const aiNode* parent = node->mParent;
+    while (parent && std::strstr(parent->mName.C_Str(), "$AssimpFbx$")) {
+        parent = parent->mParent;
+    }
+    std::optional<int64_t> match;
+    for (int64_t id : found->second) {
+        auto parentModel = ctx.fbxModels.find(ctx.fbxModels[id].parent);
+        const bool parentMatches = parentModel != ctx.fbxModels.end()
+            ? (parent && parentModel->second.name == parent->mName.C_Str())
+            : (!parent || !parent->mParent);
+        if (parentMatches) {
+            if (match) {
+                match.reset();
+                break;
+            }
+            match = id;
+        }
+    }
+    if (!match) {
+        ctx.fbxAmbiguousNodeNames.push_back(node->mName.C_Str());
+        return false;
+    }
+    return FbxModelHidden(ctx, *match);
+}
+
+// FbxNodeHidden, asked once per node (the selection prepass and ConvertNode both need it).
+bool FbxNodeHiddenCached(ImportContext& ctx, const aiNode* node) {
+    if (!ctx.fbxVisibilityRead || node->mNumMeshes == 0) {
+        return false;
+    }
+    auto found = ctx.fbxNodeHidden.find(node);
+    if (found != ctx.fbxNodeHidden.end()) {
+        return found->second;
+    }
+    const bool hidden = FbxNodeHidden(ctx, node);
+    ctx.fbxNodeHidden.emplace(node, hidden);
+    return hidden;
+}
+
+// The Cinema 4D polygon-selection rule's gate (Dario, 2026-11-24): the file has at least one sibling overlap between a
+// "*_Polygon_Selection*" mesh and another mesh under the same parent, and at least one material named "*_c4d*".
+// C4D exports a material on a polygon selection as the whole object plus a coincident sub-mesh of the selected
+// polygons; the header may name another application (Zero Day's FBX files were re-saved by Maya).
+bool C4dPolygonSelectionRuleApplies(const ImportContext& ctx, size_t overlapPairs, size_t& c4dMaterials) {
+    c4dMaterials = 0;
+    for (const MaterialInfo& material : ctx.materials) {
+        c4dMaterials += (ToLowerAscii(material.name).find("_c4d") != std::string::npos) ? 1u : 0u;
+    }
+    return overlapPairs > 0 && c4dMaterials > 0;
+}
+
+namespace {
+constexpr double kC4dSelectionEpsilon = 1.0e-4;  // world units; a triangle overlaps when its 3 quantized positions match
+using TriangleKey = std::array<int64_t, 9>;
+struct TriangleKeyHash {
+    size_t operator()(const TriangleKey& k) const {
+        size_t h = 1469598103934665603ull;
+        for (int64_t v : k) h = (h ^ static_cast<size_t>(v)) * 1099511628211ull;
+        return h;
+    }
+};
+using TriangleKeySet = std::unordered_set<TriangleKey, TriangleKeyHash>;
+
+TriangleKey KeyOfTriangle(const aiMesh* mesh, const aiFace& face, const aiMatrix4x4& world) {
+    std::array<std::array<int64_t, 3>, 3> v{};
+    for (int i = 0; i < 3; ++i) {
+        const aiVector3D p = world * mesh->mVertices[face.mIndices[i]];
+        v[i] = {static_cast<int64_t>(std::llround(p.x / kC4dSelectionEpsilon)),
+                static_cast<int64_t>(std::llround(p.y / kC4dSelectionEpsilon)),
+                static_cast<int64_t>(std::llround(p.z / kC4dSelectionEpsilon))};
+    }
+    std::sort(v.begin(), v.end());
+    return {v[0][0], v[0][1], v[0][2], v[1][0], v[1][1], v[1][2], v[2][0], v[2][1], v[2][2]};
+}
+
+struct SelectionChild {
+    const aiNode* node = nullptr;
+    aiMatrix4x4 world;
+    bool selection = false;
+};
+}  // namespace
+
+// Cinema 4D polygon selections (gate: C4dPolygonSelectionRuleApplies). Under each parent, a "*_Polygon_Selection*"
+// mesh's material wins over a sibling's coincident triangles: those are dropped from the sibling (the base mesh), and
+// its other triangles stay. Of two selections that coincide with the same material, the first keeps the triangles.
+// Selections that coincide with different materials are logged as unresolved and both kept: the file does not record
+// C4D's tag order. Fills ctx.c4dKeptFaces; ConvertNode writes a filtered primitive for those meshes.
+void ApplyC4dPolygonSelectionRule(ImportContext& ctx) {
+    struct Drop { std::string parent, base, selection; size_t dropped = 0, total = 0; bool duplicate = false; };
+    struct Unresolved { std::string parent, a, b, materialA, materialB; size_t count = 0; };
+    std::vector<Drop> drops;
+    std::vector<Unresolved> unresolved;
+    std::unordered_map<const aiNode*, std::unordered_map<unsigned int, std::vector<uint32_t>>> kept;
+    auto materialName = [&](const aiMesh* mesh) {
+        const int index = std::min<int>(mesh->mMaterialIndex, static_cast<int>(ctx.materials.size()) - 1);
+        return index >= 0 ? ctx.materials[index].name : std::string();
+    };
+    std::function<void(const aiNode*, const aiMatrix4x4&)> visit = [&](const aiNode* parent, const aiMatrix4x4& parentWorld) {
+        std::vector<SelectionChild> children;
+        for (unsigned int c = 0; c < parent->mNumChildren; ++c) {
+            const aiNode* child = parent->mChildren[c];
+            SelectionChild entry{child, parentWorld * child->mTransformation,
+                                 std::strstr(child->mName.C_Str(), "_Polygon_Selection") != nullptr};
+            if (child->mNumMeshes > 0 && !FbxNodeHiddenCached(ctx, child)) {
+                children.push_back(entry);
+            }
+            visit(child, entry.world);
+        }
+        bool anySelection = false;
+        for (const SelectionChild& c : children) anySelection |= c.selection;
+        if (!anySelection) {
+            return;
+        }
+        // Each selection's triangles, after its own earlier duplicates are removed.
+        std::vector<std::pair<const SelectionChild*, std::vector<std::pair<std::string, TriangleKeySet>>>> selections;
+        for (const SelectionChild& c : children) {
+            if (!c.selection) continue;
+            std::vector<std::pair<std::string, TriangleKeySet>> perMaterial;
+            for (unsigned int m = 0; m < c.node->mNumMeshes; ++m) {
+                const aiMesh* mesh = ctx.scene->mMeshes[c.node->mMeshes[m]];
+                std::vector<uint32_t> keepFaces;
+                size_t duplicateDrops = 0;
+                TriangleKeySet keys;
+                for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+                    const aiFace& face = mesh->mFaces[f];
+                    if (face.mNumIndices != 3) continue;
+                    const TriangleKey key = KeyOfTriangle(mesh, face, c.world);
+                    bool duplicate = false;
+                    for (const auto& [earlier, earlierSets] : selections) {
+                        for (const auto& [mat, set] : earlierSets) {
+                            if (mat == materialName(mesh) && set.count(key)) { duplicate = true; break; }
+                        }
+                        if (duplicate) break;
+                    }
+                    if (duplicate) { ++duplicateDrops; continue; }
+                    keepFaces.push_back(f);
+                    keys.insert(key);
+                }
+                if (duplicateDrops > 0) {
+                    kept[c.node][m] = keepFaces;
+                    drops.push_back({parent->mName.C_Str(), c.node->mName.C_Str(), "(earlier same-material selection)",
+                                     duplicateDrops, mesh->mNumFaces, true});
+                }
+                perMaterial.emplace_back(materialName(mesh), std::move(keys));
+            }
+            // Coincidence with an earlier selection of a different material: logged, both kept.
+            for (const auto& [earlier, earlierSets] : selections) {
+                for (const auto& [matA, setA] : earlierSets) {
+                    for (const auto& [matB, setB] : perMaterial) {
+                        if (matA == matB) continue;
+                        size_t count = 0;
+                        for (const TriangleKey& k : setB) count += setA.count(k);
+                        if (count) unresolved.push_back({parent->mName.C_Str(), earlier->node->mName.C_Str(),
+                                                         c.node->mName.C_Str(), matA, matB, count});
+                    }
+                }
+            }
+            selections.emplace_back(&c, std::move(perMaterial));
+        }
+        // Base meshes: drop the triangles a selection covers.
+        for (const SelectionChild& c : children) {
+            if (c.selection) continue;
+            for (unsigned int m = 0; m < c.node->mNumMeshes; ++m) {
+                const aiMesh* mesh = ctx.scene->mMeshes[c.node->mMeshes[m]];
+                std::unordered_map<std::string, size_t> droppedBy;
+                std::vector<uint32_t> keepFaces;
+                for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+                    const aiFace& face = mesh->mFaces[f];
+                    if (face.mNumIndices != 3) continue;
+                    const TriangleKey key = KeyOfTriangle(mesh, face, c.world);
+                    const char* by = nullptr;
+                    for (const auto& [sel, sets] : selections) {
+                        for (const auto& [mat, set] : sets) {
+                            if (set.count(key)) { by = sel->node->mName.C_Str(); break; }
+                        }
+                        if (by) break;
+                    }
+                    if (by) droppedBy[by] += 1; else keepFaces.push_back(f);
+                }
+                if (!droppedBy.empty()) {
+                    kept[c.node][m] = keepFaces;
+                    for (const auto& [sel, n] : droppedBy) {
+                        drops.push_back({parent->mName.C_Str(), c.node->mName.C_Str(), sel, n, mesh->mNumFaces, false});
+                    }
+                }
+            }
+        }
+    };
+    visit(ctx.scene->mRootNode, ctx.scene->mRootNode->mTransformation);
+    size_t c4dMaterials = 0;
+    const size_t basePairs = static_cast<size_t>(std::count_if(drops.begin(), drops.end(), [](const Drop& d) { return !d.duplicate; }));
+    const bool applies = C4dPolygonSelectionRuleApplies(ctx, basePairs, c4dMaterials);
+    std::cout << "[Import] C4D polygon selections: file ApplicationName \"" << ctx.fbxApplicationName << "\"; "
+              << c4dMaterials << " _c4d materials; " << basePairs << " base/selection overlap pairs; epsilon "
+              << kC4dSelectionEpsilon << "; rule " << (applies ? "applied" : "not applied") << std::endl;
+    if (!applies) {
+        return;
+    }
+    size_t totalDropped = 0;
+    for (const Drop& d : drops) {
+        std::cout << "[Import] C4D selection: parent " << d.parent << " | "
+                  << (d.duplicate ? "duplicate selection " : "base ") << d.base << " | selection " << d.selection
+                  << " | dropped " << d.dropped << " of " << d.total << " triangles" << std::endl;
+        totalDropped += d.dropped;
+    }
+    size_t unresolvedTriangles = 0;
+    for (const Unresolved& u : unresolved) {
+        std::cout << "[Import] C4D selection: parent " << u.parent << " | selections " << u.a << " (" << u.materialA
+                  << ") and " << u.b << " (" << u.materialB << ") coincide on " << u.count
+                  << " triangles; unresolved, both kept" << std::endl;
+        unresolvedTriangles += u.count;
+    }
+    std::cout << "[Import] C4D polygon selections: dropped " << totalDropped << " triangles in " << drops.size()
+              << " pairs; " << unresolved.size() << " different-material selection overlaps (" << unresolvedTriangles
+              << " triangles) left unresolved" << std::endl;
+    if (!unresolved.empty()) {
+        ctx.warnings.push_back(std::to_string(unresolved.size()) +
+                               " C4D polygon selections coincide with a different material; both kept");
+    }
+    ctx.c4dKeptFaces = std::move(kept);
+}
+
+// A primitive for `meshIndex` with only `faces`, sharing the mesh's vertex accessors.
+int FilteredPrimitive(ImportContext& ctx, unsigned int meshIndex, const std::vector<uint32_t>& faces) {
+    const aiMesh* mesh = ctx.scene->mMeshes[meshIndex];
+    std::vector<uint32_t> indices;
+    indices.reserve(faces.size() * 3u);
+    for (uint32_t f : faces) {
+        const aiFace& face = mesh->mFaces[f];
+        indices.insert(indices.end(), {face.mIndices[0], face.mIndices[1], face.mIndices[2]});
+    }
+    PrimitiveRef primitive = ctx.primitives[meshIndex];
+    primitive.indicesAccessor = PushAccessor(ctx, indices, 1, 5125, "SCALAR", 34963);
+    ctx.primitives.push_back(primitive);
+    return static_cast<int>(ctx.primitives.size() - 1);
+}
+
 int ConvertNode(ImportContext& ctx, const aiNode* node) {
     NodeInfo out;
     out.name = node->mName.length > 0 ? std::string(node->mName.C_Str())
@@ -2646,10 +3146,28 @@ int ConvertNode(ImportContext& ctx, const aiNode* node) {
     out.scale = {scaling.x, scaling.y, scaling.z};
     std::vector<unsigned int> primitiveSet;
     primitiveSet.reserve(node->mNumMeshes);
-    for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+    const bool hiddenInSource = FbxNodeHiddenCached(ctx, node);
+    if (hiddenInSource) {
+        // Hidden in the FBX file: keep the node and its transform for its children, drop its meshes.
+        ctx.fbxHiddenNodesSkipped += 1;
+        for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+            ctx.fbxHiddenTrianglesSkipped += ctx.scene->mMeshes[node->mMeshes[i]]->mNumFaces;
+        }
+    }
+    const auto c4dKept = ctx.c4dKeptFaces.find(node);
+    for (unsigned int i = 0; !hiddenInSource && i < node->mNumMeshes; ++i) {
         const unsigned int meshIndex = node->mMeshes[i];
         if (ShouldSkipPrimitiveForImport(ctx, meshIndex)) {
             continue;
+        }
+        if (c4dKept != ctx.c4dKeptFaces.end()) {
+            if (auto faces = c4dKept->second.find(i); faces != c4dKept->second.end()) {
+                // A C4D polygon selection covers some of these triangles (ApplyC4dPolygonSelectionRule).
+                if (!faces->second.empty()) {
+                    primitiveSet.push_back(static_cast<unsigned int>(FilteredPrimitive(ctx, meshIndex, faces->second)));
+                }
+                continue;
+            }
         }
         primitiveSet.push_back(meshIndex);
     }
@@ -3944,7 +4462,35 @@ ImportResult RunImportPipelineImpl(const ImportOptions& options) {
     ConvertCameras(ctx);
     ConvertMaterials(ctx);
     ConvertMeshes(ctx);
+    if (ToLowerAscii(ctx.sourcePath.extension().string()) == ".fbx") {
+        std::string fbxError;
+        ctx.fbxVisibilityRead = ReadFbxModelVisibility(ctx.sourcePath, ctx, fbxError);
+        if (!ctx.fbxVisibilityRead) {
+            ctx.warnings.push_back("FBX Model visibility not read (" + fbxError + "); hidden Models are imported");
+            std::cerr << "[Import] FBX visibility: not read (" << fbxError << "); hidden Models are imported" << std::endl;
+        } else {
+            for (const auto& [id, model] : ctx.fbxModels) {
+                ctx.fbxHiddenModelCount += FbxModelHidden(ctx, id) ? 1u : 0u;
+            }
+        }
+    }
+    if (ctx.fbxVisibilityRead) {
+        ApplyC4dPolygonSelectionRule(ctx);
+    }
     ctx.rootNodes.push_back(ConvertNode(ctx, ctx.scene->mRootNode));
+    if (ctx.fbxVisibilityRead) {
+        std::cout << "[Import] FBX visibility: " << ctx.fbxModels.size() << " Models, " << ctx.fbxHiddenModelCount
+                  << " hidden (own Visibility 0 or a hidden parent); skipped the meshes of " << ctx.fbxHiddenNodesSkipped
+                  << " nodes (" << ctx.fbxHiddenTrianglesSkipped << " triangles)";
+        if (!ctx.fbxAmbiguousNodeNames.empty()) {
+            std::cout << "; " << ctx.fbxAmbiguousNodeNames.size()
+                      << " nodes kept visible: their Model name is shared by hidden and visible Models and the parent does not decide (first: "
+                      << ctx.fbxAmbiguousNodeNames.front() << ")";
+            ctx.warnings.push_back(std::to_string(ctx.fbxAmbiguousNodeNames.size()) +
+                                   " FBX nodes with an ambiguous Model name were kept visible");
+        }
+        std::cout << std::endl;
+    }
 
     const std::string sceneFileName =
         ctx.sceneBaseName + (options.outputFormat == ImportOptions::OutputFormat::Glb ? ".glb" : ".gltf");

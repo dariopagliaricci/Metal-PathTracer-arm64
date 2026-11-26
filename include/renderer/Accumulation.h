@@ -3,6 +3,8 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include "renderer/AccumulationState.h"
 #include "renderer/MetalHandles.h"
 #include "renderer/RenderPassGraph.h"
 
@@ -38,7 +40,15 @@ public:
     void reset(MTLCommandQueueHandle commandQueue,
                MTLComputePipelineStateHandle clearPipeline,
                MTKViewHandle view);
-    
+
+    /// Copy the counters and the accumulated textures (radiance sums, sample counts, AOV accumulators) to the
+    /// CPU. Waits for the copies to finish.
+    bool exportState(MTLCommandQueueHandle commandQueue, AccumulationState& state, std::string& error) const;
+
+    /// Restore a state from exportState into the current textures and counters, and cancel the pending clear.
+    /// Every texture must exist with the same name, size and format. Waits for the copies to finish.
+    bool importState(MTLCommandQueueHandle commandQueue, const AccumulationState& state, std::string& error);
+
     /// Update drawable size for the view and resize textures if needed.
     /// @return Updated content scale factor used for UI scaling.
     float updateDrawableSize(NSWindowHandle window, MTKViewHandle view);

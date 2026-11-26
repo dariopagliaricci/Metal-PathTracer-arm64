@@ -515,6 +515,7 @@ bool PathLooksLikeBistroAsset(const std::string& path) {
            ContainsCaseInsensitive(path, "/bistro/");
 }
 
+// Only for the warning when a Pavilion-looking file loads without gltfBarcelonaPavilionRules; the rules follow the token.
 bool PathLooksLikeBarcelonaPavilionAsset(const std::string& path) {
     return ContainsCaseInsensitive(path, "/barcelona_pavilion/") ||
            ContainsCaseInsensitive(path, "\\barcelona_pavilion\\") ||
@@ -1155,7 +1156,8 @@ uint32_t ResolveTextureIndex(const std::string& gltfPath,
                              MaterialTextureSemantic semantic,
                              SceneResources& resources,
                              AssetPipelineReport* report,
-                             const std::string& materialName) {
+                             const std::string& materialName,
+                             bool barcelonaPavilionRules) {
     if (textureIndex < 0 || textureIndex >= static_cast<int>(textures.size())) {
         if (textureIndex >= 0 && report) {
             RecordTextureColorSpace(report, gltfPath, textureIndex, -1, nullptr, srgb, semantic, "invalid_texture_index");
@@ -1206,7 +1208,7 @@ uint32_t ResolveTextureIndex(const std::string& gltfPath,
     } else if (hasGltfSampler) {
         samplerDescPtr = &samplerDesc;
     }
-    if (PathLooksLikeBarcelonaPavilionAsset(gltfPath)) {
+    if (barcelonaPavilionRules) {
         // The renderer that produced the Pavilion references uses its maximum
         // anisotropy. Keep narrow lily veins at the pool's grazing angles.
         samplerDesc.maxAnisotropy = 16u;
@@ -1417,19 +1419,22 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
                                                 MaterialTextureSemantic::BaseColor,
                                                 resources,
                                                 report,
-                                                src.name);
+                                                src.name,
+                                                loadOptions.barcelonaPavilionRules);
     uint32_t mrIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                          src.metallicRoughnessTexture.index, false,
                                          MaterialTextureSemantic::Orm,
                                          resources,
                                          report,
-                                         src.name);
+                                         src.name,
+                                         loadOptions.barcelonaPavilionRules);
     uint32_t normalIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                              src.normalTexture.index, false,
                                              MaterialTextureSemantic::Normal,
                                              resources,
                                              report,
-                                             src.name);
+                                             src.name,
+                                             loadOptions.barcelonaPavilionRules);
     MaterialTextureSemantic occlusionSemantic = MaterialTextureSemantic::Occlusion;
     if (src.occlusionTexture.index >= 0 &&
         src.occlusionTexture.index == src.metallicRoughnessTexture.index) {
@@ -1440,19 +1445,22 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
                                                 occlusionSemantic,
                                                 resources,
                                                 report,
-                                                src.name);
+                                                src.name,
+                                                loadOptions.barcelonaPavilionRules);
     uint32_t emissiveIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                                src.emissiveTexture.index, emissiveSrgb,
                                                MaterialTextureSemantic::Emissive,
                                                resources,
                                                report,
-                                               src.name);
+                                               src.name,
+                                               loadOptions.barcelonaPavilionRules);
     uint32_t transmissionIdx = ResolveTextureIndex(gltfPath, textures, samplers, images, buffers, views,
                                                    src.transmissionTexture.index, false,
                                                    MaterialTextureSemantic::Transmission,
                                                    resources,
                                                    report,
-                                                   src.name);
+                                                   src.name,
+                                                   loadOptions.barcelonaPavilionRules);
     const bool disableOrmBySpecularWorkflowFallback =
         TextureBindingLooksLikeBistroSpecularWorkflowFallback(gltfPath,
                                                               src.metallicRoughnessTexture,
@@ -1564,7 +1572,7 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
     }
     float transmissionFactor =
         std::clamp(src.transmissionFactor * std::max(loadOptions.transmissionScale, 0.0f), 0.0f, 1.0f);
-    if (PathLooksLikeBarcelonaPavilionAsset(gltfPath)) {
+    if (loadOptions.barcelonaPavilionRules) {
         if (BarcelonaPavilionWaterMaterial(src.name)) {
             roughnessFactor = 0.0f;
             transmissionFactor = 0.0f;
@@ -1641,14 +1649,14 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
         // two opposite-facing sheets a hair apart, so either may win the hit.
         material.materialFlags |= PathTracerShaderTypes::kMaterialFlagBlackBackFace;
     }
-    if (PathLooksLikeBarcelonaPavilionAsset(gltfPath)) {
+    if (loadOptions.barcelonaPavilionRules) {
         material.materialFlags |= PathTracerShaderTypes::kMaterialFlagSingleScatterSpecular;
     }
-    if (PathLooksLikeBarcelonaPavilionAsset(gltfPath) &&
+    if (loadOptions.barcelonaPavilionRules &&
         BarcelonaPavilionWaterMaterial(src.name)) {
         material.materialFlags |= PathTracerShaderTypes::kMaterialFlagDielectricTransmissionTint;
     }
-    if (PathLooksLikeBarcelonaPavilionAsset(gltfPath) &&
+    if (loadOptions.barcelonaPavilionRules &&
         (BarcelonaPavilionWaterMaterial(src.name) ||
          BarcelonaPavilionArchitecturalGlassMaterial(src.name))) {
         // Match the reference renderer's path-regularized water and glass (Metal).
@@ -1703,7 +1711,7 @@ MaterialData BuildGltfMaterial(const GltfMaterial& src,
     if (loadOptions.alphaOverride >= 0.0f) {
         alphaFactor = std::clamp(loadOptions.alphaOverride, 0.0f, 1.0f);
     }
-    if (PathLooksLikeBarcelonaPavilionAsset(gltfPath) &&
+    if (loadOptions.barcelonaPavilionRules &&
         (BarcelonaPavilionWaterMaterial(src.name) ||
          BarcelonaPavilionArchitecturalGlassMaterial(src.name))) {
         alphaFactor = 1.0f;
@@ -2412,7 +2420,7 @@ bool LoadGltfScene(const std::string& path,
     } materialImagePrefetchGuard{resources};
     {
         std::vector<MaterialImagePrefetchSource> prefetch;
-        auto addTexture = [&](int textureIndex, bool normalMap = false) {
+        auto addTexture = [&](int textureIndex, bool normalMap = false, bool srgbColor = false) {
             if (textureIndex < 0 || textureIndex >= static_cast<int>(textures.size())) {
                 return;
             }
@@ -2423,6 +2431,7 @@ bool LoadGltfScene(const std::string& path,
             const GltfImage& image = images[static_cast<size_t>(imageIndex)];
             MaterialImagePrefetchSource source;
             source.normalMap = normalMap;
+            source.srgbColor = srgbColor;
             if (!image.uri.empty()) {
                 if (image.uri.rfind("data:", 0) == 0) {
                     return;  // decoded from a temporary buffer at request time
@@ -2445,11 +2454,11 @@ bool LoadGltfScene(const std::string& path,
             prefetch.push_back(std::move(source));
         };
         for (const GltfMaterial& material : materials) {
-            addTexture(material.baseColorTexture.index);
+            addTexture(material.baseColorTexture.index, /*normalMap=*/false, /*srgbColor=*/true);
             addTexture(material.metallicRoughnessTexture.index);
             addTexture(material.normalTexture.index, /*normalMap=*/true);
             addTexture(material.occlusionTexture.index);
-            addTexture(material.emissiveTexture.index);
+            addTexture(material.emissiveTexture.index, /*normalMap=*/false, /*srgbColor=*/true);
             addTexture(material.transmissionTexture.index);
         }
         resources.beginMaterialImagePrefetch(prefetch);
@@ -2475,7 +2484,8 @@ bool LoadGltfScene(const std::string& path,
                                                               MaterialTextureSemantic::BaseColor,
                                                               resources,
                                                               nullptr,
-                                                              candidate.name);
+                                                              candidate.name,
+                                                              loadOptions.barcelonaPavilionRules);
             const int minTexel = (baseColorIdx == kInvalidTextureIndex) ? -1
                                                                         : resources.materialTextureMinAlpha(baseColorIdx);
             const float minAlpha = minTexel < 0 ? -1.0f
@@ -2536,6 +2546,21 @@ bool LoadGltfScene(const std::string& path,
               @"double-sided MASK as before (authored BLEND with alpha below 1, no holes), %zu made double-sided MASK "
               @"without a check (texture format not decoded here), %zu skipped (no alpha holes)",
               foliageRuleApplied, foliageRuleKeptBlend, foliageRuleUnchecked, foliageRuleSkipped);
+    }
+    if (loadOptions.barcelonaPavilionRules) {
+        size_t waterMaterials = 0u, glassMaterials = 0u;
+        for (const GltfMaterial& material : materials) {
+            waterMaterials += BarcelonaPavilionWaterMaterial(material.name) ? 1u : 0u;
+            glassMaterials += BarcelonaPavilionArchitecturalGlassMaterial(material.name) ? 1u : 0u;
+        }
+        NSLog(@"[Loader] Barcelona Pavilion rules (mesh gltfBarcelonaPavilionRules=1): sampler anisotropy 16, "
+              @"SingleScatterSpecular on all %zu materials, water rules on %zu, architectural-glass rules on %zu",
+              materials.size(), waterMaterials, glassMaterials);
+    } else if (PathLooksLikeBarcelonaPavilionAsset(path)) {
+        NSLog(@"[Loader] warning: '%s' looks like the Barcelona Pavilion asset, but its mesh line does not set "
+              @"gltfBarcelonaPavilionRules=1, so its reference-matching rules (anisotropy 16, SingleScatterSpecular, "
+              @"water and glass) are off",
+              path.c_str());
     }
     const uint32_t defaultMaterialIndex =
         (defaultSourceMaterialIndex >= 0)
@@ -2874,8 +2899,9 @@ bool LoadGltfScene(const std::string& path,
     // node references are cached, and an entry is dropped after its last reference.
     struct DecodedPrimitive {
         std::vector<float> positions;  // the POSITION accessor as read, for the per-instance bounds and counts
-        std::vector<SceneResources::MeshVertex> vertices;
-        std::vector<uint32_t> indices;
+        // Shared with every mesh added from this decode (SceneResources::addMesh keeps them, not copies).
+        std::shared_ptr<const std::vector<SceneResources::MeshVertex>> vertices;
+        std::shared_ptr<const std::vector<uint32_t>> indices;
         bool hasNormals = false;
         bool hasUvs = false;
         bool hasTangents = false;
@@ -3086,11 +3112,22 @@ bool LoadGltfScene(const std::string& path,
         }
 
         if (!hasTangents && hasUvs) {
+            // MikkTSpace's sign (tangent.w) follows the index winding. Build the tangents on the authored winding, so a
+            // mirrored primitive gets the same object-space frame as an unmirrored one; the renderers then multiply w by
+            // the determinant's sign, which carries the bitangent through the mirror. Built on the reversed winding, w
+            // was flipped twice and the normal map's bitangent pointed the wrong way on mirrored nodes.
+            const bool mirrored = TransformHasNegativeDeterminant(localToWorld);
+            if (mirrored) {
+                ReverseTriangleWindingForMirroredTransform(indices, localToWorld);  // back to the authored winding
+            }
             GenerateTangents(vertices, indices);
+            if (mirrored) {
+                ReverseTriangleWindingForMirroredTransform(indices, localToWorld);
+            }
         }
         out.positions = std::move(positions);
-        out.vertices = std::move(vertices);
-        out.indices = std::move(indices);
+        out.vertices = std::make_shared<const std::vector<SceneResources::MeshVertex>>(std::move(vertices));
+        out.indices = std::make_shared<const std::vector<uint32_t>>(std::move(indices));
         out.hasNormals = hasNormals;
         out.hasUvs = hasUvs;
         out.hasTangents = hasTangents;
@@ -3157,8 +3194,8 @@ bool LoadGltfScene(const std::string& path,
         if (vertexCount == 0) {
             return true;
         }
-        const std::vector<SceneResources::MeshVertex>& vertices = decoded->vertices;
-        const std::vector<uint32_t>& indices = decoded->indices;
+        const std::vector<SceneResources::MeshVertex>& vertices = *decoded->vertices;
+        const std::vector<uint32_t>& indices = *decoded->indices;
         const bool hasNormals = decoded->hasNormals;
         const bool hasUvs = decoded->hasUvs;
         const bool hasTangents = decoded->hasTangents;
@@ -3283,10 +3320,8 @@ bool LoadGltfScene(const std::string& path,
                             static_cast<int32_t>(resources.meshes().size()),
                             geometryStableId);
 
-        resources.addMesh(vertices.data(),
-                          static_cast<uint32_t>(vertices.size()),
-                          indices.data(),
-                          static_cast<uint32_t>(indices.size()),
+        resources.addMesh(decoded->vertices,
+                          decoded->indices,
                           localToWorld,
                           sourceLocalTransform,
                           materialIndex,

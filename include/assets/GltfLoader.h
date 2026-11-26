@@ -44,6 +44,10 @@ struct GltfLoadOptions {
     bool importPunctualLights = false;
     bool texturedEmissionNee = false;   // Scene opt-in: textured emitters join direct-light sampling.
     bool referenceDielectricContinuation = false;  // Scene opt-in: eta-free refraction (Path-Tracing references).
+    // Scene opt-in (mesh gltfBarcelonaPavilionRules=1, set by the Barcelona Pavilion presets): the rules that match its
+    // reference renderer, which the loader chose by the file path before: sampler anisotropy 16, SingleScatterSpecular on
+    // every material, and the water and architectural-glass material rules.
+    bool barcelonaPavilionRules = false;
     float punctualLightIntensityScale = 1.0f;
     float transmissionScale = 1.0f;
     float roughnessOverride = -1.0f;

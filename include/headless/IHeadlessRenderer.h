@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include <simd/simd.h>
 
+#include "renderer/AccumulationState.h"
 #include "renderer/RadianceCacheTraining.h"
 #include "renderer/RenderSettings.h"
 #include "renderer/SceneResources.h"
@@ -614,9 +616,27 @@ struct HeadlessRenderOutput {
     DirectLightAuditDump directLightAudit;
 };
 
+// Headless sample checkpoints (--checkpointEverySamples, --resumeCheckpointJson on a partial checkpoint).
+struct HeadlessSampleCheckpointOptions {
+    // Export the accumulation every this many samples (0: never). The last batch before each multiple is shortened
+    // so that exports land on the multiples.
+    uint32_t everySamples = 0;
+    std::function<bool(const PathTracer::AccumulationState&, std::string&)> write;
+    // Restore this accumulation before the first sample and render only the samples it does not have yet.
+    const PathTracer::AccumulationState* resumeFrom = nullptr;
+};
+
 class IHeadlessRenderer {
 public:
     virtual ~IHeadlessRenderer() = default;
+    // Returns false, with a reason, if the backend cannot honour the options.
+    virtual bool setSampleCheckpointOptions(const HeadlessSampleCheckpointOptions& options, std::string& error) {
+        if (options.everySamples == 0u && options.resumeFrom == nullptr) {
+            return true;
+        }
+        error = "this backend does not support sample checkpoints";
+        return false;
+    }
     virtual bool render(const HeadlessScene& scene,
                         const HeadlessCamera& camera,
                         const PathTracer::RenderSettings& settings,

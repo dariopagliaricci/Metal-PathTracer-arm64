@@ -44,11 +44,6 @@ struct RenderSettings {
         FirstInMediumBoundary = 2,
     };
 
-    enum class WorkingColorSpace : uint32_t {
-        LinearSRGB = 0,
-        ACEScg = 1,
-    };
-
     enum class FireflyClampMode : uint32_t {
         Luminance = 0,
         MaxComponent = 1,
@@ -276,7 +271,6 @@ struct RenderSettings {
     float bloomRadius = 1.5f;        // Bloom tap radius in pixels
     bool srgbOutputEncoding = true;        // LDR outputs and display: piecewise sRGB encode; false = gamma 2.2
     float referenceBloomIntensity = 0.0f;  // LDR outputs: Path-Tracing reference bloom; 0 disables
-    WorkingColorSpace workingColorSpace = WorkingColorSpace::LinearSRGB;
     bool gltfViewerCompatibilityMode = false;   // Opt-in glTF viewer parity behavior
     bool gltfThinWalledFallback = true;         // If transmission exists without volume, force thin dielectric
     float gltfEmissiveScale = 1.0f;             // Extra emissive scale for viewer-oriented readability

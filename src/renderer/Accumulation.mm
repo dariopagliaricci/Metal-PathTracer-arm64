@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <iterator>
 
 #ifndef DEBUG_FIXED_RENDER_RESOLUTION
@@ -474,6 +477,268 @@ void Accumulation::teardown() {
     m_device = nil;
     m_lastAllocationGraph = {};
     m_hasLastAllocationGraph = false;
+}
+
+namespace {
+
+// The textures the integrators read and add to on every sample, and the present textures the next sample reads.
+// The denoised and SVGF textures belong to denoisers that run after the last sample or that a checkpoint refuses.
+struct ResumableTexture {
+    const char* name;
+    id<MTLTexture> texture;
+};
+
+uint32_t BytesPerPixelForResume(MTLPixelFormat format) {
+    switch (format) {
+        case MTLPixelFormatRGBA32Float: return 16u;
+        case MTLPixelFormatR32Uint: return 4u;
+        default: return 0u;
+    }
+}
+
+constexpr uint32_t kAccumulationStateMagic = 0x53434150u;  // "PACS"
+constexpr uint32_t kAccumulationStateVersion = 1u;
+
+}  // namespace
+
+bool Accumulation::exportState(MTLCommandQueueHandle commandQueue, AccumulationState& state, std::string& error) const {
+    const ResumableTexture textures[] = {
+        {"radiance_sum", m_radianceSumTexture},
+        {"direct_radiance_sum", m_directRadianceSumTexture},
+        {"indirect_radiance_sum", m_indirectRadianceSumTexture},
+        {"radiance_moment_sum", m_radianceMomentSumTexture},
+        {"sample_count", m_sampleCountTexture},
+        {"albedo", m_albedoTexture},
+        {"normal", m_normalTexture},
+        {"position", m_positionTexture},
+        {"material_feature", m_materialFeatureTexture},
+        {"motion_vector", m_motionVectorTexture},
+        {"reconstruction_metric", m_reconstructionMetricTexture},
+        {"present", m_presentTexture},
+        {"direct_present", m_directPresentTexture},
+        {"indirect_present", m_indirectPresentTexture},
+    };
+    if (!m_device || !commandQueue) {
+        error = "Accumulation state export: no Metal device or command queue";
+        return false;
+    }
+    state = AccumulationState{};
+    state.frameIndex = m_frameIndex;
+    state.sampleCount = m_sampleCount;
+    std::vector<id<MTLBuffer>> buffers;
+    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    commandBuffer.label = @"Accumulation State Export";
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    for (const ResumableTexture& entry : textures) {
+        if (!entry.texture) {
+            error = std::string("Accumulation state export: texture ") + entry.name + " does not exist";
+            [blit endEncoding];
+            return false;
+        }
+        const uint32_t bytesPerPixel = BytesPerPixelForResume(entry.texture.pixelFormat);
+        if (bytesPerPixel == 0u) {
+            error = std::string("Accumulation state export: texture ") + entry.name + " has an unsupported format";
+            [blit endEncoding];
+            return false;
+        }
+        AccumulationTextureState textureState;
+        textureState.name = entry.name;
+        textureState.width = static_cast<uint32_t>(entry.texture.width);
+        textureState.height = static_cast<uint32_t>(entry.texture.height);
+        textureState.bytesPerPixel = bytesPerPixel;
+        const NSUInteger bytesPerRow = static_cast<NSUInteger>(textureState.width) * bytesPerPixel;
+        const NSUInteger length = bytesPerRow * textureState.height;
+        id<MTLBuffer> buffer = [m_device newBufferWithLength:length options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            error = std::string("Accumulation state export: cannot allocate a buffer for ") + entry.name;
+            [blit endEncoding];
+            return false;
+        }
+        [blit copyFromTexture:entry.texture
+                     sourceSlice:0
+                     sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(textureState.width, textureState.height, 1)
+                        toBuffer:buffer
+               destinationOffset:0
+          destinationBytesPerRow:bytesPerRow
+        destinationBytesPerImage:length];
+        buffers.push_back(buffer);
+        state.textures.push_back(std::move(textureState));
+    }
+    [blit endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+        error = "Accumulation state export: the copy command buffer failed";
+        return false;
+    }
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        const uint8_t* source = static_cast<const uint8_t*>(buffers[i].contents);
+        state.textures[i].bytes.assign(source, source + buffers[i].length);
+    }
+    return true;
+}
+
+bool Accumulation::importState(MTLCommandQueueHandle commandQueue, const AccumulationState& state, std::string& error) {
+    const ResumableTexture textures[] = {
+        {"radiance_sum", m_radianceSumTexture},
+        {"direct_radiance_sum", m_directRadianceSumTexture},
+        {"indirect_radiance_sum", m_indirectRadianceSumTexture},
+        {"radiance_moment_sum", m_radianceMomentSumTexture},
+        {"sample_count", m_sampleCountTexture},
+        {"albedo", m_albedoTexture},
+        {"normal", m_normalTexture},
+        {"position", m_positionTexture},
+        {"material_feature", m_materialFeatureTexture},
+        {"motion_vector", m_motionVectorTexture},
+        {"reconstruction_metric", m_reconstructionMetricTexture},
+        {"present", m_presentTexture},
+        {"direct_present", m_directPresentTexture},
+        {"indirect_present", m_indirectPresentTexture},
+    };
+    if (!m_device || !commandQueue) {
+        error = "Accumulation state import: no Metal device or command queue";
+        return false;
+    }
+    if (state.textures.size() != std::size(textures)) {
+        error = "Accumulation state import: the state has " + std::to_string(state.textures.size()) +
+                " textures, the renderer " + std::to_string(std::size(textures));
+        return false;
+    }
+    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    commandBuffer.label = @"Accumulation State Import";
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    for (size_t i = 0; i < std::size(textures); ++i) {
+        const ResumableTexture& entry = textures[i];
+        const AccumulationTextureState& textureState = state.textures[i];
+        const uint32_t bytesPerPixel = entry.texture ? BytesPerPixelForResume(entry.texture.pixelFormat) : 0u;
+        const size_t expectedBytes =
+            static_cast<size_t>(textureState.width) * textureState.height * textureState.bytesPerPixel;
+        if (!entry.texture || textureState.name != entry.name ||
+            textureState.width != entry.texture.width || textureState.height != entry.texture.height ||
+            textureState.bytesPerPixel != bytesPerPixel || bytesPerPixel == 0u ||
+            textureState.bytes.size() != expectedBytes) {
+            error = std::string("Accumulation state import: texture ") + entry.name +
+                    " does not match the state's " + textureState.name + " (" +
+                    std::to_string(textureState.width) + "x" + std::to_string(textureState.height) + ", " +
+                    std::to_string(textureState.bytesPerPixel) + " bytes per pixel)";
+            [blit endEncoding];
+            return false;
+        }
+        id<MTLBuffer> buffer = [m_device newBufferWithBytes:textureState.bytes.data()
+                                                     length:textureState.bytes.size()
+                                                    options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            error = std::string("Accumulation state import: cannot allocate a buffer for ") + entry.name;
+            [blit endEncoding];
+            return false;
+        }
+        const NSUInteger bytesPerRow = static_cast<NSUInteger>(textureState.width) * bytesPerPixel;
+        [blit copyFromBuffer:buffer
+                   sourceOffset:0
+              sourceBytesPerRow:bytesPerRow
+            sourceBytesPerImage:bytesPerRow * textureState.height
+                     sourceSize:MTLSizeMake(textureState.width, textureState.height, 1)
+                      toTexture:entry.texture
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+    [blit endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+        error = "Accumulation state import: the copy command buffer failed";
+        return false;
+    }
+    m_frameIndex = state.frameIndex;
+    m_sampleCount = state.sampleCount;
+    m_needsClear = false;
+    return true;
+}
+
+bool WriteAccumulationStateFile(const std::string& path, const AccumulationState& state, std::string& error) {
+    const std::string temporaryPath = path + ".tmp";
+    FILE* file = std::fopen(temporaryPath.c_str(), "wb");
+    if (!file) {
+        error = "Cannot write accumulation state " + temporaryPath;
+        return false;
+    }
+    bool ok = true;
+    auto put32 = [&](uint32_t value) { ok = ok && std::fwrite(&value, sizeof(value), 1, file) == 1; };
+    put32(kAccumulationStateMagic);
+    put32(kAccumulationStateVersion);
+    put32(state.frameIndex);
+    put32(state.sampleCount);
+    put32(static_cast<uint32_t>(state.textures.size()));
+    for (const AccumulationTextureState& texture : state.textures) {
+        put32(static_cast<uint32_t>(texture.name.size()));
+        ok = ok && std::fwrite(texture.name.data(), 1, texture.name.size(), file) == texture.name.size();
+        put32(texture.width);
+        put32(texture.height);
+        put32(texture.bytesPerPixel);
+        ok = ok && std::fwrite(texture.bytes.data(), 1, texture.bytes.size(), file) == texture.bytes.size();
+    }
+    ok = (std::fclose(file) == 0) && ok;
+    if (!ok || std::rename(temporaryPath.c_str(), path.c_str()) != 0) {
+        std::remove(temporaryPath.c_str());
+        error = "Cannot write accumulation state " + path;
+        return false;
+    }
+    return true;
+}
+
+bool ReadAccumulationStateFile(const std::string& path, AccumulationState& state, std::string& error) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (!file) {
+        error = "Cannot read accumulation state " + path;
+        return false;
+    }
+    bool ok = true;
+    auto get32 = [&]() -> uint32_t {
+        uint32_t value = 0u;
+        ok = ok && std::fread(&value, sizeof(value), 1, file) == 1;
+        return value;
+    };
+    state = AccumulationState{};
+    const uint32_t magic = get32();
+    const uint32_t version = get32();
+    if (!ok || magic != kAccumulationStateMagic || version != kAccumulationStateVersion) {
+        std::fclose(file);
+        error = "Not an accumulation state file (version " + std::to_string(kAccumulationStateVersion) + "): " + path;
+        return false;
+    }
+    state.frameIndex = get32();
+    state.sampleCount = get32();
+    const uint32_t textureCount = get32();
+    for (uint32_t i = 0; ok && i < textureCount && i < 64u; ++i) {
+        AccumulationTextureState texture;
+        const uint32_t nameLength = get32();
+        if (!ok || nameLength > 256u) {
+            ok = false;
+            break;
+        }
+        texture.name.resize(nameLength);
+        ok = ok && std::fread(texture.name.data(), 1, nameLength, file) == nameLength;
+        texture.width = get32();
+        texture.height = get32();
+        texture.bytesPerPixel = get32();
+        const uint64_t byteCount = static_cast<uint64_t>(texture.width) * texture.height * texture.bytesPerPixel;
+        if (!ok || byteCount > (1ull << 32)) {
+            ok = false;
+            break;
+        }
+        texture.bytes.resize(static_cast<size_t>(byteCount));
+        ok = ok && std::fread(texture.bytes.data(), 1, texture.bytes.size(), file) == texture.bytes.size();
+        state.textures.push_back(std::move(texture));
+    }
+    std::fclose(file);
+    if (!ok || state.textures.size() != textureCount) {
+        error = "Truncated or corrupt accumulation state: " + path;
+        return false;
+    }
+    return true;
 }
 
 }  // namespace PathTracer

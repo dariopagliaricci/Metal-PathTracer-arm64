@@ -1,19 +1,26 @@
 #pragma once
 
-// Mean-preserving mip levels for textures whose sizes are not powers of two.
+// Mean-preserving mip levels for 8-bit colour textures.
 //
 // A 2x2 box keeps a texture's mean at every level only when each level halves exactly. With an odd size, a 2x2 box
 // drops the last row or column, and Metal's generateMipmapsForTexture takes a bilinear sample at each texel's
 // centre: neither keeps the mean, and at the coarse levels both are far off (an 894x894 tile texture's 1x1 level was
 // 1.20 / 1.34 / 1.50 times the mip-0 mean in R / G / B). This filter weights every source texel by the area it shares
-// with the destination texel's true footprint, so each level keeps the mean of the one above it. Metal uploads the
-// 8-bit levels built here, and Embree's CPU copy decodes the same levels, so both backends sample the same texels.
+// with the destination texel's true footprint, so each level keeps the mean of the one above it.
+//
+// Power-of-two sizes take the same chain. On an RGBA8Unorm_sRGB texture the blit builds each level from the previous
+// level's 8-bit texels and rounds each to the nearest sRGB code. Rounding to the nearest code in sRGB space raises the
+// linear value on average, and the rise adds up level by level: over Bistro's 193 base-colour images the 1x1 level was
+// 1.0106 times the mip-0 mean, and up to 1.04 on dark images. Here the chain runs in float and each level is quantized
+// once. Metal uploads the 8-bit levels built here, and Embree's CPU copy decodes the same levels, so both backends
+// sample the same texels.
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace PathTracer::MipChain {
@@ -103,6 +110,65 @@ inline uint8_t QuantizeUnorm8(float value) {
     return static_cast<uint8_t>(std::lround(v * 255.0f));
 }
 
+// QuantizeUnorm8(SrgbEncode(linear)) without a pow per texel. That function never decreases as linear grows, so it is
+// fixed by the 255 smallest floats at which it reaches codes 1 to 255; each is found by a search over the float bit
+// patterns of [0, 1] that evaluates the function itself, so the table gives the same byte for every float.
+inline const std::array<float, 255>& SrgbQuantizeThresholds() {
+    static const std::array<float, 255> thresholds = [] {
+        std::array<float, 255> table{};
+        for (uint32_t code = 1u; code < 256u; ++code) {
+            uint32_t lo = 0u;
+            uint32_t hi = 0x3f800000u;  // 1.0f, which gives code 255
+            while (lo < hi) {
+                const uint32_t mid = lo + (hi - lo) / 2u;
+                float x = 0.0f;
+                std::memcpy(&x, &mid, sizeof(x));
+                if (QuantizeUnorm8(SrgbEncode(x)) >= code) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1u;
+                }
+            }
+            std::memcpy(&table[code - 1u], &lo, sizeof(float));
+        }
+        return table;
+    }();
+    return thresholds;
+}
+
+// For each bucket of 2^15 float bit patterns in [0, 1), the code of the bucket's smallest float: a lower bound on the
+// code of every float in the bucket, which QuantizeSrgb8 then walks up through the thresholds (at most a step or two).
+inline const std::array<uint8_t, (0x3f800000u >> 15u)>& SrgbQuantizeBuckets() {
+    static const std::array<uint8_t, (0x3f800000u >> 15u)> buckets = [] {
+        const std::array<float, 255>& thresholds = SrgbQuantizeThresholds();
+        std::array<uint8_t, (0x3f800000u >> 15u)> table{};
+        for (uint32_t bucket = 0u; bucket < table.size(); ++bucket) {
+            const uint32_t bits = bucket << 15u;
+            float x = 0.0f;
+            std::memcpy(&x, &bits, sizeof(x));
+            table[bucket] = static_cast<uint8_t>(std::upper_bound(thresholds.begin(), thresholds.end(), x) -
+                                                 thresholds.begin());
+        }
+        return table;
+    }();
+    return buckets;
+}
+
+inline uint8_t QuantizeSrgb8(float linear) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &linear, sizeof(bits));
+    if (bits >= 0x3f800000u) {
+        // Negative (sign bit) and NaN give 0, as QuantizeUnorm8(SrgbEncode(x)) does; 1 and above, infinity included, 255.
+        return ((bits & 0x80000000u) != 0u || bits > 0x7f800000u) ? 0u : 255u;
+    }
+    const std::array<float, 255>& thresholds = SrgbQuantizeThresholds();
+    uint32_t code = SrgbQuantizeBuckets()[bits >> 15u];
+    while (code < 255u && linear >= thresholds[code]) {
+        ++code;
+    }
+    return static_cast<uint8_t>(code);
+}
+
 struct Rgba8Level {
     uint32_t width = 0u;
     uint32_t height = 0u;
@@ -131,7 +197,7 @@ inline std::vector<Rgba8Level> BuildRgba8MipLevels(const uint8_t* rgba0, uint32_
         height = nextHeight;
         Rgba8Level encoded{width, height, std::vector<uint8_t>(level.size())};
         for (size_t i = 0u; i < level.size(); ++i) {
-            encoded.rgba[i] = QuantizeUnorm8((srgb && i % 4u != 3u) ? SrgbEncode(level[i]) : level[i]);
+            encoded.rgba[i] = (srgb && i % 4u != 3u) ? QuantizeSrgb8(level[i]) : QuantizeUnorm8(level[i]);
         }
         out.push_back(std::move(encoded));
     }

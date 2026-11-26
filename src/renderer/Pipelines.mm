@@ -287,9 +287,9 @@ struct Pipelines::LazyIntegrateState {
     std::string archiveBase;  // main archive path without its extension; empty without archives
     bool deviceSupportsRaytracing = false;
     bool verboseTiming = false;
-    id<MTLComputePipelineState> pipelines[3] = {nil, nil, nil};
-    std::atomic<bool> ready[3] = {false, false, false};
-    std::atomic<bool> failed[3] = {false, false, false};
+    id<MTLComputePipelineState> pipelines[5] = {nil, nil, nil, nil, nil};
+    std::atomic<bool> ready[5] = {false, false, false, false, false};
+    std::atomic<bool> failed[5] = {false, false, false, false, false};
     std::atomic<bool> cancelled{false};
     std::atomic<bool> backgroundStarted{false};
     std::mutex recordsMutex;
@@ -310,15 +310,28 @@ namespace {
 constexpr int kIntegrateSoftware = 0;
 constexpr int kIntegrateHardware = 1;
 constexpr int kIntegrateHardwareDefaultFeatures = 2;
+// The wavefront shade kernel's default-features specializations (direct and resolved surface, function constant 1),
+// built on first use like the integrate variants: the general shade pipelines are built at initialization.
+constexpr int kWavefrontShadeDefaultFeatures = 3;
+constexpr int kWavefrontShadeResolvedDefaultFeatures = 4;
+constexpr int kLazyVariantCount = 5;
+
+bool LazyVariantNeedsRaytracing(int variant) {
+    return variant == kIntegrateHardware || variant == kIntegrateHardwareDefaultFeatures;
+}
 
 NSString* IntegrateVariantFunction(int variant) {
-    return variant == kIntegrateSoftware ? @"pathtraceIntegrateKernel" : @"pathtraceIntegrateHardwareKernel";
+    return variant == kIntegrateSoftware ? @"pathtraceIntegrateKernel"
+         : variant >= kWavefrontShadeDefaultFeatures ? @"wavefrontShadeKernel"
+                                                     : @"pathtraceIntegrateHardwareKernel";
 }
 
 NSString* IntegrateVariantLabel(int variant) {
     return variant == kIntegrateSoftware ? @"Path Trace Integrate"
          : variant == kIntegrateHardware ? @"Path Trace Integrate (HW)"
-                                         : @"Path Trace Integrate (HW, default features)";
+         : variant == kIntegrateHardwareDefaultFeatures ? @"Path Trace Integrate (HW, default features)"
+         : variant == kWavefrontShadeDefaultFeatures ? @"Wavefront Shade (default features)"
+                                                     : @"Wavefront Shade Resolved (default features)";
 }
 
 }  // namespace
@@ -329,13 +342,18 @@ NSString* IntegrateVariantLabel(int variant) {
 static bool BuildIntegrateVariantLocked(Pipelines::LazyIntegrateState& state, int variant, bool archiveHitOnly) {
     NSString* label = IntegrateVariantLabel(variant);
     NSString* functionName = IntegrateVariantFunction(variant);
-    const bool defaultFeatures = variant == kIntegrateHardwareDefaultFeatures;
+    const bool defaultFeatures = variant >= kIntegrateHardwareDefaultFeatures;
     // Shared shader code reads the default-features function constant (index 2), and Metal only builds pipelines
     // from such functions once specialized: unset, kMegakernelDefaultFeatures is false (shaders/common.metal).
     MTLFunctionConstantValues* constants = [[[MTLFunctionConstantValues alloc] init] autorelease];
     if (defaultFeatures) {
         bool enabled = true;
         [constants setConstantValue:&enabled type:MTLDataTypeBool atIndex:2];
+    }
+    if (variant >= kWavefrontShadeDefaultFeatures) {
+        // The shade kernel's surface source (index 1): resolved by the resolve-surface pass, or resolved inline.
+        bool resolvedSurface = variant == kWavefrontShadeResolvedDefaultFeatures;
+        [constants setConstantValue:&resolvedSurface type:MTLDataTypeBool atIndex:1];
     }
     NSError* functionError = nil;
     id<MTLFunction> function = [[state.library newFunctionWithName:functionName
@@ -451,7 +469,7 @@ static bool BuildIntegrateVariantLocked(Pipelines::LazyIntegrateState& state, in
 
 MTLComputePipelineStateHandle Pipelines::integrateVariant(const std::shared_ptr<LazyIntegrateState>& state,
                                                           int variant, bool foreground) {
-    if (!state || (variant != kIntegrateSoftware && !state->deviceSupportsRaytracing)) {
+    if (!state || (LazyVariantNeedsRaytracing(variant) && !state->deviceSupportsRaytracing)) {
         return nil;
     }
     if (state->ready[variant].load(std::memory_order_acquire)) {
@@ -493,6 +511,38 @@ MTLComputePipelineStateHandle Pipelines::integrateHardwareDefaultFeatures() cons
     return integrateVariant(m_lazyIntegrate, kIntegrateHardwareDefaultFeatures, true);
 }
 
+// The wavefront shade variants never wait: a variant that is not built yet is built here only when no other build
+// holds the lazy-build mutex (the GUI's background build can hold it for minutes on a megakernel variant). Otherwise,
+// or after a failed build, this returns nil and the caller keeps the general shade pipeline for that frame.
+MTLComputePipelineStateHandle Pipelines::lazyVariantWithoutWaiting(const std::shared_ptr<LazyIntegrateState>& state,
+                                                                   int variant) {
+    if (!state) {
+        return nil;
+    }
+    if (state->ready[variant].load(std::memory_order_acquire)) {
+        return state->pipelines[variant];
+    }
+    if (state->failed[variant].load()) {
+        return nil;
+    }
+    std::unique_lock<std::mutex> lock(state->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return nil;
+    }
+    if (!state->ready[variant].load() && !state->failed[variant].load()) {
+        BuildIntegrateVariantLocked(*state, variant, /*archiveHitOnly=*/false);
+    }
+    return state->ready[variant].load(std::memory_order_acquire) ? state->pipelines[variant] : nil;
+}
+
+MTLComputePipelineStateHandle Pipelines::wavefrontShadeDefaultFeatures() const {
+    return lazyVariantWithoutWaiting(m_lazyIntegrate, kWavefrontShadeDefaultFeatures);
+}
+
+MTLComputePipelineStateHandle Pipelines::wavefrontShadeResolvedDefaultFeatures() const {
+    return lazyVariantWithoutWaiting(m_lazyIntegrate, kWavefrontShadeResolvedDefaultFeatures);
+}
+
 bool Pipelines::integrateHardwareAvailable() const {
     return m_lazyIntegrate && m_lazyIntegrate->deviceSupportsRaytracing;
 }
@@ -503,16 +553,17 @@ void Pipelines::buildIntegrateVariantsInBackground() const {
         return;
     }
     bool missing = false;
-    for (int variant = 0; variant < 3; ++variant) {
+    for (int variant = 0; variant < kLazyVariantCount; ++variant) {
         missing = missing || (!state->ready[variant].load() &&
-                              (variant == kIntegrateSoftware || state->deviceSupportsRaytracing));
+                              (!LazyVariantNeedsRaytracing(variant) || state->deviceSupportsRaytracing));
     }
     if (!missing) {
         return;
     }
     NSLog(@"[Pipelines] Building the integrate pipelines not built yet in the background");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        for (int variant : {kIntegrateHardwareDefaultFeatures, kIntegrateHardware, kIntegrateSoftware}) {
+        for (int variant : {kIntegrateHardwareDefaultFeatures, kIntegrateHardware, kIntegrateSoftware,
+                            kWavefrontShadeDefaultFeatures, kWavefrontShadeResolvedDefaultFeatures}) {
             if (state->cancelled.load()) {
                 return;
             }
@@ -819,8 +870,8 @@ bool Pipelines::createComputePipelines() {
     // Variants already in an archive are created now, as before, without compiling; the others on first use.
     {
         std::lock_guard<std::mutex> lock(m_lazyIntegrate->mutex);
-        for (int variant = 0; variant < 3; ++variant) {
-            if (variant == 0 || m_lazyIntegrate->deviceSupportsRaytracing) {
+        for (int variant = 0; variant < kLazyVariantCount; ++variant) {
+            if (!LazyVariantNeedsRaytracing(variant) || m_lazyIntegrate->deviceSupportsRaytracing) {
                 BuildIntegrateVariantLocked(*m_lazyIntegrate, variant, /*archiveHitOnly=*/true);
             }
         }

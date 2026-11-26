@@ -78,6 +78,8 @@ constexpr uint32_t kMaterialFlagSourceFeatures = 1u << 19;
 constexpr uint32_t kMaterialFlagSubsurfaceExit = 1u << 20;
 // Set only on an integrator's local copy (shaders/shared/source_closures.h, source_mark_closure_side).
 constexpr uint32_t kMaterialFlagSourceClosureBackSide = 1u << 21;
+// Shader-local (never set by the host): coat lobe of a coated random-walk subsurface vertex, see shaders/common.metal.
+constexpr uint32_t kMaterialFlagSubsurfaceCoatLobe = 1u << 23;
 constexpr uint32_t kMaterialFlagInterfacePrecision = 1u << 28;
 constexpr uint32_t kMaterialFlagExplicitInterior = 1u << 29;
 constexpr uint32_t kMaterialFlagMediumInherit = 1u << 30;
@@ -299,7 +301,6 @@ struct PathtraceUniforms {
     uint32_t emissivePrimitiveCount = 0;
     uint32_t fixedRngSeed = 0;  // If non-zero, use as deterministic RNG seed
     uint32_t backgroundMode = 0;
-    uint32_t workingColorSpace = 0;
     float environmentRotation = 0.0f;   // Radians, rotates env map around world Y
     float environmentIntensity = 1.0f;  // Multiplier applied to environment sampling
     float emissiveTotalPower = 0.0f;

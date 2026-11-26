@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "MetalRendererTypes.h"
+#include "renderer/AccumulationState.h"
 #include "headless/IHeadlessRenderer.h"
 
 namespace PathTracer {
@@ -355,6 +356,16 @@ public:
     void applySettings(const PathTracer::RenderSettings& settings, bool resetAccumulation = true);
     void setSamplesPerFrame(uint32_t samples);
     uint32_t sampleCount() const;
+
+    // Headless sample checkpoints: copy the accumulation (counters and accumulated textures) to the CPU, or queue
+    // one to be restored at the start of the next drawFrame, after any pending reset and texture allocation.
+    // accumulationImportError() is empty unless the last queued import failed (the accumulation then restarts).
+    bool exportAccumulationState(PathTracer::AccumulationState& state, std::string& error);
+    void setPendingAccumulationImport(PathTracer::AccumulationState state);
+    std::string accumulationImportError() const;
+    // A state that already holds every sample (a completed checkpoint): allocate the accumulation textures as
+    // drawFrame does and restore the state now, without drawing; the captures then read it.
+    bool importAccumulationStateNow(PathTracer::AccumulationState state, std::string& error);
 
     // Presentation Mode controls
     void setPresentationEnabled(bool enabled);

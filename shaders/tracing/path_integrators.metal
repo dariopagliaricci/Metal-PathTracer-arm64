@@ -779,9 +779,6 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                    uniforms);
                 }
             }
-            if (uniforms.backgroundMode != 2u) {
-                background = to_working_space(background, uniforms);
-            }
             background = spectral_radiance_to_channels(background, spectralState);
             if (debugContext) {
                 record_debug_event(*debugContext,
@@ -1097,8 +1094,8 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                 float2(0.0f));
             baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
                                                                              baseColorSample);
-            float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
-            float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
+            float3 baseFactor = material.baseColorRoughness.xyz;
+            float3 baseColorSampleRgb = baseColorSample.xyz;
             material.baseColorRoughness.xyz = baseFactor * baseColorSampleRgb;
             debugBaseColor = material.baseColorRoughness.xyz;
             debugBaseColorUv = baseColorCtx.uv;
@@ -1309,7 +1306,7 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                                                            dUVdx1,
                                                                                            dUVdy1,
                                                                                            uvPerWorld1);
-            float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
+            float3 baseFactor = material.baseColorRoughness.xyz;
             float baseColorLod =
                 material_texture_lod_with_fallback(materialTextures,
                                                    materialTextureInfos,
@@ -1344,7 +1341,7 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
             }
             baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
                                                                              baseColorSample);
-            float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
+            float3 baseColorSampleRgb = baseColorSample.xyz;
             float3 baseColor = baseFactor * baseColorSampleRgb;
             debugBaseColorUv = baseColorCtx.uv;
             debugBaseColorLod = baseColorLod;
@@ -1354,14 +1351,14 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
             float roughness = max(material.pbrParams.y, 0.0f);
             float normalStrengthScale = 1.0f;
 #if PT_DEBUG_TOOLS
-            normalStrengthScale = max(uniforms.debugNormalStrengthScale, 0.0f);
+            normalStrengthScale = max(PT_DEFAULT_VALUE(uniforms.debugNormalStrengthScale, 1.0f), 0.0f);
 #endif
             float normalScale = material.pbrParams.w * normalStrengthScale;
             bool disableOrmByMaterial = (material.materialFlags & kMaterialFlagDisableOrm) != 0u;
             bool useOrmTexture = !disableOrmByMaterial &&
                                  material_texture_valid(uniforms, material.textureIndices0.y);
 #if PT_DEBUG_TOOLS
-            useOrmTexture = useOrmTexture && (uniforms.debugDisableOrmTexture == 0u);
+            useOrmTexture = useOrmTexture && (PT_DEFAULT_OFF(uniforms.debugDisableOrmTexture) == 0u);
 #endif
             if (useOrmTexture) {
                 float ormLod =
@@ -1375,7 +1372,7 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                        ormCtx.uvPerWorld,
                                                        surfaceFootprintWorld);
 #if PT_DEBUG_TOOLS
-                ormLod = max(ormLod + uniforms.debugOrmLodBias, 0.0f);
+                ormLod = max(ormLod + PT_DEFAULT_VALUE(uniforms.debugOrmLodBias, 0.0f), 0.0f);
 #endif
                 float3 mrSample =
                     sample_material_texture_level(materialTextures,
@@ -1412,7 +1409,7 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                    normalCtx.uvPerWorld,
                                                    surfaceFootprintWorld);
 #if PT_DEBUG_TOOLS
-            normalLod = max(normalLod + uniforms.debugNormalLodBias, 0.0f);
+            normalLod = max(normalLod + PT_DEFAULT_VALUE(uniforms.debugNormalLodBias, 0.0f), 0.0f);
 #endif
 
             float transmission = clamp(material.pbrExtras.z, 0.0f, 1.0f);
@@ -1535,7 +1532,7 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
             debugMetallic = metallic;
             debugRoughness = roughness;
 
-            float3 emissive = to_working_space(material.emission.xyz, uniforms);
+            float3 emissive = material.emission.xyz;
             if (material_texture_valid(uniforms, material.textureIndices1.x)) {
                 float emissiveLod =
                     material_texture_lod_with_fallback(materialTextures,
@@ -1559,13 +1556,12 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                     emissiveCtx.hasIgehyGradients,
                                                     emissiveCtx.dUVdx,
                                                     emissiveCtx.dUVdy).xyz;
-                emissiveSample = to_working_space(emissiveSample, uniforms);
                 emissive *= emissiveSample;
             }
 
             bool useNormalMap = material_texture_valid(uniforms, material.textureIndices0.z);
 #if PT_DEBUG_TOOLS
-            if (uniforms.debugDisableNormalMap != 0u) {
+            if (PT_DEFAULT_OFF(uniforms.debugDisableNormalMap) != 0u) {
                 useNormalMap = false;
             }
 #endif
@@ -1576,7 +1572,7 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
             float3 normalSampleTs = float3(0.0f, 0.0f, 1.0f);
             bool flipNormalGreen = false;
 #if PT_DEBUG_TOOLS
-            flipNormalGreen = uniforms.debugFlipNormalGreen != 0u;
+            flipNormalGreen = PT_DEFAULT_OFF(uniforms.debugFlipNormalGreen) != 0u;
 #endif
             if (useNormalMap) {
                 float4 normalTexel =
@@ -1628,7 +1624,9 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
                                                              b);
                 }
                 if (!hasBasis) {
+                    // No vertex tangent and no UV frame (degenerate UVs): no normal map, as on Embree and in Falcor.
                     build_onb(shadingNormal, t, b);
+                    normalSampleTs = float3(0.0f, 0.0f, 1.0f);
                 }
                 float3 mappedNormalTs = normalSampleTs;
                 if (hasVertexTangentBasis &&
@@ -2092,8 +2090,32 @@ inline float3 trace_path_software(constant PathtraceUniforms& uniforms,
         // the walk leaves the mesh; any other subsurface hit is shaded as its dense limit.
         bool subsurfaceExitVertex = false;
         if (material_is_subsurface(material)) {
-            if (subsurface_vertex_begin(uniforms, material, rec, shadingNormal, wo, specularOnly, state, throughput) ==
-                kSubsurfaceVertexWalk) {
+            // The material's normal map shapes only its coat (backlog #47, as in Arnold): where the mapped normal faces the
+            // view, the coat's lobe choice uses it, and a coat-lobe vertex is shaded at it. The walk's weights
+            // and its entry use the unmapped hit.
+            float3 coatNormal = shadingNormal;
+            bool coatNormalMapped = false;
+            if (sss_use_random_walk(PT_DEFAULT_OFF(uniforms.sssMode), material) && subsurface_has_coat(material) &&
+                rec.frontFace != 0u && !specularOnly) {
+                float3 mappedNormal;
+                if (subsurface_coat_mapped_normal(uniforms, materialTextures, materialSamplers, materialTextureInfos,
+                                                  meshInfos, sceneVertices, meshIndices, material, rec, shadingNormal,
+                                                  mappedNormal)) {
+                    // A coat normal whose mirror reflection of the view would point into the mesh is bent toward Ng.
+                    mappedNormal = subsurface_coat_valid_reflection_normal(rec.normal, wo, mappedNormal);
+                    if (dot(mappedNormal, wo) > 0.0f) {
+                        coatNormal = mappedNormal;
+                        coatNormalMapped = true;
+                    }
+                }
+            }
+            const uint subsurfaceEvent = subsurface_vertex_begin(uniforms, material, rec, shadingNormal, coatNormal, wo,
+                                                                 specularOnly, state, throughput);
+            if (subsurfaceEvent == kSubsurfaceVertexCoat && coatNormalMapped) {
+                shadingNormal = coatNormal;
+                rec.shadingNormal = coatNormal;
+            }
+            if (subsurfaceEvent == kSubsurfaceVertexWalk) {
                 HitRecord exitRec;
                 float3 walkWeight = float3(0.0f);
                 uint walkEvent = sss_random_walk_software(uniforms, material, rec, spheres, rectangles, triangleData,
@@ -4801,12 +4823,12 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
         (tlasNodes && tlasPrimIndices && blasNodes && blasPrimIndices && instanceInfos && triangleData);
     const bool forcePureHWRTForGlass = (uniforms.forcePureHWRTForGlass != 0u);
     const bool enableMissFallback =
-        !forcePureHWRTForGlass && (uniforms.enableHardwareMissFallback != 0u);
+        !forcePureHWRTForGlass && (PT_DEFAULT_OFF(uniforms.enableHardwareMissFallback) != 0u);
     const bool enableFirstHitFallback =
-        !forcePureHWRTForGlass && (uniforms.enableHardwareFirstHitFromSoftware != 0u);
+        !forcePureHWRTForGlass && (PT_DEFAULT_OFF(uniforms.enableHardwareFirstHitFromSoftware) != 0u);
     const bool forceSoftware =
         !forcePureHWRTForGlass &&
-        (uniforms.enableHardwareForceSoftware != 0u) &&
+        (PT_DEFAULT_OFF(uniforms.enableHardwareForceSoftware) != 0u) &&
         softwareTrianglesAvailable;
 
     uint foliageAlphaVisibilitySkips = 0u;
@@ -4819,8 +4841,11 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
         if (prevValid) {
             compute_exclusion_indices(prevRec, excludeMeshIndex, excludePrimitiveIndex);
         }
+        // Tracing path rays inside a medium with the software BVH is a PT_DEBUG_TOOLS-only rule (the GUI build has
+        // none). The default-features pipeline compiles it out, as the GUI build does: it costs that pipeline about
+        // 1.1 KB of register spill, and no image was found that it changes.
         const bool preferSoftwareForMedium =
-            !forcePureHWRTForGlass && (mediumDepth > 0u) && softwareTrianglesAvailable;
+            !kMegakernelDefaultFeatures && !forcePureHWRTForGlass && (mediumDepth > 0u) && softwareTrianglesAvailable;
 
         bool doParity = false;
 #if PT_DEBUG_TOOLS
@@ -5111,9 +5136,6 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                    uniforms.environmentIntensity,
                                                    uniforms);
                 }
-            }
-            if (uniforms.backgroundMode != 2u) {
-                background = to_working_space(background, uniforms);
             }
             background = spectral_radiance_to_channels(background, spectralState);
             if (debugContext) {
@@ -5461,8 +5483,8 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                 float2(0.0f));
             baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
                                                                              baseColorSample);
-            float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
-            float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
+            float3 baseFactor = material.baseColorRoughness.xyz;
+            float3 baseColorSampleRgb = baseColorSample.xyz;
             material.baseColorRoughness.xyz = baseFactor * baseColorSampleRgb;
             debugBaseColor = material.baseColorRoughness.xyz;
             debugBaseColorUv = baseColorCtx.uv;
@@ -5673,7 +5695,7 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                                                            dUVdx1,
                                                                                            dUVdy1,
                                                                                            uvPerWorld1);
-            float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
+            float3 baseFactor = material.baseColorRoughness.xyz;
             float baseColorLod =
                 material_texture_lod_with_fallback(materialTextures,
                                                    materialTextureInfos,
@@ -5708,7 +5730,7 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
             }
             baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
                                                                              baseColorSample);
-            float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
+            float3 baseColorSampleRgb = baseColorSample.xyz;
             float3 baseColor = baseFactor * baseColorSampleRgb;
             debugBaseColorUv = baseColorCtx.uv;
             debugBaseColorLod = baseColorLod;
@@ -5718,14 +5740,14 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
             float roughness = max(material.pbrParams.y, 0.0f);
             float normalStrengthScale = 1.0f;
 #if PT_DEBUG_TOOLS
-            normalStrengthScale = max(uniforms.debugNormalStrengthScale, 0.0f);
+            normalStrengthScale = max(PT_DEFAULT_VALUE(uniforms.debugNormalStrengthScale, 1.0f), 0.0f);
 #endif
             float normalScale = material.pbrParams.w * normalStrengthScale;
             bool disableOrmByMaterial = (material.materialFlags & kMaterialFlagDisableOrm) != 0u;
             bool useOrmTexture = !disableOrmByMaterial &&
                                  material_texture_valid(uniforms, material.textureIndices0.y);
 #if PT_DEBUG_TOOLS
-            useOrmTexture = useOrmTexture && (uniforms.debugDisableOrmTexture == 0u);
+            useOrmTexture = useOrmTexture && (PT_DEFAULT_OFF(uniforms.debugDisableOrmTexture) == 0u);
 #endif
             if (useOrmTexture) {
                 float ormLod =
@@ -5739,7 +5761,7 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                        ormCtx.uvPerWorld,
                                                        surfaceFootprintWorld);
 #if PT_DEBUG_TOOLS
-                ormLod = max(ormLod + uniforms.debugOrmLodBias, 0.0f);
+                ormLod = max(ormLod + PT_DEFAULT_VALUE(uniforms.debugOrmLodBias, 0.0f), 0.0f);
 #endif
                 float3 mrSample =
                     sample_material_texture_level(materialTextures,
@@ -5776,7 +5798,7 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                    normalCtx.uvPerWorld,
                                                    surfaceFootprintWorld);
 #if PT_DEBUG_TOOLS
-            normalLod = max(normalLod + uniforms.debugNormalLodBias, 0.0f);
+            normalLod = max(normalLod + PT_DEFAULT_VALUE(uniforms.debugNormalLodBias, 0.0f), 0.0f);
 #endif
 
             float transmission = clamp(material.pbrExtras.z, 0.0f, 1.0f);
@@ -5899,7 +5921,7 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
             debugMetallic = metallic;
             debugRoughness = roughness;
 
-            float3 emissive = to_working_space(material.emission.xyz, uniforms);
+            float3 emissive = material.emission.xyz;
             if (material_texture_valid(uniforms, material.textureIndices1.x)) {
                 float emissiveLod =
                     material_texture_lod_with_fallback(materialTextures,
@@ -5923,13 +5945,12 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                     emissiveCtx.hasIgehyGradients,
                                                     emissiveCtx.dUVdx,
                                                     emissiveCtx.dUVdy).xyz;
-                emissiveSample = to_working_space(emissiveSample, uniforms);
                 emissive *= emissiveSample;
             }
 
             bool useNormalMap = material_texture_valid(uniforms, material.textureIndices0.z);
 #if PT_DEBUG_TOOLS
-            if (uniforms.debugDisableNormalMap != 0u) {
+            if (PT_DEFAULT_OFF(uniforms.debugDisableNormalMap) != 0u) {
                 useNormalMap = false;
             }
 #endif
@@ -5940,7 +5961,7 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
             float3 normalSampleTs = float3(0.0f, 0.0f, 1.0f);
             bool flipNormalGreen = false;
 #if PT_DEBUG_TOOLS
-            flipNormalGreen = uniforms.debugFlipNormalGreen != 0u;
+            flipNormalGreen = PT_DEFAULT_OFF(uniforms.debugFlipNormalGreen) != 0u;
 #endif
             if (useNormalMap) {
                 float4 normalTexel =
@@ -5992,7 +6013,9 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
                                                              b);
                 }
                 if (!hasBasis) {
+                    // No vertex tangent and no UV frame (degenerate UVs): no normal map, as on Embree and in Falcor.
                     build_onb(shadingNormal, t, b);
+                    normalSampleTs = float3(0.0f, 0.0f, 1.0f);
                 }
                 float3 mappedNormalTs = normalSampleTs;
                 if (hasVertexTangentBasis &&
@@ -6455,8 +6478,32 @@ inline float3 trace_path_hardware(constant PathtraceUniforms& uniforms,
         // the walk leaves the mesh; any other subsurface hit is shaded as its dense limit.
         bool subsurfaceExitVertex = false;
         if (material_is_subsurface(material)) {
-            if (subsurface_vertex_begin(uniforms, material, rec, shadingNormal, wo, specularOnly, state, throughput) ==
-                kSubsurfaceVertexWalk) {
+            // The material's normal map shapes only its coat (backlog #47, as in Arnold): where the mapped normal faces the
+            // view, the coat's lobe choice uses it, and a coat-lobe vertex is shaded at it. The walk's weights
+            // and its entry use the unmapped hit.
+            float3 coatNormal = shadingNormal;
+            bool coatNormalMapped = false;
+            if (sss_use_random_walk(PT_DEFAULT_OFF(uniforms.sssMode), material) && subsurface_has_coat(material) &&
+                rec.frontFace != 0u && !specularOnly) {
+                float3 mappedNormal;
+                if (subsurface_coat_mapped_normal(uniforms, materialTextures, materialSamplers, materialTextureInfos,
+                                                  meshInfos, sceneVertices, meshIndices, material, rec, shadingNormal,
+                                                  mappedNormal)) {
+                    // A coat normal whose mirror reflection of the view would point into the mesh is bent toward Ng.
+                    mappedNormal = subsurface_coat_valid_reflection_normal(rec.normal, wo, mappedNormal);
+                    if (dot(mappedNormal, wo) > 0.0f) {
+                        coatNormal = mappedNormal;
+                        coatNormalMapped = true;
+                    }
+                }
+            }
+            const uint subsurfaceEvent = subsurface_vertex_begin(uniforms, material, rec, shadingNormal, coatNormal, wo,
+                                                                 specularOnly, state, throughput);
+            if (subsurfaceEvent == kSubsurfaceVertexCoat && coatNormalMapped) {
+                shadingNormal = coatNormal;
+                rec.shadingNormal = coatNormal;
+            }
+            if (subsurfaceEvent == kSubsurfaceVertexWalk) {
                 HitRecord exitRec;
                 float3 walkWeight = float3(0.0f);
                 uint walkEvent;

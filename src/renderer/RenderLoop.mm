@@ -2433,21 +2433,28 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
     // off. The gates come from the
     // settings and do not change between the samples dispatched below, so one build decides.
     bool useDefaultFeatures = false;
+    std::string liveGates;
     if (useHardware && pipelines.integrateHardwareAvailable()) {
         const PathtraceUniforms gateProbe = UniformBuilder::buildPathtraceUniforms(
             settings, accumulation, scene, accumulation.currentSize());
         useDefaultFeatures = UniformBuilder::usesOnlyDefaultFeatures(gateProbe);
+        if (!useDefaultFeatures) liveGates = UniformBuilder::liveFeatureGates(gateProbe);
     }
     const int integrateVariant = !useHardware ? 0 : (useDefaultFeatures ? 2 : 1);
-    if (integrateVariant != m_lastIntegrateVariant) {
+    if (integrateVariant != m_lastIntegrateVariant || liveGates != m_lastLiveGates) {
         m_lastIntegrateVariant = integrateVariant;
-        NSLog(@"[Megakernel] integrate pipeline: %s%s%s",
-              integrateVariant == 2 ? "hardware, default features (research and debug gates off, direct-light mode live)"
-              : integrateVariant == 1 ? "hardware, general (a research or debug gate is on)"
-                                      : "software (",
-              integrateVariant == 0 ? traversal.fallbackReason.c_str() : "",
-              integrateVariant == 0 ? ")" : "");
+        m_lastLiveGates = liveGates;
+        if (integrateVariant == 1) {
+            NSLog(@"[Megakernel] integrate pipeline: hardware, general (gates on: %s)", liveGates.c_str());
+        } else {
+            NSLog(@"[Megakernel] integrate pipeline: %s%s%s",
+                  integrateVariant == 2 ? "hardware, default features (research and debug gates off, direct-light mode live)"
+                                        : "software (",
+                  integrateVariant == 0 ? traversal.fallbackReason.c_str() : "",
+                  integrateVariant == 0 ? ")" : "");
+        }
     }
+    logPathSpaceCausticsOnce(settings);
 
     id<MTLComputePipelineState> selectedPipeline = useHardware
         ? (useDefaultFeatures ? pipelines.integrateHardwareDefaultFeatures()
@@ -2731,6 +2738,22 @@ uint32_t RenderLoop::encodeIntegration(MTLCommandBufferHandle commandBuffer,
     [encoder endEncoding];
 
     return samplesThisFrame;
+}
+
+// causticTransportMode=path_space is a prototype that adds no light transport: on both executors its hooks
+// (caustic_transport_connect_light_sample) record environment and rect-light next-event connections, up to
+// causticMaxVertices, and return the plain next-event contribution with the same balance-heuristic weight. Say so once
+// per enable, since the mode's name promises caustics and it costs the megakernel its default-features pipeline.
+void RenderLoop::logPathSpaceCausticsOnce(const RenderSettings& settings) {
+    const bool pathSpaceCaustics =
+        settings.causticTransportMode == RenderSettings::CausticTransportMode::PathSpacePrototype;
+    if (pathSpaceCaustics && !m_loggedPathSpaceCausticsInert) {
+        NSLog(@"[Caustics] causticTransportMode=path_space adds no caustic paths: it records environment and rect-light "
+              @"next-event connections (up to causticMaxVertices=%u) and returns the same contribution as plain "
+              @"next-event estimation, so the image is the one causticTransportMode=off gives (on the hardware megakernel, up "
+              @"to the arithmetic order of its two pipelines). On the hardware megakernel it also selects the general pipeline.", settings.causticMaxVertices);
+    }
+    m_loggedPathSpaceCausticsInert = pathSpaceCaustics;
 }
 
 bool RenderLoop::ensureWavefrontResources(const SceneResources& scene,
@@ -3083,15 +3106,7 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
         return encodeWavefrontMegakernelFallback("queue allocation failed", commandBuffer, accumulation,
                                                  pipelines, scene, settings);
     }
-    // The wavefront has no same-frame spatial reuse: under ris_spatial its fused direct light is plain RIS
-    // (shaders/wavefront/kernels.metal). Say so when that starts, and in the render metadata.
-    const bool risSpatialRanAsRis =
-        settings.directLightMode == RenderSettings::DirectLightMode::RisSpatialReuse;
-    if (risSpatialRanAsRis && !m_wavefrontRisSpatialRanAsRis) {
-        NSLog(@"[Wavefront] directLightMode=ris_spatial is not implemented on the wavefront (no same-frame spatial "
-              @"reuse); it runs plain ris. Use executionMode=megakernel for ris_spatial.");
-    }
-    m_wavefrontRisSpatialRanAsRis = risSpatialRanAsRis;
+    logPathSpaceCausticsOnce(settings);
     if (m_wavefront.cacheTrainRecordsNeedClear && m_wavefront.cacheTrainRecords) {
         id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
         if (!blit) {
@@ -3643,12 +3658,50 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                 [encoder endEncoding];
             }
 
+            // The shade kernel has the hardware megakernel's default-features specialization (function constant 2:
+            // every research and debug gate folded to 0, the direct-light mode live). Use it when all those gates are
+            // off in this frame's uniforms; it is built on first use, and the general pipeline stays if that fails.
+            id<MTLComputePipelineState> shadePipeline = pipelines.wavefrontShade();
+            id<MTLComputePipelineState> shadeResolvedPipeline = pipelines.wavefrontShadeResolved();
+            const bool shadeDefaultFeatures =
+                m_hasCurrentPathtraceUniforms && UniformBuilder::usesOnlyDefaultFeatures(m_currentPathtraceUniforms);
+            bool shadeDefaultFeaturesUsed = false;
+            if (shadeDefaultFeatures) {
+                // Only the variant this frame dispatches is fetched, so a run builds one of the two.
+                const bool shadeResolvedNeeded = guardedShadeIndirect && m_wavefront.resolvedSurfaces != nil;
+                id<MTLComputePipelineState> defaultShade =
+                    shadeResolvedNeeded ? nil : pipelines.wavefrontShadeDefaultFeatures();
+                id<MTLComputePipelineState> defaultShadeResolved =
+                    shadeResolvedNeeded ? pipelines.wavefrontShadeResolvedDefaultFeatures() : nil;
+                if (defaultShade) {
+                    shadePipeline = defaultShade;
+                    shadeDefaultFeaturesUsed = true;
+                }
+                if (defaultShadeResolved) {
+                    shadeResolvedPipeline = defaultShadeResolved;
+                    shadeDefaultFeaturesUsed = true;
+                }
+            }
+            const std::string shadeLiveGates = shadeDefaultFeatures || !m_hasCurrentPathtraceUniforms
+                ? std::string() : UniformBuilder::liveFeatureGates(m_currentPathtraceUniforms);
+            const int shadeVariant = shadeDefaultFeaturesUsed ? 1 : 0;
+            if (shadeVariant != m_lastWavefrontShadeVariant || shadeLiveGates != m_lastWavefrontShadeLiveGates) {
+                m_lastWavefrontShadeVariant = shadeVariant;
+                m_lastWavefrontShadeLiveGates = shadeLiveGates;
+                if (shadeDefaultFeaturesUsed) {
+                    NSLog(@"[Wavefront] shade pipeline: default features (research and debug gates off, direct-light mode live)");
+                } else if (shadeDefaultFeatures) {
+                    NSLog(@"[Wavefront] shade pipeline: general (the default-features pipeline failed to build)");
+                } else {
+                    NSLog(@"[Wavefront] shade pipeline: general (gates on: %s)", shadeLiveGates.c_str());
+                }
+            }
             const MTLSize shadeThreadsPerThreadgroup =
-                PreferredLinearThreadgroupSize(pipelines.wavefrontShade());
+                PreferredLinearThreadgroupSize(shadePipeline);
             const MTLSize shadeResolveSurfaceThreadsPerThreadgroup =
                 PreferredLinearThreadgroupSize(pipelines.wavefrontShadeResolveSurface());
             const MTLSize shadeResolvedThreadsPerThreadgroup =
-                PreferredLinearThreadgroupSize(pipelines.wavefrontShadeResolved());
+                PreferredLinearThreadgroupSize(shadeResolvedPipeline);
             const bool useIndirectShadeProbe =
                 guardedShadeIndirectProbe &&
                 encodeWavefrontDispatchArgs(
@@ -4123,8 +4176,8 @@ uint32_t RenderLoop::encodeWavefront(MTLCommandBufferHandle commandBuffer,
                             useResolvedShade ? @"Wavefront Shade Resolved" : @"Wavefront Shade",
                             "Wavefront Shade");
                 [encoder setComputePipelineState:(useResolvedShade
-                                                      ? pipelines.wavefrontShadeResolved()
-                                                      : pipelines.wavefrontShade())];
+                                                      ? shadeResolvedPipeline
+                                                      : shadePipeline)];
                 if (canHardwareIntersect &&
                     provider.hardware.tlas &&
                     [encoder respondsToSelector:@selector(setAccelerationStructure:atBufferIndex:)]) {

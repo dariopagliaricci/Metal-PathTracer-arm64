@@ -18,21 +18,6 @@ inline float2 random_in_unit_disk(thread uint& state) {
     }
 }
 
-inline float3 linear_srgb_to_acescg(const float3 color) {
-    const float3x3 m = float3x3(float3(0.613097f, 0.339523f, 0.047380f),
-                                float3(0.070194f, 0.916354f, 0.013452f),
-                                float3(0.020615f, 0.109569f, 0.869816f));
-    return m * color;
-}
-
-inline float3 to_working_space(const float3 color,
-                               constant PathtraceUniforms& uniforms) {
-    if (uniforms.workingColorSpace == kWorkingColorSpaceACEScg) {
-        return linear_srgb_to_acescg(color);
-    }
-    return color;
-}
-
 inline float3 decode_normal_map(float3 sample,
                                 float normalScale,
                                 bool flipGreen) {

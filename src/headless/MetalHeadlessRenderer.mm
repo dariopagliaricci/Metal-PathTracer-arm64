@@ -87,6 +87,35 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
 
     const uint32_t targetSamples = std::max<uint32_t>(1u, sppTotal);
     uint32_t accumulatedSamples = renderer.sampleCount();
+    // Resume: the renderer restores the state at the start of the first drawFrame, so the first frame's sample
+    // count is measured from the state's count.
+    bool awaitingResumedFrame = false;
+    bool completedFromState = false;
+    if (m_checkpoint.resumeFrom) {
+        const uint32_t resumedSamples = m_checkpoint.resumeFrom->sampleCount;
+        if (resumedSamples == 0u || resumedSamples > targetSamples) {
+            error = "Checkpoint state has " + std::to_string(resumedSamples) + " samples; the render needs between 1 and " +
+                    std::to_string(targetSamples);
+            return false;
+        }
+        if (resumedSamples == targetSamples) {
+            // A completed checkpoint: the state is the finished accumulation, so the output is written from it.
+            std::string importError;
+            if (!renderer.importAccumulationStateNow(*m_checkpoint.resumeFrom, importError)) {
+                error = "Checkpoint resume failed: " + importError;
+                return false;
+            }
+            completedFromState = true;
+            std::cout << "[Checkpoint] The state holds all " << targetSamples
+                      << " samples: writing the output from it without rendering" << std::endl;
+        } else {
+            renderer.setPendingAccumulationImport(*m_checkpoint.resumeFrom);
+            awaitingResumedFrame = true;
+            std::cout << "[Checkpoint] Resuming at " << resumedSamples << " of " << targetSamples << " samples" << std::endl;
+        }
+        accumulatedSamples = resumedSamples;
+    }
+    const uint32_t checkpointEvery = m_checkpoint.write ? m_checkpoint.everySamples : 0u;
     uint32_t maxBatch = rendererSettings.enableSoftwareRayTracing ? 1u : 16u;
 #if PT_MNEE_SWRT_RAYS
     if (verbose) {
@@ -324,9 +353,13 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
     while (accumulatedSamples < targetSamples) {
         uint32_t remaining = targetSamples - accumulatedSamples;
         uint32_t request = (maxBatch == 0) ? remaining : std::min(maxBatch, remaining);
+        if (checkpointEvery > 0u) {
+            const uint32_t toNextCheckpoint = checkpointEvery - (accumulatedSamples % checkpointEvery);
+            request = std::min(request, toNextCheckpoint);
+        }
         renderer.setSamplesPerFrame(request);
 
-        uint32_t before = renderer.sampleCount();
+        uint32_t before = awaitingResumedFrame ? accumulatedSamples : renderer.sampleCount();
         CFAbsoluteTime frameStart = CFAbsoluteTimeGetCurrent();
         renderer.drawFrame();
         CFAbsoluteTime frameEnd = CFAbsoluteTimeGetCurrent();
@@ -337,6 +370,14 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
             return false;
         }
 
+        if (awaitingResumedFrame) {
+            awaitingResumedFrame = false;
+            const std::string importError = renderer.accumulationImportError();
+            if (!importError.empty()) {
+                error = "Checkpoint resume failed: " + importError;
+                return false;
+            }
+        }
         uint32_t after = renderer.sampleCount();
         uint32_t produced = (after > before) ? (after - before) : std::min(request, remaining);
         if (produced == 0) {
@@ -642,6 +683,14 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
         }
         accumulatedSamples += produced;
         accumulatedFrameTime += (frameEnd - frameStart);
+        if (checkpointEvery > 0u && accumulatedSamples < targetSamples && (accumulatedSamples % checkpointEvery) == 0u) {
+            PathTracer::AccumulationState state;
+            std::string checkpointError;
+            if (!renderer.exportAccumulationState(state, checkpointError) || !m_checkpoint.write(state, checkpointError)) {
+                error = "Sample checkpoint failed: " + checkpointError;
+                return false;
+            }
+        }
 
         if (verbose) {
             CFAbsoluteTime now = frameEnd;
@@ -694,6 +743,16 @@ bool MetalHeadlessRenderer::render(const HeadlessScene& scene,
 
     if (verbose) {
         std::cout << std::endl;
+    }
+    if (checkpointEvery > 0u && !completedFromState) {
+        // The finished accumulation, kept so a completed checkpoint manifest can write the output again without
+        // rendering.
+        PathTracer::AccumulationState state;
+        std::string checkpointError;
+        if (!renderer.exportAccumulationState(state, checkpointError) || !m_checkpoint.write(state, checkpointError)) {
+            error = "Sample checkpoint failed: " + checkpointError;
+            return false;
+        }
     }
 
     CFAbsoluteTime renderEnd = CFAbsoluteTimeGetCurrent();
