@@ -6,6 +6,8 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 
+#include <string>
+
 #include "MetalShaderTypes.h"
 #include "RenderSettings.h"
 
@@ -35,6 +37,10 @@ public:
     /// megakernel (gates folded at compile time) renders the same features as the general one.
     /// The direct-light mode is not a gate and may have any value.
     static bool usesOnlyDefaultFeatures(const PathTracerShaderTypes::PathtraceUniforms& uniforms);
+
+    /// The gates of usesOnlyDefaultFeatures that are on, by uniform name, comma-separated ("" when none is),
+    /// so the log can say which one keeps the megakernel on its general pipeline.
+    static std::string liveFeatureGates(const PathTracerShaderTypes::PathtraceUniforms& uniforms);
 
     /// Build display uniforms for tonemapping
     /// @param settings Render settings

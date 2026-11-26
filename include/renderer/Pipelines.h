@@ -101,6 +101,11 @@ public:
     MTLComputePipelineStateHandle wavefrontShade() const { return m_wavefrontShadePipeline; }
     MTLComputePipelineStateHandle wavefrontShadeResolveSurface() const { return m_wavefrontShadeResolveSurfacePipeline; }
     MTLComputePipelineStateHandle wavefrontShadeResolved() const { return m_wavefrontShadeResolvedPipeline; }
+    /// The shade kernel's default-features specializations (function constant 2, every research and debug gate
+    /// folded to 0, as the hardware megakernel's): built on first use without waiting on another build; nil when that
+    /// build is busy or failed (the caller keeps the general shade pipeline).
+    MTLComputePipelineStateHandle wavefrontShadeDefaultFeatures() const;
+    MTLComputePipelineStateHandle wavefrontShadeResolvedDefaultFeatures() const;
     MTLComputePipelineStateHandle wavefrontShadeIndirectProbe() const { return m_wavefrontShadeIndirectProbePipeline; }
     MTLComputePipelineStateHandle wavefrontShadeSurfaceProbe() const { return m_wavefrontShadeSurfaceProbePipeline; }
     MTLComputePipelineStateHandle wavefrontShadeMetadataProbe() const { return m_wavefrontShadeMetadataProbePipeline; }
@@ -158,6 +163,8 @@ private:
     static MTLComputePipelineStateHandle integrateVariant(const std::shared_ptr<LazyIntegrateState>& state,
                                                           int variant,
                                                           bool foreground);
+    static MTLComputePipelineStateHandle lazyVariantWithoutWaiting(const std::shared_ptr<LazyIntegrateState>& state,
+                                                                   int variant);
     MTLComputePipelineStateHandle m_wavefrontResetPipeline = nullptr;
     MTLComputePipelineStateHandle m_wavefrontBuildDispatchArgsPipeline = nullptr;
     MTLComputePipelineStateHandle m_wavefrontCompactQueuePipeline = nullptr;

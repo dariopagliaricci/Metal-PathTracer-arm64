@@ -1838,9 +1838,6 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
                                                uniforms);
             }
         }
-        if (uniforms.backgroundMode != 2u) {
-            background = to_working_space(background, uniforms);
-        }
         {
             const SpectralPathState missSpectral = spectral_path_state_from_hero(
                 uniforms, state.spectralWavelengthNm, state.spectralSampleIndex);
@@ -2581,8 +2578,32 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
     bool subsurfaceExitVertex = false;
     if (material_is_subsurface(material)) {
         float3 pathThroughput = state.throughput.xyz;
-        if (subsurface_vertex_begin(uniforms, material, rec, shadingNormal, wo, specularOnly, rngState, pathThroughput) ==
-            kSubsurfaceVertexWalk) {
+        // The material's normal map shapes only its coat (backlog #47, as in Arnold): where the mapped normal faces the
+        // view, the coat's lobe choice uses it, and a coat-lobe vertex is shaded at it. The walk's weights
+        // and its entry use the unmapped hit.
+        float3 coatNormal = shadingNormal;
+        bool coatNormalMapped = false;
+        if (sss_use_random_walk(PT_DEFAULT_OFF(uniforms.sssMode), material) && subsurface_has_coat(material) &&
+            rec.frontFace != 0u && !specularOnly) {
+            float3 mappedNormal;
+            if (subsurface_coat_mapped_normal(uniforms, materialResources.textures, materialResources.samplers, materialTextureInfos,
+                                              meshInfos, sceneVertices, meshIndices, material, rec, shadingNormal,
+                                              mappedNormal)) {
+                // A coat normal whose mirror reflection of the view would point into the mesh is bent toward Ng.
+                mappedNormal = subsurface_coat_valid_reflection_normal(rec.normal, wo, mappedNormal);
+                if (dot(mappedNormal, wo) > 0.0f) {
+                    coatNormal = mappedNormal;
+                    coatNormalMapped = true;
+                }
+            }
+        }
+        const uint subsurfaceEvent = subsurface_vertex_begin(uniforms, material, rec, shadingNormal, coatNormal, wo,
+                                                             specularOnly, rngState, pathThroughput);
+        if (subsurfaceEvent == kSubsurfaceVertexCoat && coatNormalMapped) {
+            shadingNormal = coatNormal;
+            rec.shadingNormal = coatNormal;
+        }
+        if (subsurfaceEvent == kSubsurfaceVertexWalk) {
             HitRecord exitRec;
             float3 walkWeight = float3(0.0f);
             uint walkEvent;
@@ -2885,7 +2906,13 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
                 }
             }
 
-            if (uniforms.directLightMode == kDirectLightModeRisWorldReuse &&
+            // ris_spatial and ris_world reuse the same neighbour merge. ris_spatial follows the megakernel's
+            // (path_integrators.metal): the K = spatialReuseNeighborCount (1 to 4) pixels next to this one, depth
+            // within 10% and shading normals within 0.9, no cell test. ris_world takes the four pixels two away, in
+            // the same world cell, with depth within 20% and normals within 0.85. Both run when the pixel's own
+            // reservoir is empty too: the candidates' MIS weights assume the canonical technique always takes part.
+            const bool spatialReuse = uniforms.directLightMode == kDirectLightModeRisSpatialReuse;
+            if ((spatialReuse || uniforms.directLightMode == kDirectLightModeRisWorldReuse) &&
                 (queuedRay.depth == 0u && !subsurfaceExitVertex) &&
                 rec.t > 0.0f &&
                 uniforms.width > 0u &&
@@ -2897,8 +2924,11 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
                 // canonical unweighted and added 1 to M per candidate: 0.824 of the exact light on the EP12 sun plane.
                 // Targets are compared per unit light area, which carries the solid-angle Jacobian of moving a
                 // triangle-light sample between pixels.
-                constexpr uint kWorldReusePairs = 4u;
-                const float pairCount = float(kWorldReusePairs);
+                const uint reusePairs = spatialReuse ? min(max(uniforms.spatialReuseNeighborCount, 1u), 4u) : 4u;
+                const int offsetScale = spatialReuse ? 1 : 2;
+                const float maxDepthRel = spatialReuse ? 0.1f : 0.2f;
+                const float minNormalDot = spatialReuse ? 0.9f : 0.85f;
+                const float pairCount = float(reusePairs);
                 const bool canonicalValid = reservoir.valid;
                 const RISSamplePayload canonicalWinner = reservoir.winner;
                 const float canonicalAreaTarget = canonicalValid
@@ -2918,13 +2948,13 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
                 float canonicalMis = 0.0f;
                 Reservoir merged = make_empty_reservoir();
                 constexpr int2 offsets[4] = {
-                    int2(-2, 0),
-                    int2(2, 0),
-                    int2(0, -2),
-                    int2(0, 2)
+                    int2(-1, 0),
+                    int2(1, 0),
+                    int2(0, -1),
+                    int2(0, 1)
                 };
-                for (uint n = 0u; n < kWorldReusePairs; ++n) {
-                    int2 candidateCoordI = int2(pixel) + offsets[n];
+                for (uint n = 0u; n < reusePairs; ++n) {
+                    int2 candidateCoordI = int2(pixel) + offsets[n] * offsetScale;
                     if (candidateCoordI.x < 0 ||
                         candidateCoordI.y < 0 ||
                         candidateCoordI.x >= int(uniforms.width) ||
@@ -2939,7 +2969,7 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
                     bool candidateHit = false;
                     // Candidates are traced like the pixel's own rays: in hardware mode the software BVH has no
                     // triangles (the triangle buffer is not uploaded), so a software trace missed every candidate and
-                    // ris_world ran as plain RIS.
+                    // ris_world (and ris_spatial) ran as plain RIS.
 #if __METAL_VERSION__ >= 310
                     if (uniforms.intersectionMode == kIntersectionModeHardwareRT &&
                         meshInfos && triangleData && sceneVertices && meshIndices && instanceUserIds) {
@@ -2991,19 +3021,19 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
 
                     int3 candidateCell =
                         world_reuse_cell(candidateRec.point, uniforms.worldReuseCellSize);
-                    if (!world_reuse_cell_compatible(worldCell, candidateCell)) {
+                    if (!spatialReuse && !world_reuse_cell_compatible(worldCell, candidateCell)) {
                         canonicalMis += 1.0f / pairCount;
                         continue;
                     }
 
                     float depthRel = fabs(rec.t - candidateRec.t) / max(rec.t, kEpsilon);
-                    if (!(depthRel <= 0.2f) || !isfinite(depthRel)) {
+                    if (!(depthRel <= maxDepthRel) || !isfinite(depthRel)) {
                         canonicalMis += 1.0f / pairCount;
                         continue;
                     }
                     float normalDot = dot(safe_normalize(shadingNormal),
                                           safe_normalize(candidateRec.shadingNormal));
-                    if (!(normalDot >= 0.85f) || !isfinite(normalDot)) {
+                    if (!(normalDot >= minNormalDot) || !isfinite(normalDot)) {
                         canonicalMis += 1.0f / pairCount;
                         continue;
                     }
@@ -3025,12 +3055,17 @@ kernel void wavefrontShadeKernel(constant PathtraceUniforms* uniformsBuffer [[bu
                                 ris_payload_solid_angle_per_area(candidateRec, canonicalWinner),
                             pairCount);
                     }
-                    uint candidateState =
-                        pcg_hash(rngState ^
-                                 (uint(candidateCell.x) * 1664525u) ^
-                                 (uint(candidateCell.y) * 1013904223u) ^
-                                 (uint(candidateCell.z) * 747796405u) ^
-                                 ((n + 1u) * 2891336453u));
+                    // ris_spatial seeds each neighbour's candidates from its pixel, as the megakernel does.
+                    uint candidateState = spatialReuse
+                        ? pcg_hash(rngState ^
+                                   (candidateCoord.x * 1664525u) ^
+                                   (candidateCoord.y * 1013904223u) ^
+                                   ((n + 1u) * 747796405u))
+                        : pcg_hash(rngState ^
+                                   (uint(candidateCell.x) * 1664525u) ^
+                                   (uint(candidateCell.y) * 1013904223u) ^
+                                   (uint(candidateCell.z) * 747796405u) ^
+                                   ((n + 1u) * 2891336453u));
                     Reservoir candidateReservoir = make_empty_reservoir();
                     if (!build_ris_reservoir_for_hit(uniforms,
                                                      emissivePrimitives,
@@ -4355,8 +4390,25 @@ kernel void wavefrontShadowKernel(constant PathtraceUniforms* uniformsBuffer [[b
                                              shadowRec);
         const bool referenceMaskShadow = wavefront_reference_punctual_shadow(uniforms, queued, rectangles) &&
             pavilion_mask_shadow_hit(uniforms, shadowRec, materials);
+        bool closestShadowHit = false;
         if (source_transport_enabled(uniforms) || scene_has_source_opacity(uniforms, materials) || (occluded && (referenceMaskShadow ||
             wavefront_shadow_hit_alpha_tested(uniforms, shadowRec, materials)))) {
+            occluded = trace_scene_software_alpha_aware_shadow<true>(
+                uniforms, spheres, rectangles, triangleData,
+                tlasNodes, tlasPrimIndices, instanceInfos, blasNodes, blasPrimIndices,
+                nodes, primitiveIndices, stats, shadowRay, wavefront_shadow_software_t_min(queued), queued.originTMax.w,
+                materials, materialResources.textures, materialResources.samplers,
+                materialTextureInfos, meshInfos, sceneVertices, meshIndices, shadowRec, referenceMaskShadow, queued.depth, queued.sourceSigma.xyz,
+                dot(shadowRay.origin-queued.sourceOrigin.xyz,shadowRay.direction));
+            closestShadowHit = true;
+        }
+        // The any-hit trace can return the sampled light although a blocker lies in front of it. Trace the
+        // closest hit, as the megakernel's shadow rays do, before the light-hit rule below.
+        if (!closestShadowHit &&
+            (queued.flags & kWavefrontShadowFlagEmissivePrimitive) != 0u &&
+            occluded &&
+            shadowRec.primitiveType == kPrimitiveTypeTriangle &&
+            shadowRec.primitiveIndex == queued.lightId) {
             occluded = trace_scene_software_alpha_aware_shadow<true>(
                 uniforms, spheres, rectangles, triangleData,
                 tlasNodes, tlasPrimIndices, instanceInfos, blasNodes, blasPrimIndices,
@@ -4506,8 +4558,25 @@ kernel void wavefrontShadowIndexedKernel(constant PathtraceUniforms* uniformsBuf
                                          shadowRec);
     const bool referenceMaskShadow = wavefront_reference_punctual_shadow(uniforms, queued, rectangles) &&
         pavilion_mask_shadow_hit(uniforms, shadowRec, materials);
+    bool closestShadowHit = false;
     if (source_transport_enabled(uniforms) || scene_has_source_opacity(uniforms, materials) || (occluded && (referenceMaskShadow ||
         wavefront_shadow_hit_alpha_tested(uniforms, shadowRec, materials)))) {
+        occluded = trace_scene_software_alpha_aware_shadow<true>(
+            uniforms, spheres, rectangles, triangleData,
+            tlasNodes, tlasPrimIndices, instanceInfos, blasNodes, blasPrimIndices,
+            nodes, primitiveIndices, stats, shadowRay, wavefront_shadow_software_t_min(queued), queued.originTMax.w,
+            materials, materialResources.textures, materialResources.samplers,
+            materialTextureInfos, meshInfos, sceneVertices, meshIndices, shadowRec, referenceMaskShadow, queued.depth, queued.sourceSigma.xyz,
+            dot(shadowRay.origin-queued.sourceOrigin.xyz,shadowRay.direction));
+        closestShadowHit = true;
+    }
+    // The any-hit trace can return the sampled light although a blocker lies in front of it. Trace the
+    // closest hit, as the megakernel's shadow rays do, before the light-hit rule below.
+    if (!closestShadowHit &&
+        (queued.flags & kWavefrontShadowFlagEmissivePrimitive) != 0u &&
+        occluded &&
+        shadowRec.primitiveType == kPrimitiveTypeTriangle &&
+        shadowRec.primitiveIndex == queued.lightId) {
         occluded = trace_scene_software_alpha_aware_shadow<true>(
             uniforms, spheres, rectangles, triangleData,
             tlasNodes, tlasPrimIndices, instanceInfos, blasNodes, blasPrimIndices,
@@ -4657,8 +4726,27 @@ kernel void wavefrontShadowHardwareKernel(constant PathtraceUniforms* uniformsBu
                                              shadowRec);
         const bool referenceMaskShadow = wavefront_reference_punctual_shadow(uniforms, queued, rectangles) &&
             pavilion_mask_shadow_hit(uniforms, shadowRec, materials);
+        bool closestShadowHit = false;
         if (source_transport_enabled(uniforms) || scene_has_source_opacity(uniforms, materials) || (occluded && (referenceMaskShadow ||
             wavefront_shadow_hit_alpha_tested(uniforms, shadowRec, materials)))) {
+            occluded = trace_scene_hardware_alpha_aware_shadow<true>(
+                uniforms, accel, meshInfos, triangleData, sceneVertices, meshIndices,
+                instanceUserIds, spheres, rectangles, nodes, primitiveIndices, stats,
+                shadowRay, wavefront_shadow_t_min(queued), queued.originTMax.w,
+                queued.excludeMeshIndex, queued.excludePrimitiveIndex,
+                materials, materialResources.textures, materialResources.samplers,
+                materialTextureInfos, shadowRec, referenceMaskShadow, queued.depth, queued.sourceSigma.xyz,
+                dot(shadowRay.origin-queued.sourceOrigin.xyz,shadowRay.direction));
+            closestShadowHit = true;
+        }
+        // The occlusion trace returns the closest triangle and tests spheres and rectangles only when it hits no
+        // triangle, so it can return the sampled light although an analytic blocker lies in front of it. Trace the
+        // closest hit over every primitive, as the megakernel's shadow rays do, before the light-hit rule below.
+        if (!closestShadowHit &&
+            (queued.flags & kWavefrontShadowFlagEmissivePrimitive) != 0u &&
+            occluded &&
+            shadowRec.primitiveType == kPrimitiveTypeTriangle &&
+            shadowRec.primitiveIndex == queued.lightId) {
             occluded = trace_scene_hardware_alpha_aware_shadow<true>(
                 uniforms, accel, meshInfos, triangleData, sceneVertices, meshIndices,
                 instanceUserIds, spheres, rectangles, nodes, primitiveIndices, stats,
@@ -4818,8 +4906,27 @@ kernel void wavefrontShadowIndexedHardwareKernel(constant PathtraceUniforms* uni
                                          shadowRec);
     const bool referenceMaskShadow = wavefront_reference_punctual_shadow(uniforms, queued, rectangles) &&
         pavilion_mask_shadow_hit(uniforms, shadowRec, materials);
+    bool closestShadowHit = false;
     if (source_transport_enabled(uniforms) || scene_has_source_opacity(uniforms, materials) || (occluded && (referenceMaskShadow ||
         wavefront_shadow_hit_alpha_tested(uniforms, shadowRec, materials)))) {
+        occluded = trace_scene_hardware_alpha_aware_shadow<true>(
+            uniforms, accel, meshInfos, triangleData, sceneVertices, meshIndices,
+            instanceUserIds, spheres, rectangles, nodes, primitiveIndices, stats,
+            shadowRay, wavefront_shadow_t_min(queued), queued.originTMax.w,
+            queued.excludeMeshIndex, queued.excludePrimitiveIndex,
+            materials, materialResources.textures, materialResources.samplers,
+            materialTextureInfos, shadowRec, referenceMaskShadow, queued.depth, queued.sourceSigma.xyz,
+            dot(shadowRay.origin-queued.sourceOrigin.xyz,shadowRay.direction));
+        closestShadowHit = true;
+    }
+    // The occlusion trace returns the closest triangle and tests spheres and rectangles only when it hits no
+    // triangle, so it can return the sampled light although an analytic blocker lies in front of it. Trace the
+    // closest hit over every primitive, as the megakernel's shadow rays do, before the light-hit rule below.
+    if (!closestShadowHit &&
+        (queued.flags & kWavefrontShadowFlagEmissivePrimitive) != 0u &&
+        occluded &&
+        shadowRec.primitiveType == kPrimitiveTypeTriangle &&
+        shadowRec.primitiveIndex == queued.lightId) {
         occluded = trace_scene_hardware_alpha_aware_shadow<true>(
             uniforms, accel, meshInfos, triangleData, sceneVertices, meshIndices,
             instanceUserIds, spheres, rectangles, nodes, primitiveIndices, stats,

@@ -56,6 +56,9 @@ constant uint kMaterialFlagSubsurfaceExit = 1u << 20;
 // Set only on an integrator's local copy: an authored source dielectric seen from the side its raw normal points away
 // from (source_mark_closure_side). The direct-light cosine then uses the side the closure shades.
 constant uint kMaterialFlagSourceClosureBackSide = 1u << 21;
+// Set only on an integrator's local plastic copy: the coat lobe of a coated random-walk subsurface vertex
+// (subsurface_vertex_begin). Its Fresnel is the exact dielectric one, as Arnold's specular layer.
+constant uint kMaterialFlagSubsurfaceCoatLobe = 1u << 23;
 constant uint kMaterialFlagInterfacePrecision = 1u << 28;
 constant uint kMaterialFlagExplicitInterior = 1u << 29;
 constant uint kMaterialFlagMediumInherit = 1u << 30;
@@ -403,7 +406,6 @@ struct PathtraceUniforms {
     uint emissivePrimitiveCount;
     uint fixedRngSeed;  // If non-zero, use as deterministic RNG seed
     uint backgroundMode;
-    uint workingColorSpace;
     float environmentRotation;
     float environmentIntensity;
     float emissiveTotalPower;
@@ -530,9 +532,12 @@ constant bool kMegakernelDefaultFeaturesValue [[function_constant(2)]];
 constant bool kMegakernelDefaultFeatures =
     is_function_constant_defined(kMegakernelDefaultFeaturesValue) ? kMegakernelDefaultFeaturesValue : false;
 #define PT_DEFAULT_OFF(gate) (kMegakernelDefaultFeatures ? 0u : (gate))
+// A non-flag knob that the default-features pipeline folds to its default value (listed with its default below).
+#define PT_DEFAULT_VALUE(value, defaultValue) (kMegakernelDefaultFeatures ? (defaultValue) : (value))
 
-// The gates PT_DEFAULT_OFF wraps. Mirrors UniformBuilder::UsesOnlyDefaultFeatures: a field
-// wrapped in PT_DEFAULT_OFF must be listed in both.
+// The gates PT_DEFAULT_OFF and PT_DEFAULT_VALUE wrap. Mirrors UniformBuilder::UsesOnlyDefaultFeatures: a field
+// wrapped in either must be listed in both. The wavefront shade kernel has the same specialization (Pipelines.mm),
+// so this also covers code reachable from it.
 inline bool default_feature_gates_off(constant PathtraceUniforms& u) {
     return u.sssMode == 0u && u.enableMnee == 0u &&
            u.restirGiMode == 0u && u.pathGuidingMode == 0u && u.restirPtMode == 0u &&
@@ -542,7 +547,16 @@ inline bool default_feature_gates_off(constant PathtraceUniforms& u) {
            u.radianceCacheDebug == 0u && u.volumeDebug == 0u && u.spectralDebug == 0u &&
            u.parityAssertEnabled == 0u && u.debugViewMode == 0u && u.debugDirectLightAudit == 0u &&
            u.directLightMode != 3u &&  // kDirectLightModeRisSpatialReuse (core/constants.metal, compiled later)
-           u.directLightMode != 5u;    // kDirectLightModeRisWorldReuse
+           u.directLightMode != 5u  // kDirectLightModeRisWorldReuse
+#if PT_DEBUG_TOOLS
+           // Read only in PT_DEBUG_TOOLS builds (headless): the hardware megakernel's software-trace fallbacks and the
+           // normal-map and ORM debug knobs, at their defaults. Other builds never read them, so they are no gate there.
+           && u.enableHardwareMissFallback == 0u && u.enableHardwareFirstHitFromSoftware == 0u &&
+           u.enableHardwareForceSoftware == 0u && u.debugDisableNormalMap == 0u &&
+           u.debugDisableOrmTexture == 0u && u.debugFlipNormalGreen == 0u &&
+           u.debugNormalStrengthScale == 1.0f && u.debugNormalLodBias == 0.0f && u.debugOrmLodBias == 0.0f
+#endif
+           ;
 }
 
 struct DisplayUniforms {

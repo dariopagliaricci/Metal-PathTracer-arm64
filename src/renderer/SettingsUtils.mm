@@ -33,25 +33,18 @@ bool ResolveSourceCapabilities(const SceneResources& scene, RenderSettings& sett
         // Bump maps are ported (EP8c): Embree perturbs the authored normal as Metal's source_bump_normal does.
         // Thin source sheets under source transport are ported (EP8c): stochastic forward events on path rays, the forward
         // transmission on shadow rays, as Metal's wavefront.
-        uint32_t opacityCount = 0, interfaceCount = 0, explicitHoleCount = 0;
+        uint32_t explicitHoleCount = 0;
         for (uint32_t i = 0; materials && i < scene.materialCount(); ++i) {
             const auto& m = materials[i];
             if ((m.materialFlags & PathTracerShaderTypes::kMaterialFlagSourceFeatures) == 0u) continue;
-            opacityCount += m.textureControl.y != 0.0f ? 1u : 0u;
-            interfaceCount += (m.materialFlags & PathTracerShaderTypes::kMaterialFlagInterfacePrecision) != 0u ? 1u : 0u;
             explicitHoleCount += ((m.materialFlags & PathTracerShaderTypes::kMaterialFlagExplicitInterior) != 0u &&
                                   m.pbrExtras.w > 0.5f) ? 1u : 0u;
         }
-        // Source opacity is ported under source transport (EP8c): path rays pass with probability 1 - opacity, and shadow
-        // rays are weighted by 1 - opacity at each hit. Without transport Metal's opacity spawns use the source epsilon,
-        // which Embree takes only under transport.
-        if (opacityCount && !settings.sourceTransport)
-            add("opacity without sourceTransport (" + std::to_string(opacityCount) + " materials)");
-        // Without source transport, interfacePrecision changes only that material's spawns on Metal (not ported).
-        if (interfaceCount && !settings.sourceTransport)
-            add("interfacePrecision without sourceTransport (" + std::to_string(interfaceCount) + " materials)");
-        // Explicit-interior and inherited medium boundaries are ported (EP8d). Under source transport Metal's shadow
-        // rays re-select the medium at each alpha hole they pass; Embree's take one medium per segment.
+        // Source opacity is ported with and without source transport (EP8c): path rays pass with probability
+        // 1 - opacity, and shadow rays are weighted by 1 - opacity at each hit. interfacePrecision materials spawn at the
+        // interface origin with tMin 1e-6 without source transport too; Embree logs both as a [SourceSpawn] line.
+        // Explicit-interior and inherited medium boundaries are ported (EP8d). Under source transport the shadow rays
+        // of both backends re-select the medium at each pass-through (alpha hole, source opacity, thin sheet).
         if (explicitHoleCount && settings.sourceTransport)
             add("alpha cutouts on explicit-interior materials under sourceTransport (" +
                 std::to_string(explicitHoleCount) + " materials)");
@@ -239,7 +232,6 @@ RadiometricChangeResult DetectRadiometricChange(const RenderSettings& prev,
     if (!nearlyEqual(prev.bloomThreshold, next.bloomThreshold)) return change("BLOOM_THRESHOLD");
     if (!nearlyEqual(prev.bloomIntensity, next.bloomIntensity)) return change("BLOOM_INTENSITY");
     if (!nearlyEqual(prev.bloomRadius, next.bloomRadius)) return change("BLOOM_RADIUS");
-    if (prev.workingColorSpace != next.workingColorSpace) return change("COLORSPACE");
     if (prev.gltfViewerCompatibilityMode != next.gltfViewerCompatibilityMode) return change("GLTF_COMPAT");
     if (prev.gltfThinWalledFallback != next.gltfThinWalledFallback) return change("GLTF_THIN");
     if (!nearlyEqual(prev.gltfEmissiveScale, next.gltfEmissiveScale)) return change("GLTF_EMISSIVE");

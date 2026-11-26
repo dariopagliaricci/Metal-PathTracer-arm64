@@ -342,33 +342,28 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
         add_custom_target(PathTracerPavilionEnvironments
             DEPENDS ${PAVILION_REFERENCE_ENVS})
     endif()
-    file(GLOB_RECURSE ASSET_FILES CONFIGURE_DEPENDS
-        "${ASSET_SOURCE_DIR}/*"
-    )
-    # assets/ is not tracked, so a fresh clone has none: build without bundled scene assets then.
-    if(EXISTS "${ASSET_SOURCE_DIR}")
-        set(APP_ASSET_COPY COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets")
-        set(HEADLESS_ASSET_COPY COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${ASSET_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/assets")
-        set(HEADLESS_TARGET_ASSET_COPY COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${ASSET_SOURCE_DIR}" "$<TARGET_FILE_DIR:PathTracerHeadless>/assets")
-    else()
+    # The scene assets (tens of GB, not tracked) are linked, not copied, into the app bundle and next to
+    # PathTracerHeadless (cmake/LinkAssets.cmake). A fresh clone has no assets/: nothing is linked and the build goes
+    # on without bundled scene assets. The link needs no per-file dependencies, so asset edits rebuild nothing.
+    if(NOT EXISTS "${ASSET_SOURCE_DIR}")
         message(STATUS "No assets/ directory: building without bundled scene assets")
-        set(APP_ASSET_COPY)
-        set(HEADLESS_ASSET_COPY)
-        set(HEADLESS_TARGET_ASSET_COPY)
     endif()
+    set(LINK_ASSETS_SCRIPT "${CMAKE_SOURCE_DIR}/cmake/LinkAssets.cmake")
+    set(APP_ASSET_LINK COMMAND ${CMAKE_COMMAND} -DSRC=${ASSET_SOURCE_DIR}
+        -DDST=$<TARGET_FILE_DIR:PathTracer>/../Resources/assets -P ${LINK_ASSETS_SCRIPT})
+    set(HEADLESS_ASSET_LINK COMMAND ${CMAKE_COMMAND} -DSRC=${ASSET_SOURCE_DIR}
+        -DDST=${CMAKE_BINARY_DIR}/assets -P ${LINK_ASSETS_SCRIPT})
+    set(HEADLESS_TARGET_ASSET_LINK COMMAND ${CMAKE_COMMAND} -DSRC=${ASSET_SOURCE_DIR}
+        -DDST=$<TARGET_FILE_DIR:PathTracerHeadless>/assets -P ${LINK_ASSETS_SCRIPT})
 
     set(ASSET_COPY_STAMP "${CMAKE_BINARY_DIR}/PathTracerAssets.stamp")
     add_custom_command(
         OUTPUT "${ASSET_COPY_STAMP}"
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracer>/../Resources/assets"
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracer>/../Resources"
-        ${APP_ASSET_COPY}
+        ${APP_ASSET_LINK}
         COMMAND ${CMAKE_COMMAND} -E touch "${ASSET_COPY_STAMP}"
-        DEPENDS ${ASSET_FILES} ${PAVILION_REFERENCE_ENVS}
-        COMMENT "Copying scene assets into PathTracer.app bundle"
+        DEPENDS ${PAVILION_REFERENCE_ENVS} ${LINK_ASSETS_SCRIPT}
+        COMMENT "Linking scene assets into PathTracer.app bundle"
     )
 
     add_custom_target(PathTracerAssets ALL
@@ -382,13 +377,13 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
     set(HEADLESS_ASSET_COPY_STAMP "${CMAKE_BINARY_DIR}/PathTracerHeadlessAssets.stamp")
     add_custom_command(
         OUTPUT "${HEADLESS_ASSET_COPY_STAMP}"
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/assets" "${CMAKE_BINARY_DIR}/shaders"
-        ${HEADLESS_ASSET_COPY}
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+        ${HEADLESS_ASSET_LINK}
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/shaders" "${CMAKE_BINARY_DIR}/shaders"
         COMMAND ${CMAKE_COMMAND} -E touch "${HEADLESS_ASSET_COPY_STAMP}"
-        DEPENDS ${ASSET_FILES} ${PAVILION_REFERENCE_ENVS} ${SHADER_SOURCES}
-        COMMENT "Copying scene assets next to PathTracerHeadless"
+        DEPENDS ${PAVILION_REFERENCE_ENVS} ${SHADER_SOURCES} ${LINK_ASSETS_SCRIPT}
+        COMMENT "Linking scene assets and copying shaders next to PathTracerHeadless"
     )
 
     add_custom_target(PathTracerHeadlessAssets ALL
@@ -606,10 +601,8 @@ if(NOT PATH_TRACER_BUILD_EMBREE_SMOKE_ONLY)
     add_dependencies(PathTracerHeadless PathTracerHeadlessShaders)
 
     add_custom_command(TARGET PathTracerHeadless POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PathTracerHeadless>/assets"
-        ${HEADLESS_TARGET_ASSET_COPY}
-        COMMENT "Copying scene assets next to PathTracerHeadless"
+        ${HEADLESS_TARGET_ASSET_LINK}
+        COMMENT "Linking scene assets next to PathTracerHeadless"
     )
 
     add_test(

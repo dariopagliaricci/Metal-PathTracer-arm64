@@ -1,51 +1,62 @@
 # Metal PathTracer
 
-A physically based renderer for macOS on Apple Silicon, written in C++20,
-Objective-C++ and Metal.
+A physically based renderer for macOS and Apple Silicon, written in C++20,
+Objective-C++, and Metal.
 
-Metal PathTracer is a research renderer. Its primary backend is a Metal GPU path
-tracer with hardware ray tracing. An Embree CPU backend is kept as a reference
-for parity checks. The renderer has deterministic headless output and a
-static-scene import pipeline. Its research lighting systems are off by default;
-each one is enabled through its own CLI flag.
+Metal PathTracer is a research-grade production renderer with multiple transport
+backends, large-scene asset onboarding, deterministic headless rendering,
+runtime diagnostics, and explicitly gated experimental systems.
 
-The current release is `v4.0.0`. Development happens in a private line, and each
-release is imported into this repository as a single snapshot commit. What
-changed since `v3.0.0` is in [CHANGELOG.md](CHANGELOG.md) and
-[release_notes/v4.0.0.md](release_notes/v4.0.0.md).
+The current public release line is `v3.2.1`. This release includes the renderer
+scalability foundation, Bistro large-scene pilot support, Embree reference
+rendering, and importer/texture conversion tooling.
 
 ## Current Status
 
-The defaults are conservative. The core path tracer runs by default, and every
-research system is opt-in through CLI flags or the GUI's debug settings. Each
-system below carries one of four labels: Absent, Prototype,
-Implemented/runnable, or Production-complete.
+The default renderer remains conservative: core path tracing paths are enabled by
+default, while high-risk research modes are opt-in and controlled through CLI
+flags and UI/debug settings.
 
-| System | Label | Notes |
-| --- | --- | --- |
-| Metal megakernel path tracer, hardware ray tracing with a software BVH fallback | Production-complete | The default renderer. Headless output is deterministic. A fallback from hardware to software ray tracing is logged, and `--force-hwrt` / `--force-swrt` make a run fail instead. |
-| Metal wavefront execution (`--executionMode=wavefront`) | Implemented/runnable | Matches the megakernel on the scenes measured. Runs `ris_spatial` as plain RIS and logs it. |
-| Embree CPU reference backend | Implemented/runnable | For parity checks against Metal. Runs Metal's random-walk subsurface and the Bitterli scenes' source closures. Ignores volumes. Refuses by name the features it does not implement. |
-| glTF 2.0 PBR, KHR transmission (thin-walled, without volume), KTX2 textures | Implemented/runnable | |
-| `PathTracerImport` (Assimp, static scenes) | Implemented/runnable | One texture V-origin rule for every source format. |
-| OIDN denoise | Production-complete | When the vendored native libraries are present; CMake disables it otherwise. |
-| SVGF denoise | Prototype | Gated. |
-| Direct light: `legacy`, `baseline_emissive` | Production-complete | |
-| Direct light: `ris` | Implemented/runnable | |
-| `ris_spatial` | Implemented/runnable | Unbiased on the megakernel (2.33004 against the exact 2.33005 on an analytic sun-plane test). Plain RIS on the wavefront, logged. |
-| `ris_world` | Implemented/runnable | Unbiased on both executors, with and without hardware ray tracing (2.33004 on the sun-plane test). |
-| ReGIR (`ris_regir`) and the DI+ReGIR hybrid (`restir_di_regir_hybrid`) | Prototype | Both give 2.33004 on the sun-plane test. |
-| ReSTIR DI, fused path (`restir_di`) | Implemented/runnable | Exact on the sun-plane test. |
-| ReSTIR DI explicit passes on the megakernel | Prototype | Refused: a headless run exits with code 2 and says why. The wavefront's explicit stage is exact on the sun-plane test. |
-| ReSTIR GI, ReSTIR PT | Prototype | |
-| Path guiding | Prototype | |
-| Radiance cache | Prototype | Measured bias at most 0.03% of the frame's mean luminance on three scenes. No error reduction at equal render time. |
-| Path-space caustics, MNEE | Implemented/runnable | |
-| Homogeneous volumes | Prototype | Metal only. Under a medium, `restir_di` and the hybrid render as `baseline_emissive`, and the run logs it. Henyey-Greenstein anisotropy follows pbrt's sign; a forward/backward glow ratio 6-8% above Arnold's is unexplained. |
-| Hero-wavelength spectral transport | Implemented/runnable | Refuses specular NEE, MNEE and volumes; spectral runs need `--enableSpecularNee=0`. See [Hero-Wavelength Spectral Mode](#hero-wavelength-spectral-mode). |
-| Random-walk subsurface scattering (Metal) | Implemented/runnable | On a unit sphere under one emitter: within 0.06% of Arnold's randomwalk at mean free path 0.1 and 0.31% at 0.25. Objects thinner than about two mean free paths differ more (up to 5%), where Arnold departs from a volumetric walk by design. |
-| Tungsten source closures (Bitterli scenes) | Implemented/runnable | Opt-in per scene. |
-| ML reconstruction backend (`--mlBackendMode`) | Prototype | Off by default. No quality claim. |
+Production-ready or primary paths:
+
+- Metal GPU renderer with hardware ray tracing where available and a software
+  BVH fallback/debug path.
+- Progressive physically based path tracing with deterministic headless output.
+- Megakernel execution path plus an actively developed wavefront execution path.
+- glTF 2.0 / GLB runtime loading with PBR metallic-roughness materials, texture
+  transforms, tangent generation, normal maps, emissive materials, transmission
+  fallback, and KTX2 texture loading for imported assets.
+- Large-scene reporting and memory-budget policy checks before acceleration
+  structure builds.
+- Headless render profiles, metadata sidecars, settings JSON, debug bundles,
+  checkpoint manifests, tiled render manifests, PBR metrics, and deterministic
+  render queue item/batch JSON. JSON/text sidecars and report manifests publish
+  through temp files plus atomic rename, while settings JSON is scoped to the
+  documented headless product contract rather than every private renderer
+  setting.
+- Intel Open Image Denoise CPU postprocess when the vendored native libraries are
+  present, plus the production Metal SVGF reconstruction path with split
+  direct/indirect controls.
+- `PathTracerImport`, an importer-only Assimp pipeline that converts static FBX,
+  OBJ, and other supported source formats into deterministic glTF/GLB output.
+
+Gated research paths that are present but opt-in:
+
+- RIS-family direct lighting, ReGIR world reuse, ReSTIR DI, and DI+ReGIR hybrid.
+- Production ReSTIR GI diffuse reuse and ReSTIR PT reservoir capture/path reuse.
+- Gated production path guiding.
+- A prototype non-neural radiance cache that learns the radiance paths gather
+  after a cached vertex and returns it in place of the rest of the path. It is
+  biased by design; see the radiance cache notes under the headless examples.
+- Path-space caustic transport, homogeneous volume transport, and
+  hero-wavelength spectral transport.
+- ReSTIR debug inspector views and counters.
+- Wavefront active-work scheduling through selectable preview, final, offline,
+  and research scheduling policies.
+
+Embree is maintained as a selectable CPU reference renderer for visual-output
+parity checks, asset validation, and backend comparison. Metal remains the
+primary GPU renderer.
 
 ## Render Modes
 
@@ -69,79 +80,171 @@ mode context, backend, profile, and execution mode where applicable.
 
 ## Repository Map
 
-- `src/renderer`, `include/renderer`: Metal renderer, scene resources, pass
-  graph, transport memory registry, accumulation, denoise, UI, and acceleration
-  setup.
-- `src/headless`, `include/headless`: Metal and Embree headless backends.
-- `src/import`, `include/import`: Assimp import pipeline, Bistro audit, texture
-  conversion, KTX2 writing and loading.
-- `shaders`: Metal shader tree split by core math, tracing, BSDF, lighting,
+- `src/renderer`, `include/renderer` - Metal renderer, scene resources,
+  pass graph, transport memory registry, accumulation, denoise, UI, and
+  acceleration setup.
+- `src/headless`, `include/headless` - Metal and Embree headless backends.
+- `src/import`, `include/import` - Assimp import pipeline, Bistro audit, texture
+  conversion, KTX2 writing/loading support.
+- `shaders` - Metal shader tree split by core math, tracing, BSDF, lighting,
   ReSTIR, wavefront, reconstruction, guiding, cache, volume, spectral, caustics,
-  scene access, and debug views. `shaders/shared` holds closure code that the
-  Metal shaders and the C++ Embree backend both compile.
-- `assets`: the bundled sample assets (two busts, two HDRIs, five scenes) and
-  `CREDITS.md`. The full scene set is the separate [asset pack](#assets-pack).
-- `tests`: the public smoke test and test scenes.
-- `validation/baselines`: threshold files for the ReSTIR and RIS checks.
-- `Images/Gallery`: the README gallery (JPEG, 1920x1080).
-- `paper`: the JOSS paper sources.
+  scene access, and debug views.
+- `assets` - scene files and canonical assets, including Bistro,
+  San Miguel, Living Room, Bitterli, automotive, Khronos, Blender, and synthetic
+  fixtures.
+- `tests` - public smoke tests and optional renderer regression fixtures when
+  included in the release package.
+- `Images/Images-Legacy`, `Images/Metal-Wavefront-Images`, `Images/Embree-Renders` - public gallery
+  render sets used below.
 
 ## Renderings Gallery
 
-Every image below is a v4.0.0 release render at 1920x1080, made with the
-headless renderer and denoised with OIDN (albedo and normal guides). Metal
-images use 1024 samples per pixel; the two Embree images use 256. Each caption
-names the scene ID, so the image can be reproduced from the asset pack (see
-[Assets Pack](#assets-pack)). Asset credits are under [Asset Credits](#asset-credits).
+The galleries below show selected release renders from the legacy material set,
+current Metal wavefront output, and Embree reference output.
 
-### Large Scenes
+### Legacy Gallery
 
-| | |
-| --- | --- |
-| ![Amazon Lumberyard Bistro in sunlight](Images/Gallery/bistro_full_sun_restir_alt_mk_1920x1080_1024spp.jpg)<br>Bistro, day: `bistro_full_sun_restir_alt`, megakernel, `restir_di`, exposure +1 stop. | ![Amazon Lumberyard Bistro at night](Images/Gallery/bistro_night_openfront_restir_mk_1920x1080_1024spp.jpg)<br>Bistro, night: `bistro_night_openfront_restir`, megakernel, `restir_di`. |
-| ![San Miguel balcony in sunlight](Images/Gallery/san_miguel_balcony_sun_restir_mk_1920x1080_1024spp.jpg)<br>San Miguel, balcony: `san_miguel_balcony_sun_restir`, megakernel. | ![San Miguel courtyard in sunlight](Images/Gallery/san_miguel_2_restir_sunlit_alternate_mk_1920x1080_1024spp.jpg)<br>San Miguel, courtyard: `san_miguel_2_restir_sunlit_alternate`, megakernel. |
-| ![Sponza in sunlight](Images/Gallery/sponza_sunlight_hdri_restir_mk_1920x1080_1024spp.jpg)<br>Sponza: `sponza_sunlight_hdri_restir`, megakernel, `restir_di`. | ![Unreal Engine Sun Temple](Images/Gallery/sun_temple_mk_1920x1080_1024spp.jpg)<br>Sun Temple: `sun_temple`, megakernel. Asset CC BY-NC-SA 4.0 (Epic Games, via NVIDIA ORCA). |
-| ![NVIDIA Emerald Square by day](Images/Gallery/emerald_square_day_wf_1920x1080_1024spp.jpg)<br>Emerald Square, day: `emerald_square_day`, wavefront. Asset CC BY-NC-SA 3.0 (NVIDIA ORCA). | ![NVIDIA Emerald Square at dusk](Images/Gallery/emerald_square_dusk_wf_1920x1080_1024spp.jpg)<br>Emerald Square, dusk: `emerald_square_dusk`, wavefront. Asset CC BY-NC-SA 3.0 (NVIDIA ORCA). |
-| ![Barcelona Pavilion by day](Images/Gallery/barcelona_pavilion_day_mk_1920x1080_1024spp.jpg)<br>Barcelona Pavilion, day: `barcelona_pavilion_day`, megakernel. | ![Barcelona Pavilion at night](Images/Gallery/barcelona_pavilion_night_mk_1920x1080_1024spp.jpg)<br>Barcelona Pavilion, night: `barcelona_pavilion_night`, megakernel. |
-| ![Zero-Day, Measure Seven](Images/Gallery/zero_day_measure_seven_mk_1920x1080_1024spp.jpg)<br>Zero-Day, Measure Seven: `zero_day_measure_seven`, megakernel. | |
+Images from `Images/Images-Legacy`.
 
-### Bitterli Scenes
+<div align="center">
 
-| | |
-| --- | --- |
-| ![Wooden staircase](Images/Gallery/bitterli_staircase_mk_1920x1080_1024spp.jpg)<br>Staircase: `bitterli_staircase`, megakernel. | ![Glass of water](Images/Gallery/bitterli_glass_of_water_wf_1920x1080_1024spp.jpg)<br>Glass of Water: `bitterli_glass_of_water`, wavefront. |
-| ![Spaceship](Images/Gallery/bitterli_spaceship_wf_1920x1080_1024spp.jpg)<br>Spaceship: `bitterli_spaceship`, wavefront. | ![Veach, Ajar](Images/Gallery/bitterli_veach_ajar_wf_1920x1080_1024spp.jpg)<br>Veach, Ajar: `bitterli_veach_ajar`, wavefront. |
+![Hygieia hardware ray tracing legacy render](Images/Images-Legacy/hygieia_HWRT.jpg)
 
-### Materials, Subsurface and Spectral Transport
+![Hygieia metal material legacy render](Images/Images-Legacy/hygieia_metal.jpeg)
 
-| | |
-| --- | --- |
-| ![Damaged Helmet](Images/Gallery/gltf-damaged-helmet_mk_1920x1080_1024spp.jpg)<br>Damaged Helmet: `gltf-damaged-helmet`, megakernel. | ![Bugatti Chiron Top Edition](Images/Gallery/bugatti_chiron_top_edition_matchref_mk_1920x1080_1024spp.jpg)<br>Bugatti Chiron: `bugatti_chiron_top_edition_matchref`, megakernel. |
-| ![Marble and wax busts with random-walk subsurface scattering](Images/Gallery/sss_marble_wax_mk_1920x1080_1024spp.jpg)<br>Random-walk subsurface, marble and wax: `sss_marble_wax`, megakernel. | ![Transparent Machines film camera](Images/Gallery/transparent_machines_film_mk_1920x1080_1024spp.jpg)<br>Transparent Machines, film camera: `transparent_machines_film`, megakernel. |
-| ![Suzanne caustics in hero-wavelength spectral mode](Images/Gallery/suzanne_caustics_hero_spectral_mk_1920x1080_1024spp.jpg)<br>Hero-wavelength spectral transport with path-space caustics: `suzanne_caustics_hero`, megakernel, three wavelengths per path, specular NEE and MNEE off (spectral mode refuses them). | |
+![glTF BoomBox legacy render](Images/Images-Legacy/boombox.jpg)
 
-### Formula 1 Cars
+![Damaged Helmet legacy render 1](Images/Images-Legacy/damaged-helmet-01.jpg)
 
-| | |
-| --- | --- |
-| ![2021 McLaren MCL35M](Images/Gallery/f1_bulk_2021_f1_mclaren_mcl35m_mk_1920x1080_1024spp.jpg)<br>2021 McLaren MCL35M: `f1_bulk_2021_f1_mclaren_mcl35m`. | ![2021 Mercedes-Benz W12](Images/Gallery/f1_bulk_2021_f1_mercedes_benz_w12_mk_1920x1080_1024spp.jpg)<br>2021 Mercedes-Benz W12: `f1_bulk_2021_f1_mercedes_benz_w12`. |
-| ![2021 Alpine A521](Images/Gallery/f1_bulk_2021_f1_alpine_a521_mk_1920x1080_1024spp.jpg)<br>2021 Alpine A521: `f1_bulk_2021_f1_alpine_a521`. | ![2020 Mercedes-Benz W11](Images/Gallery/f1_bulk_2020_f1_mercedes_benz_w11_mk_1920x1080_1024spp.jpg)<br>2020 Mercedes-Benz W11: `f1_bulk_2020_f1_mercedes_benz_w11`. |
-| ![2020 McLaren MCL35](Images/Gallery/f1_bulk_2020_f1_mclaren_mcl35_mk_1920x1080_1024spp.jpg)<br>2020 McLaren MCL35: `f1_bulk_2020_f1_mclaren_mcl35`. | ![2020 Racing Point RP20](Images/Gallery/f1_bulk_2020_f1_racing_point_rp20_mk_1920x1080_1024spp.jpg)<br>2020 Racing Point RP20: `f1_bulk_2020_f1_racing_point_rp20`. |
-| ![2020 Alfa Romeo C39](Images/Gallery/f1_bulk_2020_f1_alfa_romeo_c39_mk_1920x1080_1024spp.jpg)<br>2020 Alfa Romeo C39: `f1_bulk_2020_f1_alfa_romeo_c39`. | ![2020 Haas VF-20](Images/Gallery/f1_bulk_2020_f1_haas_vf20_mk_1920x1080_1024spp.jpg)<br>2020 Haas VF-20: `f1_bulk_2020_f1_haas_vf20`. |
-| ![2020 Williams FW43](Images/Gallery/f1_bulk_2020_f1_whilliams_fw43_mk_1920x1080_1024spp.jpg)<br>2020 Williams FW43: `f1_bulk_2020_f1_whilliams_fw43`. | ![2019 Mercedes-Benz W10](Images/Gallery/f1_bulk_2019_f1_mercedes_benz_w10_mk_1920x1080_1024spp.jpg)<br>2019 Mercedes-Benz W10: `f1_bulk_2019_f1_mercedes_benz_w10`. |
-| ![2019 McLaren MCL34](Images/Gallery/f1_bulk_2019_mclaren_mcl34_mk_1920x1080_1024spp.jpg)<br>2019 McLaren MCL34: `f1_bulk_2019_mclaren_mcl34`. | ![2019 Red Bull RB15](Images/Gallery/f1_bulk_2019_f1_red_bull_rb15_mk_1920x1080_1024spp.jpg)<br>2019 Red Bull RB15: `f1_bulk_2019_f1_red_bull_rb15`. |
-| ![2019 Alfa Romeo C38](Images/Gallery/f1_bulk_2019_f1_alfa_romeo_c38_mk_1920x1080_1024spp.jpg)<br>2019 Alfa Romeo C38: `f1_bulk_2019_f1_alfa_romeo_c38`. | ![2019 Haas VF-19](Images/Gallery/f1_bulk_2019_haas_vf_19_mk_1920x1080_1024spp.jpg)<br>2019 Haas VF-19: `f1_bulk_2019_haas_vf_19`. |
+![Damaged Helmet legacy render 2](Images/Images-Legacy/damaged-helmet-02.jpg)
 
-All fourteen cars render on the megakernel. The car models are by OUTPISTON on Sketchfab, CC BY-NC-SA 4.0; these images are shared under the same licence.
+![Marble and wax validation legacy render](Images/Images-Legacy/marble-wax-validation.jpg)
 
-### Embree CPU Reference
+![Plastic material validation legacy render](Images/Images-Legacy/plastic_validation.jpg)
 
-The Embree backend renders the same scene files on the CPU and is used to check
-Metal's output. These two images are Embree renders at 256 samples per pixel.
+</div>
 
-| | |
-| --- | --- |
-| ![Sponza on Embree](Images/Gallery/sponza_sunlight_hdri_restir_embree_1920x1080_256spp.jpg)<br>Sponza: `sponza_sunlight_hdri_restir`, Embree, `restir_di`. | ![Staircase on Embree](Images/Gallery/bitterli_staircase_embree_1920x1080_256spp.jpg)<br>Staircase: `bitterli_staircase`, Embree. |
+### Metal Wavefront Gallery
+
+Current Metal wavefront renders from `Images/Metal-Wavefront-Images`.
+
+<div align="center">
+
+![Bistro full sun ReSTIR wavefront render](Images/Metal-Wavefront-Images/bistro_full_sun_restir_alt_denoised_1024spp_denoised.jpg)
+
+![Bistro night open-front ReSTIR wavefront render](Images/Metal-Wavefront-Images/bistro_night_openfront_restir_denoised_1024spp_denoised.jpg)
+
+![San Miguel balcony sun ReSTIR wavefront render](Images/Metal-Wavefront-Images/san_miguel_balcony_sun_restir_denoised_1024spp_denoised.jpg)
+
+![San Miguel sunlit alternate ReSTIR wavefront render](Images/Metal-Wavefront-Images/san_miguel_2_restir_sunlit_alternate_denoised_1024spp_denoised.jpg)
+
+![Sponza sunlight HDRI ReSTIR wavefront render](Images/Metal-Wavefront-Images/sponza_sunlight_hdri_restir_denoised_1024spp_denoised.jpg)
+
+![Bitterli staircase wavefront render](Images/Metal-Wavefront-Images/bitterli_staircase_denoised_1024spp_denoised.jpg)
+
+![Living room ReGIR stress wavefront render](Images/Metal-Wavefront-Images/living_room_regir_stress_denoised_1024spp_denoised.jpg)
+
+![Living room practical lights ReGIR stress wavefront render](Images/Metal-Wavefront-Images/living_room_regir_practicals_stress_denoised_1024spp_denoised.jpg)
+
+![LuxCore balls wavefront render](Images/Metal-Wavefront-Images/luxcoreballs_denoised_1024spp_denoised.jpg)
+
+![McLaren MCL35M wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2021_f1_mclaren_mcl35m_denoised_1024spp_denoised.jpg)
+
+![Mercedes W12 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2021_f1_mercedes_benz_w12_denoised_1024spp_denoised.jpg)
+
+![Alpine A521 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2021_f1_alpine_a521_denoised_1024spp_denoised.jpg)
+
+![Mercedes W11 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_mercedes_benz_w11_denoised_1024spp_denoised.jpg)
+
+![McLaren MCL35 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_mclaren_mcl35_denoised_1024spp_denoised.jpg)
+
+![Racing Point RP20 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_racing_point_rp20_denoised_1024spp_denoised.jpg)
+
+![Alfa Romeo C39 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_alfa_romeo_c39_denoised_1024spp_denoised.jpg)
+
+![Haas VF20 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_haas_vf20_denoised_1024spp_denoised.jpg)
+
+![Williams FW43 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2020_f1_whilliams_fw43_denoised_1024spp_denoised.jpg)
+
+![Mercedes W10 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_f1_mercedes_benz_w10_denoised_1024spp_denoised.jpg)
+
+![McLaren MCL34 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_mclaren_mcl34_denoised_1024spp_denoised.jpg)
+
+![Red Bull RB15 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_f1_red_bull_rb15_denoised_1024spp_denoised.jpg)
+
+![Alfa Romeo C38 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_f1_alfa_romeo_c38_denoised_1024spp_denoised.jpg)
+
+![Haas VF-19 wavefront render](Images/Metal-Wavefront-Images/f1_bulk_2019_haas_vf_19_denoised_1024spp_denoised.jpg)
+
+</div>
+
+### Embree Gallery
+
+CPU reference renders from `Images/Embree-Renders`.
+
+<div align="center">
+
+![Bistro sun Embree render](Images/Embree-Renders/bistro_full_sun_restir_alt_16spp_denoised_denoised.jpg)
+
+![Sponza sunlight Embree render](Images/Embree-Renders/sponza_sunlight_hdri_restir_denoised_16spp_denoised.jpg)
+
+![Bitterli staircase Embree render](Images/Embree-Renders/bitterli_staircase_denoised_16spp_denoised.jpg)
+
+![San Miguel balcony Embree render](Images/Embree-Renders/san_miguel_balcony_sun_restir_denoised_16spp_denoised.jpg)
+
+![San Miguel alternate Embree render](Images/Embree-Renders/san_miguel_2_restir_sunlit_alternate_denoised_16spp_denoised.jpg)
+
+![Living room Embree render](Images/Embree-Renders/living_room_denoised_16spp_denoised.jpg)
+
+![glTF Damaged Helmet Embree render](Images/Embree-Renders/gltf_damaged_helmet_denoised_16spp_denoised.jpg)
+
+![Ajax Embree render](Images/Embree-Renders/ajax_denoised_16spp_denoised.jpg)
+
+![Hygieia Embree render](Images/Embree-Renders/hygieia_denoised_16spp_denoised.jpg)
+
+![Hygieia other Embree render](Images/Embree-Renders/hygieia_other_denoised_16spp_denoised.jpg)
+
+![Jason alloys Embree render](Images/Embree-Renders/jason_alloys_denoised_16spp_denoised.jpg)
+
+![Lucy glass Embree render](Images/Embree-Renders/lucy_glass_denoised_16spp_denoised.jpg)
+
+![Lucy plastic Embree render](Images/Embree-Renders/lucy_plastic_denoised_16spp_denoised.jpg)
+
+![Dragon car paint Embree render](Images/Embree-Renders/dragon_carpaint_denoised_16spp_denoised.jpg)
+
+![Bugatti Chiron Embree render](Images/Embree-Renders/bugatti_chiron_top_edition_matchref_16spp_denoised_denoised.jpg)
+
+![Ferrari F14 T Embree render](Images/Embree-Renders/ferrari_f14_t_2014_matchref_denoised_16spp_denoised.jpg)
+
+![McLaren MCL35M Embree render](Images/Embree-Renders/f1_bulk_2021_f1_mclaren_mcl35m_denoised_16spp_denoised.jpg)
+
+![Mercedes W12 Embree render](Images/Embree-Renders/f1_bulk_2021_f1_mercedes_benz_w12_denoised_16spp_denoised.jpg)
+
+![Alpine A521 Embree render](Images/Embree-Renders/f1_bulk_2021_f1_alpine_a521_denoised_16spp_denoised.jpg)
+
+![Mercedes W11 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_mercedes_benz_w11_denoised_16spp_denoised.jpg)
+
+![McLaren MCL35 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_mclaren_mcl35_denoised_16spp_denoised.jpg)
+
+![Racing Point RP20 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_racing_point_rp20_denoised_16spp_denoised.jpg)
+
+![Alfa Romeo C39 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_alfa_romeo_c39_denoised_16spp_denoised.jpg)
+
+![Haas VF20 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_haas_vf20_denoised_16spp_denoised.jpg)
+
+![Williams FW43 Embree render](Images/Embree-Renders/f1_bulk_2020_f1_whilliams_fw43_denoised_16spp_denoised.jpg)
+
+![Mercedes W10 Embree render](Images/Embree-Renders/f1_bulk_2019_f1_mercedes_benz_w10_denoised_16spp_denoised.jpg)
+
+![McLaren MCL34 Embree render](Images/Embree-Renders/f1_bulk_2019_mclaren_mcl34_denoised_16spp_denoised.jpg)
+
+![Red Bull RB15 Embree render](Images/Embree-Renders/f1_bulk_2019_f1_red_bull_rb15_denoised_16spp_denoised.jpg)
+
+![Alfa Romeo C38 Embree render](Images/Embree-Renders/f1_bulk_2019_f1_alfa_romeo_c38_denoised_16spp_denoised.jpg)
+
+![Haas VF-19 Embree render](Images/Embree-Renders/f1_bulk_2019_haas_vf_19_denoised_16spp_denoised.jpg)
+
+</div>
 
 ## Features
 
@@ -155,9 +258,9 @@ Metal's output. These two images are Embree renders at 256 samples per pixel.
   bloom, color space, and deterministic seeds.
 - Environment map importance sampling and MIS.
 - Specular NEE and MNEE caustics.
-- Optional firefly clamp modes.
+- Optional firefly clamp modes for production output control.
 - Path-space caustic connection transport.
-- Gated homogeneous/global volume transport (Prototype) with isotropic or
+- Gated production homogeneous/global volume transport with isotropic or
   Henyey-Greenstein phase, rect-light volume NEE, debug metadata, and explicit
   fallbacks for non-medium-aware providers. Heterogeneous volumes remain future
   work.
@@ -184,10 +287,10 @@ Metal's output. These two images are Embree renders at 256 samples per pixel.
   `ris_temporal`, `ris_world`, `ris_regir`, `restir_di`, and
   `restir_di_regir_hybrid`.
 - ReSTIR DI explicit pass graph path for headless and opt-in GUI profiling.
-- ReSTIR GI diffuse reuse (Prototype).
-- ReSTIR PT reservoir capture and path reuse (Prototype).
+- ReSTIR GI production diffuse reuse.
+- ReSTIR PT production reservoir capture and path reuse modes.
 - ReGIR/world-space candidate reuse.
-- Gated path guiding (Prototype).
+- Gated production path guiding.
 - A prototype non-neural radiance cache that learns the radiance paths gather
   after a cached vertex and returns it in place of the rest of the path. It is
   biased by design; see the radiance cache notes under the headless examples.
@@ -217,7 +320,7 @@ Metal's output. These two images are Embree renders at 256 samples per pixel.
 - Optional: Assimp for `PathTracerImport`.
 - Optional: Embree 4.4 or newer for the CPU headless backend.
 - Vendored Intel Open Image Denoise 2.4.1 and TBB native libraries in
-  `external/oidn` for CPU denoising. Release builds are tested with the
+  `external/oidn` for CPU denoising. The release is validated against the
   bundled OIDN/TBB runtime. Newer OIDN releases should be tested by replacing
   `external/oidn`, reconfiguring CMake, and rerunning validation; until then,
   the bundled version is the supported runtime. Source-only rebuilds can disable
@@ -629,11 +732,11 @@ Important headless flag groups:
 
 Run `build/PathTracerHeadless --help` for the complete current CLI surface.
 
-### Gated Research Mode Examples
+### Gated Production And Research Mode Examples
 
-The advanced transport systems are explicit opt-in paths. Each run records the
-selected modes in its metadata and debug output. The maturity of each system
-is in the table under [Current Status](#current-status).
+The advanced transport systems are explicit opt-in paths. ReSTIR modes are
+production transport paths with their selected mode recorded in metadata/debug
+output; unrelated research systems remain gated separately.
 
 ReSTIR DI plus ReGIR hybrid on the Metal wavefront path:
 
@@ -648,7 +751,7 @@ build/PathTracerHeadless \
   --out=renders/bistro_restir_regir.exr
 ```
 
-ReSTIR GI diffuse reuse (Prototype; the mode value is `restir_gi_production`):
+ReSTIR GI production diffuse reuse:
 
 ```bash
 build/PathTracerHeadless \
@@ -748,8 +851,8 @@ with a position (mesh emitters, rect lights, point lights) is attenuated by the
 medium's transmittance over the shadow segment in every direct-light mode, on
 the megakernels and the wavefront; suns and the environment are not attenuated,
 as escaped paths are not. The `volume_transmittance_query_count` metric counts
-those queries too. Embree ignores volumes and runs every requested mode without
-them.
+those queries too. Embree follows the same rules: the medium's absorption,
+emission and scattering, volume NEE to rect lights, and the mode demotions above.
 
 Hero-wavelength spectral transport with path-space caustics. Spectral mode
 refuses specular NEE, MNEE and volumes (see
@@ -786,8 +889,8 @@ Notes:
 
 `--spectralMode=hero_wavelength` replaces RGB transport with transport over
 wavelengths sampled uniformly between `--spectralMinNm` and `--spectralMaxNm`
-(default 380-720 nm). It is a gated mode of the Metal backend; the Embree
-backend ignores it with a warning and renders RGB.
+(default 380-720 nm). It is a gated mode of the Metal and Embree backends, with
+the same rules and the same refusals.
 
 - **Wavelengths per path.** Each path samples a hero wavelength and carries
   C wavelengths in its three throughput channels,
@@ -826,13 +929,13 @@ backend ignores it with a warning and renders RGB.
   and dispersion events of the last frame; the stats buffer is cleared every
   frame). `--pbrMetrics=1` adds the same counters to the metrics JSON.
 
-Support matrix (headless Metal backend):
+Support matrix (headless Metal and Embree backends):
 
 | Supported | Refused |
 | --- | --- |
 | `--directLightMode=legacy`, `baseline_emissive` | RIS, ReGIR, ReSTIR DI and the DI+ReGIR hybrid |
-| Megakernel and wavefront execution | `--restirGiMode`, `--restirPtMode` other than `off` |
-| Path-space caustics (`--causticTransportMode=path_space`) | Path guiding, radiance cache |
+| Metal: megakernel and wavefront execution. Embree: its CPU path tracer | `--restirGiMode`, `--restirPtMode` other than `off` |
+| Metal only: path-space caustics (`--causticTransportMode=path_space`); Embree ignores the mode with a warning, as it does in RGB | Path guiding, radiance cache |
 | OIDN denoising with RGB guides | Homogeneous volumes |
 | `--spectralWavelengthsPerPath=1` or `3` | Specular NEE (on by default: pass `--enableSpecularNee=0`), MNEE |
 | | SVGF, ML reconstruction |
@@ -841,7 +944,9 @@ Support matrix (headless Metal backend):
 
 A refused combination prints `spectral mode does not support <combination>`,
 writes a sidecar with `"status": "refused"` and
-`spectral_refused_combination`, and exits with status 2 without rendering.
+`spectral_refused_combination`, and exits with status 2 without rendering. The
+headless binary checks the refused column before it picks a backend, so it holds
+on both.
 
 Limits:
 
@@ -883,12 +988,12 @@ deterministic output directory containing the scene, textures, and
 texture policy, stable geometry/material/texture IDs, output hashes, and
 diagnostics for omitted static-import features.
 
-Runtime glTF/GLB and `.scene` loads expose the same asset contract in
+Runtime glTF/GLB and `.scene` loads expose the same production asset contract in
 `--outputMetadataJson` and `--pbrMetricsJson` under `asset_pipeline`. The report
 includes support boundaries, stable resource IDs, material override records,
 texture color-space decisions, texture residency/mip/compression/budget policy,
 and diagnostics for unsupported lights, animation, skinning, morph targets,
-USD, and MaterialX. The current pipeline covers static scenes:
+USD, and MaterialX. The current pipeline is static-scene production scope:
 glTF/GLB geometry, transforms, cameras, textures, PBR-compatible materials,
 alpha/transmission/emission mappings, KTX2/DDS/raster texture handling, and
 Assimp conversion are supported; animation, skinning, morph evaluation,
@@ -984,45 +1089,38 @@ Release notes, source archives, and asset-pack links are published through
 
 ## Assets Pack
 
-This repository bundles a small asset set, so the renderer can be tried from a
-fresh clone: the Ajax and Hygieia busts, two Poly Haven HDRIs, and five scenes
-that use them (`ajax`, `ajax-other`, `ajax-glass`, `hygieia`, `hygieia-other`).
-Run from the repository root:
+The public release contains many scene wrappers and canonical assets. Large
+scenes, high-resolution meshes, HDRIs, and externally licensed datasets may be
+distributed separately to keep the Git repository manageable.
 
-```bash
-build/PathTracerHeadless --scene=ajax --width=640 --height=360 --spp=64 \
-  --seed=42 --format=png --out=renders/ajax.png
-```
-
-The other scenes in this README, including every gallery scene, need the v4
-asset pack, which is distributed separately because of its size.
-
-- Download the v4 asset pack from [this link](https://drive.google.com/file/d/1N7OLGjs4FPK57eoMsdOd8tS2iHmQTO7X/view).
-- Unzip it.
-- Copy or replace the `assets` folder in the root of your clone before you
-  render a scene from the pack. The headless renderer resolves scenes from the
-  first folder, from the current directory upward, that holds both `.git` and
-  `assets/`.
-- If Git then reports mesh assets such as `assets/ajax.obj` as modified,
-  normalize the Wavefront text files back to the repository's LF line endings:
+- Download `Metal-PathTracer-Assets-v3-0-0.zip` from the
+  [public asset-pack link](https://drive.google.com/file/d/1Xsb5R_wzJUWYKn3FKulJlHEt4Whyxs1A/view?usp=share_link).
+- Unzip this file.
+- Copy or replace the `assets` folder into the root of `Metal-PathTracer-arm64` before
+  rendering asset-pack-dependent scenes.
+- If Git reports mesh assets such as `assets/ajax.obj` as modified after
+  replacement, normalize downloaded Wavefront text files back to the repository
+  LF line-ending policy:
 
   ```bash
   find assets -type f \( -name '*.obj' -o -name '*.mtl' \) -exec perl -pi -e 's/\r\n/\n/g' {} +
   git status --short
   ```
 
-Scene IDs used in the gallery:
+Important scene IDs include:
 
-- `bistro_full_sun_restir_alt`, `bistro_night_openfront_restir`
-- `san_miguel_balcony_sun_restir`, `san_miguel_2_restir_sunlit_alternate`
-- `sponza_sunlight_hdri_restir`, `sun_temple`
-- `emerald_square_day`, `emerald_square_dusk`
-- `barcelona_pavilion_day`, `barcelona_pavilion_night`, `zero_day_measure_seven`
-- `bitterli_staircase`, `bitterli_glass_of_water`, `bitterli_spaceship`,
-  `bitterli_veach_ajar`
-- `gltf-damaged-helmet`, `bugatti_chiron_top_edition_matchref`,
-  `sss_marble_wax`, `transparent_machines_film`, `suzanne_caustics_hero`
-- the fourteen `f1_bulk_*` scenes listed in the gallery
+- `bistro_full`, `bistro_full_sun_restir_alt`, `bistro_night_openfront_restir`
+- `sponza`, `sponza_sunlight_hdri_restir`
+- `bitterli_staircase`
+- `living_room`, `living_room_regir_stress`,
+  `living_room_regir_practicals_stress`
+- `san_miguel_2_0`, `san_miguel_balcony_sun_restir`,
+  `san_miguel_2_restir_sunlit_alternate`
+- `luxcoreballs`
+- `gltf-boombox`, `gltf-lantern`, `gltf-flight-helmet`,
+  `gltf-damaged-helmet`, `gltf-emissive-strength`
+- automotive/F1 scenes for Ferrari, Red Bull, McLaren, Mercedes, Alfa Romeo,
+  Alpine, Williams, Haas, Toro Rosso, Racing Point, and Bugatti scenes.
 
 ## Operational Notes
 
@@ -1034,8 +1132,8 @@ Scene IDs used in the gallery:
   core rendering remains usable.
 - Embree is a selectable CPU reference renderer for visual-output parity,
   asset validation, and backend comparison.
-- Advanced transport systems are explicit opt-in paths; use the commands in
-  the gated mode examples above. Their maturity is in the Current Status table.
+- Advanced transport systems are explicit opt-in production/research paths; use
+  the commands in the gated mode examples above.
 - Wavefront execution is selectable through `--executionMode=wavefront`, with
   scheduling controlled by `--wavefront-policy`.
 - GUI EXR export intentionally writes timestamped captures to
@@ -1043,97 +1141,6 @@ Scene IDs used in the gallery:
   when an exact path is required.
 - The importer handles static scenes only; animation, skinning, morph targets,
   and full DCC material graphs are outside the current importer scope.
-
-## Asset Credits
-
-The renderer's code is MIT licensed. The scenes shown in this README are third-party
-assets, each under its own terms; they are converted, and many are re-materialed,
-for this renderer. `assets/CREDITS.md` has the full list.
-
-Metal PathTracer is a non-commercial project. Some of the assets below are
-licensed for non-commercial use only (CC BY-NC-SA 4.0, CC BY-NC 4.0 and
-CC BY-NC-SA 3.0). They are used, and their images are shared, only for
-non-commercial purposes, as those licences require. If you reuse these assets
-or images, their licences apply to you.
-
-Bundled in this repository:
-
-- Ajax bust: courtesy of Jotero (http://forum.jotero.com), as credited by
-  Miles Macklin's Tinsel (https://github.com/mmacklin/tinsel); this copy comes
-  from knightcrawler25's GLSL-PathTracer
-  (https://github.com/knightcrawler25/GLSL-PathTracer). Licence: none stated
-  by the upstream sources (Jotero, via mmacklin/tinsel and
-  knightcrawler25/GLSL-PathTracer).
-- Hygieia bust: "Hygieia" by noe-3d.at on Sketchfab,
-  https://sketchfab.com/3d-models/hygieia-fd53f578e9bc4fbaa52551c2f5175cde,
-  CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/).
-- HDRIs `san_giuseppe_bridge_4k.hdr` and `venice_sunrise_4k.hdr`: Poly Haven
-  (https://polyhaven.com/), CC0.
-
-Gallery assets (from the asset pack):
-
-- Amazon Lumberyard Bistro, Open Research Content Archive (ORCA), Amazon
-  Lumberyard, 2017, http://developer.nvidia.com/orca/amazon-lumberyard-bistro,
-  CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); converted to glTF
-  for this renderer.
-- San Miguel by Guillermo M. Leal Llaguno (Evolucien Visual,
-  http://www.evvisual.com/), 2017 version improved by Morgan McGuire, Guedis
-  Cardenas, Michael Mara and Nicholas Hull, http://casual-effects.com/data; free
-  for research and educational use; textures re-authored for this renderer.
-- Sponza, Khronos glTF Sample Assets
-  (https://github.com/KhronosGroup/glTF-Sample-Assets): original by Marko
-  Dabrovic, model by Frank Meinl (Crytek), PBR textures by Alexandre Pestana;
-  under the Cryengine Limited License Agreement.
-- Unreal Engine Sun Temple by Epic Games (exported by Kai-Hwa Yao and Nicholas
-  Hull), Open Research Content Archive,
-  http://developer.nvidia.com/orca/epic-games-sun-temple, CC BY-NC-SA 4.0
-  (http://creativecommons.org/licenses/by-nc-sa/4.0/); converted for this
-  renderer. The Sun Temple image is shared under the same licence.
-- NVIDIA Emerald Square by Nicholas Hull, Kate Anderson and Nir Benty (NVIDIA),
-  Open Research Content Archive,
-  http://developer.nvidia.com/orca/nvidia-emerald-square, CC BY-NC-SA 3.0
-  (http://creativecommons.org/licenses/by-nc-sa/3.0/); foliage by SpeedTree;
-  converted for this renderer. The Emerald Square images are shared under the
-  same licence.
-- Zero-Day by Mike Winkelmann (Beeple) and Kate Anderson, Open Research Content
-  Archive, https://developer.nvidia.com/orca/beeple-zero-day, CC BY 4.0
-  (https://creativecommons.org/licenses/by/4.0/); converted for this renderer.
-- Barcelona Pavilion by Claudio Andres (base model), Hamza Cheggour / eMirage
-  (https://www.emirage.org/), glTF conversion by Piotr Przybysz, CC BY 4.0
-  (https://creativecommons.org/licenses/by/4.0/); HDRIs from Poly Haven (CC0);
-  re-materialed for this renderer.
-- Transparent Machines by Mike Winkelmann (Beeple),
-  https://www.beeple-crap.com/resources, glTF conversion by Piotr Przybysz,
-  CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); re-materialed for
-  this renderer.
-- Bitterli scenes via Benedikt Bitterli's Rendering Resources
-  (https://benedikt-bitterli.me/resources/), converted for this renderer:
-  - "Modern Hall" (staircase) by NewSee2l035,
-    http://www.blendswap.com/blends/view/51997, CC BY 3.0
-    (https://creativecommons.org/licenses/by/3.0/).
-  - "Glass of Water" by aXel (Blend Swap 21697), CC0.
-  - "4060.b Spaceship" by thecali (Blend Swap 75686), CC0.
-  - "Veach, Ajar" by Benedikt Bitterli, CC0.
-- Damaged Helmet by ctxwing (rebuild, CC BY 4.0,
-  https://creativecommons.org/licenses/by/4.0/) and theblueturtle_ (earlier
-  version, CC BY-NC 4.0), via Khronos glTF Sample Assets
-  (https://github.com/KhronosGroup/glTF-Sample-Assets); re-materialed for this
-  renderer.
-- Bugatti Chiron Top Edition by iamsunroy,
-  https://sketchfab.com/3d-models/bugatti-chiron-top-edition-3d1f955d5e7a4df4b44787ceb3e2e975,
-  Sketchfab Standard licence; imported and re-materialed. The model itself is
-  not distributed.
-- Marble and wax busts (`sss_marble_wax`): the Ajax bust, courtesy of Jotero
-  (see the bundled assets above).
-- Suzanne, Blender's test model (CC0 copy via Khronos glTF Sample Assets, UX3D).
-- Formula 1 cars: all fourteen models are by OUTPISTON
-  (https://sketchfab.com/outpiston) on Sketchfab, licensed CC BY-NC-SA 4.0
-  (https://creativecommons.org/licenses/by-nc-sa/4.0/), converted and
-  re-materialed for this renderer. Their images are shared under the same
-  licence. Each model's page is listed in `assets/CREDITS.md`. The W10, RB15
-  and C39 pages state that the models were extracted from Real Racing 3. Team
-  names, liveries and car designs are trademarks of their owners. The images
-  are renderer tests, not endorsed by any team.
 
 ## License
 

@@ -40,7 +40,14 @@
     uint maxAttempts = min(max(uniforms.hardwareExcludeMaxAttempts, 1u), kMaxAttempts);
     Ray currentRay = ray;
     float currentTMin = tMin;
+    // How far along the ray the origin has moved past rejected hits. The returned t and the reach stay in the
+    // original ray's frame, as Embree's IntersectSceneExcludingShaded keeps them: callers read rec.t as the
+    // distance from the ray they traced (texture footprint, medium segments, shadow distances).
+    float tBase = 0.0f;
     for (uint attempt = 0u; attempt < maxAttempts; ++attempt) {
+        if (attempt > 0u && !(tMax - tBase > currentTMin)) {
+            return false;  // the re-spawn passed the segment's end
+        }
         HitRecord tempRec = make_empty_hit_record();
         device PathtraceStats* attemptStats = (attempt == 0u) ? stats : nullptr;
         if (!trace_scene_software(uniforms,
@@ -57,7 +64,7 @@
                                   attemptStats,
                                   currentRay,
                                   currentTMin,
-                                  tMax,
+                                  tMax - tBase,
                                   /*anyHitOnly=*/false,
                                   /*includeTriangles=*/true,
                                   tempRec)) {
@@ -69,6 +76,7 @@
                          tempRec.primitiveIndex == excludePrimitiveIndex);
         if (!excluded) {
             rec = tempRec;
+            rec.t += tBase;
             return true;
         }
 
@@ -76,10 +84,18 @@
             currentTMin = nextafter(max(tempRec.t, currentTMin), INFINITY);
             continue;
         }
-        float advance = max(tempRec.t + kHardwareOcclusionEpsilon, kHardwareOcclusionEpsilon);
-        currentRay.origin = ray_at(currentRay, advance);
-        currentRay.origin += currentRay.direction * kHardwareOcclusionEpsilon;
-        currentTMin = kHardwareOcclusionEpsilon;
+        // Resume kHardwareOcclusionEpsilon past the excluded hit with tMin 0, as trace_scene_hardware does after a
+        // rejected hit. The old resume (t + 5 mm, another 5 mm along the ray, then tMin 5 mm) skipped 15 mm past the
+        // hit, so a grazing bounce ray that re-crosses its own triangle skipped thin geometry the hardware path still
+        // reaches (Zero Day's light towers: SW/HW 0.957 on their tiles).
+        float3 dirStep = float3(0.0f, 0.0f, 1.0f);
+        const float dirLenSq = dot(currentRay.direction, currentRay.direction);
+        if (all(isfinite(currentRay.direction)) && dirLenSq > 1.0e-12f) {
+            dirStep = currentRay.direction * rsqrt(dirLenSq);
+        }
+        currentRay.origin = ray_at(currentRay, tempRec.t) + dirStep * kHardwareOcclusionEpsilon;
+        currentTMin = 0.0f;
+        tBase += tempRec.t + kHardwareOcclusionEpsilon * rsqrt(max(dirLenSq, 1.0e-12f));
     }
 
     return false;
@@ -841,8 +857,8 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                             baseColorCtx.dUVdy);
         baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
                                                                          baseColorSample);
-        float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
-        float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
+        float3 baseFactor = material.baseColorRoughness.xyz;
+        float3 baseColorSampleRgb = baseColorSample.xyz;
         material.baseColorRoughness.xyz = baseFactor * baseColorSampleRgb;
         result.debugBaseColor = material.baseColorRoughness.xyz;
     }
@@ -1026,7 +1042,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                                                       dUVdy1,
                                                                                       hasSurfacePartials1 ? uvPerWorld1 : 0.0f);
 
-        float3 baseFactor = to_working_space(material.baseColorRoughness.xyz, uniforms);
+        float3 baseFactor = material.baseColorRoughness.xyz;
         float baseColorLod =
             material_texture_lod_with_fallback(materialTextures,
                                                materialTextureInfos,
@@ -1058,7 +1074,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         }
         baseColorSample = resolve_alpha_cutout_foliage_base_color_sample(material,
                                                                          baseColorSample);
-        float3 baseColorSampleRgb = to_working_space(baseColorSample.xyz, uniforms);
+        float3 baseColorSampleRgb = baseColorSample.xyz;
         float3 baseColor = baseFactor * baseColorSampleRgb;
 
         float metallic = clamp(material.pbrParams.x, 0.0f, 1.0f);
@@ -1066,14 +1082,14 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         float roughness = max(material.pbrParams.y, 0.0f);
         float normalStrengthScale = 1.0f;
 #if PT_DEBUG_TOOLS
-        normalStrengthScale = max(uniforms.debugNormalStrengthScale, 0.0f);
+        normalStrengthScale = max(PT_DEFAULT_VALUE(uniforms.debugNormalStrengthScale, 1.0f), 0.0f);
 #endif
         float normalScale = material.pbrParams.w * normalStrengthScale;
         bool disableOrmByMaterial = (material.materialFlags & kMaterialFlagDisableOrm) != 0u;
         bool useOrmTexture = !disableOrmByMaterial &&
                              material_texture_valid(uniforms, material.textureIndices0.y);
 #if PT_DEBUG_TOOLS
-        useOrmTexture = useOrmTexture && (uniforms.debugDisableOrmTexture == 0u);
+        useOrmTexture = useOrmTexture && (PT_DEFAULT_OFF(uniforms.debugDisableOrmTexture) == 0u);
 #endif
         if (useOrmTexture) {
             float ormLod =
@@ -1087,7 +1103,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                    ormCtx.uvPerWorld,
                                                    surfaceFootprintWorld);
 #if PT_DEBUG_TOOLS
-            ormLod = max(ormLod + uniforms.debugOrmLodBias, 0.0f);
+            ormLod = max(ormLod + PT_DEFAULT_VALUE(uniforms.debugOrmLodBias, 0.0f), 0.0f);
 #endif
             float3 mrSample =
                 sample_material_texture_level(materialTextures,
@@ -1125,7 +1141,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                normalCtx.uvPerWorld,
                                                surfaceFootprintWorld);
 #if PT_DEBUG_TOOLS
-        normalLod = max(normalLod + uniforms.debugNormalLodBias, 0.0f);
+        normalLod = max(normalLod + PT_DEFAULT_VALUE(uniforms.debugNormalLodBias, 0.0f), 0.0f);
 #endif
 
         float transmission = clamp(material.pbrExtras.z, 0.0f, 1.0f);
@@ -1219,7 +1235,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         result.debugBaseColor = baseColor;
         result.debugMetallic = metallic;
 
-        float3 emissive = to_working_space(material.emission.xyz, uniforms);
+        float3 emissive = material.emission.xyz;
         if (material_texture_valid(uniforms, material.textureIndices1.x)) {
             float emissiveLod =
                 material_texture_lod_with_fallback(materialTextures,
@@ -1243,12 +1259,12 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                 emissiveCtx.hasIgehyGradients,
                                                 emissiveCtx.dUVdx,
                                                 emissiveCtx.dUVdy).xyz;
-            emissive *= to_working_space(emissiveSample, uniforms);
+            emissive *= emissiveSample;
         }
 
         bool useNormalMap = material_texture_valid(uniforms, material.textureIndices0.z);
 #if PT_DEBUG_TOOLS
-        if (uniforms.debugDisableNormalMap != 0u) {
+        if (PT_DEFAULT_OFF(uniforms.debugDisableNormalMap) != 0u) {
             useNormalMap = false;
         }
 #endif
@@ -1257,7 +1273,7 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
         }
         bool flipNormalGreen = false;
 #if PT_DEBUG_TOOLS
-        flipNormalGreen = uniforms.debugFlipNormalGreen != 0u;
+        flipNormalGreen = PT_DEFAULT_OFF(uniforms.debugFlipNormalGreen) != 0u;
 #endif
         if (useNormalMap) {
             result.debugHasNormalMap = true;
@@ -1308,7 +1324,9 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
                                                          b);
             }
             if (!hasBasis) {
+                // No vertex tangent and no UV frame (degenerate UVs): no normal map, as on Embree and in Falcor.
                 build_onb(shadingNormal, t, b);
+                normalSampleTs = float3(0.0f, 0.0f, 1.0f);
             }
             float3 mappedNormalTs = normalSampleTs;
             if (hasVertexTangentBasis &&
@@ -1407,4 +1425,140 @@ inline WavefrontSurfaceState resolve_wavefront_surface_state(
     result.firstHitAlbedo = material_base_color(material);
     result.firstHitNormal = rec.shadingNormal;
     return result;
+}
+
+// Backlog #47: bends a mapped coat normal N toward the geometric normal Ng (facing the view direction I) so that the
+// mirror reflection of I about it stays above the geometric surface, by at least min(0.9 * dot(Ng, I), 0.01). This is the
+// rule of Cycles' ensure_valid_reflection (Blender, Apache-2.0), rewritten here. N is returned unchanged when its
+// reflection is already above that threshold. Without the bend a strongly tilted coat normal reflects into the mesh: dark
+// bands (-12% on the stripes probe) where Arnold's stay faint.
+inline float3 subsurface_coat_valid_reflection_normal(const float3 Ng, const float3 I, const float3 N) {
+    const float cosGeometric = dot(Ng, I);
+    if (!(cosGeometric > 0.0f)) {
+        return N;
+    }
+    const float3 R = 2.0f * dot(N, I) * N - I;
+    const float threshold = min(0.9f * cosGeometric, 0.01f);
+    if (dot(Ng, R) >= threshold) {
+        return N;
+    }
+    // Frame with Ng as z and N in the x-z plane; solve for the normal whose reflection of I has height `threshold`.
+    const float3 X = normalize(N - dot(N, Ng) * Ng);
+    const float Ix = dot(I, X);
+    const float Iz = cosGeometric;
+    const float Ix2 = Ix * Ix;
+    const float a = Ix2 + Iz * Iz;
+    const float b = sqrt(max(Ix2 * (a - threshold * threshold), 0.0f));
+    const float c = Iz * threshold + a;
+    const float fac = 0.5f / a;
+    const float n1z2 = fac * (b + c);
+    const float n2z2 = fac * (c - b);
+    bool valid1 = n1z2 > 1.0e-5f && n1z2 <= 1.0f + 1.0e-5f;
+    bool valid2 = n2z2 > 1.0e-5f && n2z2 <= 1.0f + 1.0e-5f;
+    float2 bent;
+    if (valid1 && valid2) {
+        const float2 n1 = float2(sqrt(max(1.0f - n1z2, 0.0f)), sqrt(max(n1z2, 0.0f)));
+        const float2 n2 = float2(sqrt(max(1.0f - n2z2, 0.0f)), sqrt(max(n2z2, 0.0f)));
+        const float r1 = 2.0f * (n1.x * Ix + n1.y * Iz) * n1.y - Iz;
+        const float r2 = 2.0f * (n2.x * Ix + n2.y * Iz) * n2.y - Iz;
+        valid1 = r1 >= 1.0e-5f;
+        valid2 = r2 >= 1.0e-5f;
+        if (valid1 && valid2) {
+            bent = (r1 < r2) ? n1 : n2;  // both reflect above: the shallower one is closer to N
+        } else {
+            bent = (r1 > r2) ? n1 : n2;
+        }
+    } else if (valid1 || valid2) {
+        const float z2 = valid1 ? n1z2 : n2z2;
+        bent = float2(sqrt(max(1.0f - z2, 0.0f)), sqrt(max(z2, 0.0f)));
+    } else {
+        return Ng;
+    }
+    const float3 result = bent.x * X + bent.y * Ng;
+    return all(isfinite(result)) ? normalize(result) : Ng;
+}
+
+// Backlog #47 (Dario 2026-11-24, as in Arnold): a type=sss material's normal map (normalTexture, SceneManager.mm) shapes
+// only its coat lobe and the coat/walk lobe choice at the walk's entry. The walk's direction, its coat weights and its
+// exit keep the interpolated normal, so without a coat a map changes nothing. This
+// returns the mapped normal at `rec` without changing the record. The frame is the vertex's own: `vertexNormal` (its
+// interpolated shading normal, as the integrator resolved it; the software tracer's rec.shadingNormal is the face normal
+// at a fresh hit) and its geometric normal, UV set 0 through the normal slot's transform, and the vertex tangent or else the triangle's UV
+// frame, as at an ordinary normal-mapped vertex. The walk has no ray footprint, so the map is read at mip 0. The result is
+// flipped toward the geometric normal, as at an ordinary vertex. No map, a scale at or below 1e-4, or no tangent frame
+// (degenerate UVs) returns false.
+inline bool subsurface_coat_mapped_normal(
+    constant PathtraceUniforms& uniforms,
+    constant array<texture2d<float, access::sample>, kMaxMaterialTextures>& materialTextures,
+    constant array<sampler, kMaxMaterialSamplers>& materialSamplers,
+    device const MaterialTextureInfo* materialTextureInfos,
+    device const MeshInfo* meshInfos,
+    device const SceneVertex* sceneVertices,
+    device const uint3* meshIndices,
+    const MaterialData material,
+    thread const HitRecord& rec,
+    const float3 vertexNormal,
+    thread float3& mappedNormal) {
+    if (!material_texture_valid(uniforms, material.textureIndices0.z) ||
+        rec.primitiveType != kPrimitiveTypeTriangle || !meshInfos || !sceneVertices || !meshIndices ||
+        uniforms.meshCount == 0u) {
+        return false;
+    }
+#if PT_DEBUG_TOOLS
+    if (PT_DEFAULT_OFF(uniforms.debugDisableNormalMap) != 0u) {
+        return false;
+    }
+#endif
+    const float normalScale = material.pbrParams.w;
+    float3 shadingNormal = vertexNormal;
+    if (normalScale <= 1.0e-4f || !all(isfinite(shadingNormal)) || dot(shadingNormal, shadingNormal) <= 0.0f) {
+        return false;
+    }
+    shadingNormal = normalize(shadingNormal);
+    const float2 uv0 = interpolate_uv(uniforms, rec.meshIndex, rec.primitiveIndex, rec.barycentric, 0u,
+                                      meshInfos, sceneVertices, meshIndices);
+    float3 row0 = float3(1.0f, 0.0f, 0.0f);
+    float3 row1 = float3(0.0f, 1.0f, 0.0f);
+    pbr_texture_transform_rows(material, kPbrTextureSlotNormal, row0, row1);
+    const float2 uv = pbr_apply_uv_transform(uv0, row0, row1);
+    const float4 texel = sample_material_texture_filtered(materialTextures,
+                                                          materialSamplers,
+                                                          materialTextureInfos,
+                                                          uniforms,
+                                                          material.textureIndices0.z,
+                                                          uv,
+                                                          float4(0.5f, 0.5f, 1.0f, 1.0f),
+                                                          /*lod=*/0.0f,
+                                                          /*hasIgehyGradients=*/false,
+                                                          float2(0.0f),
+                                                          float2(0.0f));
+    const float3 n = decode_normal_map(texel.xyz, normalScale, /*flipGreen=*/false);
+    const float4 tangent = interpolate_tangent(uniforms, rec.meshIndex, rec.primitiveIndex, rec.barycentric,
+                                               meshInfos, sceneVertices, meshIndices);
+    float3 t = tangent.xyz;
+    float3 b = float3(0.0f);
+    bool hasBasis = false;
+    if (fabs(tangent.w) > 0.5f && all(isfinite(t)) && dot(t, t) > 1.0e-6f) {
+        t = normalize(t - shadingNormal * dot(shadingNormal, t));
+        if (all(isfinite(t)) && dot(t, t) > 1.0e-6f) {
+            b = normalize(cross(shadingNormal, t)) * (tangent.w < 0.0f ? -1.0f : 1.0f);
+            hasBasis = all(isfinite(b)) && dot(b, b) > 1.0e-6f;
+        }
+    }
+    if (!hasBasis) {
+        hasBasis = compute_tangent_basis_from_uv(uniforms, rec.meshIndex, rec.primitiveIndex, 0u,
+                                                 meshInfos, sceneVertices, meshIndices, shadingNormal, t, b);
+    }
+    if (!hasBasis) {
+        return false;
+    }
+    float3 mapped = normalize(t * n.x + b * n.y + shadingNormal * n.z);
+    if (!all(isfinite(mapped))) {
+        return false;
+    }
+    if (dot(mapped, rec.normal) < 0.0f) {
+        mapped = -mapped;
+    }
+    mappedNormal = mapped;
+    return true;
 }

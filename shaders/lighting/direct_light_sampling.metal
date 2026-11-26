@@ -759,8 +759,7 @@ inline bool resolve_textured_direct_light_emission(
     if (material.pbrExtras.w > 0.5f && material.pbrExtras.w < 1.5f &&
         alpha < material.pbrExtras.y) return false;
     const float coverage = material.pbrExtras.w >= 1.5f ? alpha : 1.0f;
-    sample.emission = to_working_space(sample.emission, uniforms) *
-                      to_working_space(color, uniforms) * coverage;
+    sample.emission = sample.emission * color * coverage;
     return all(isfinite(sample.emission)) && any(sample.emission > float3(0.0f));
 }
 

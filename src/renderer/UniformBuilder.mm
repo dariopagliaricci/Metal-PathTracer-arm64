@@ -4,6 +4,8 @@
 #include "renderer/SpectralSensor.h"
 
 #include <algorithm>
+#include <string>
+#include <utility>
 #include <cmath>
 
 namespace PathTracer {
@@ -176,7 +178,6 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
     uniforms.emissivePrimitiveCount = scene.emissivePrimitiveCount();
     uniforms.fixedRngSeed = settings.fixedRngSeed;
     uniforms.backgroundMode = static_cast<uint32_t>(settings.backgroundMode);
-    uniforms.workingColorSpace = static_cast<uint32_t>(settings.workingColorSpace);
     uniforms.environmentRotation = settings.environmentRotation;
     uniforms.environmentIntensity = std::max(settings.environmentIntensity, 0.0f);
     const float backgroundScale = std::isfinite(settings.environmentBackgroundScale)
@@ -457,7 +458,7 @@ PathTracerShaderTypes::PathtraceUniforms UniformBuilder::buildPathtraceUniforms(
 }
 
 bool UniformBuilder::usesOnlyDefaultFeatures(const PathTracerShaderTypes::PathtraceUniforms& u) {
-    // Mirrors default_feature_gates_off() in shaders/common.metal: the gates the
+    // Mirrors default_feature_gates_off() in shaders/common.metal (and liveFeatureGates below names the same terms): the gates the
     // default-features hardware megakernel folds to 0 with PT_DEFAULT_OFF. directLightMode stays
     // a runtime value in both pipelines, except ris_spatial and ris_world, whose neighbour and candidate
     // blocks are gates.
@@ -469,7 +470,63 @@ bool UniformBuilder::usesOnlyDefaultFeatures(const PathTracerShaderTypes::Pathtr
            u.radianceCacheDebug == 0u && u.volumeDebug == 0u && u.spectralDebug == 0u &&
            u.parityAssertEnabled == 0u && u.debugViewMode == 0u && u.debugDirectLightAudit == 0u &&
            u.directLightMode != static_cast<uint32_t>(RenderSettings::DirectLightMode::RisSpatialReuse) &&
-           u.directLightMode != static_cast<uint32_t>(RenderSettings::DirectLightMode::RisWorldReuse);
+           u.directLightMode != static_cast<uint32_t>(RenderSettings::DirectLightMode::RisWorldReuse)
+#if PT_DEBUG_TOOLS
+           // Read by the shaders only in PT_DEBUG_TOOLS builds (headless): the hardware megakernel's software-trace
+           // fallbacks and the normal-map and ORM debug knobs, at their defaults. The GUI build never reads them, so
+           // they must not move it off the default-features pipeline.
+           && u.enableHardwareMissFallback == 0u && u.enableHardwareFirstHitFromSoftware == 0u &&
+           u.enableHardwareForceSoftware == 0u && u.debugDisableNormalMap == 0u &&
+           u.debugDisableOrmTexture == 0u && u.debugFlipNormalGreen == 0u &&
+           u.debugNormalStrengthScale == 1.0f && u.debugNormalLodBias == 0.0f && u.debugOrmLodBias == 0.0f
+#endif
+           ;
+}
+
+std::string UniformBuilder::liveFeatureGates(const PathTracerShaderTypes::PathtraceUniforms& u) {
+    // The same terms as usesOnlyDefaultFeatures, in the same order: a gate added there is added here too.
+    const std::pair<const char*, bool> gates[] = {
+        {"sssMode", u.sssMode != 0u},
+        {"enableMnee", u.enableMnee != 0u},
+        {"restirGiMode", u.restirGiMode != 0u},
+        {"pathGuidingMode", u.pathGuidingMode != 0u},
+        {"restirPtMode", u.restirPtMode != 0u},
+        {"radianceCacheMode", u.radianceCacheMode != 0u},
+        {"causticTransportMode", u.causticTransportMode != 0u},
+        {"volumeTransportMode", u.volumeTransportMode != 0u},
+        {"spectralRenderingMode", u.spectralRenderingMode != 0u},
+        {"restirDebugEnabled", u.restirDebugEnabled != 0u},
+        {"debugPathActive", u.debugPathActive != 0u},
+        {"restirPtDebug", u.restirPtDebug != 0u},
+        {"radianceCacheDebug", u.radianceCacheDebug != 0u},
+        {"volumeDebug", u.volumeDebug != 0u},
+        {"spectralDebug", u.spectralDebug != 0u},
+        {"parityAssertEnabled", u.parityAssertEnabled != 0u},
+        {"debugViewMode", u.debugViewMode != 0u},
+        {"debugDirectLightAudit", u.debugDirectLightAudit != 0u},
+        {"directLightMode=ris_spatial",
+         u.directLightMode == static_cast<uint32_t>(RenderSettings::DirectLightMode::RisSpatialReuse)},
+        {"directLightMode=ris_world",
+         u.directLightMode == static_cast<uint32_t>(RenderSettings::DirectLightMode::RisWorldReuse)},
+#if PT_DEBUG_TOOLS
+        {"enableHardwareMissFallback", u.enableHardwareMissFallback != 0u},
+        {"enableHardwareFirstHitFromSoftware", u.enableHardwareFirstHitFromSoftware != 0u},
+        {"enableHardwareForceSoftware", u.enableHardwareForceSoftware != 0u},
+        {"debugDisableNormalMap", u.debugDisableNormalMap != 0u},
+        {"debugDisableOrmTexture", u.debugDisableOrmTexture != 0u},
+        {"debugFlipNormalGreen", u.debugFlipNormalGreen != 0u},
+        {"debugNormalStrengthScale", u.debugNormalStrengthScale != 1.0f},
+        {"debugNormalLodBias", u.debugNormalLodBias != 0.0f},
+        {"debugOrmLodBias", u.debugOrmLodBias != 0.0f},
+#endif
+    };
+    std::string live;
+    for (const auto& [name, on] : gates) {
+        if (!on) continue;
+        if (!live.empty()) live += ", ";
+        live += name;
+    }
+    return live;
 }
 
 PathTracerShaderTypes::DisplayUniforms UniformBuilder::buildDisplayUniforms(

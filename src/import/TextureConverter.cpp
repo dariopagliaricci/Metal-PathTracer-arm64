@@ -119,6 +119,11 @@ std::string ShortPathHash(const fs::path& path) {
     return Sha256Hex(bytes).substr(0, 8);
 }
 
+// DDS sources (Zero Day, Bistro) are decoded with the shared decoder (shared/DdsTexture.h) that Embree also uses. Since
+// PR #131 (2026-11-23) it applies the GPU's block rules (bit-replicated 565 endpoints, 6-bit palette weights), so the
+// KTX2 an import writes holds the texels Metal would sample from the DDS itself. Imports made before that differ by up to
+// 2-3 8-bit steps in colour and in a normal map's X and Y, and by up to 15 in a BC5 normal map's reconstructed Z, whose
+// square root amplifies the X and Y change. Zero Day's installed packs keep their Nov 19 KTX2 files (older rules).
 bool DecodeDds(const std::vector<uint8_t>& bytes,
                uint32_t& width,
                uint32_t& height,

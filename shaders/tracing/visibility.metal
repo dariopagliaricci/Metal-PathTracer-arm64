@@ -295,7 +295,6 @@ inline float3 environment_color(texture2d<float, access::sample> environmentText
     if (!all(isfinite(color))) {
         return float3(0.0f);
     }
-    color = to_working_space(color, uniforms);
     return all(isfinite(color)) ? color : float3(0.0f);
 }
 
@@ -332,7 +331,6 @@ inline float3 environment_color_lod(texture2d<float, access::sample> environment
     if (!all(isfinite(color))) {
         return float3(0.0f);
     }
-    color = to_working_space(color, uniforms);
     return all(isfinite(color)) ? color : float3(0.0f);
 }
 
@@ -1270,6 +1268,7 @@ inline bool trace_scene_software(constant PathtraceUniforms& uniforms,
     float closest = tMax;
     bool hitAnything = false;
     bool usedTlasTriangles = false;
+    bool spheresInBvh = false;
 
     TraversalCounters counters;
     reset_counters(counters);
@@ -1332,6 +1331,7 @@ inline bool trace_scene_software(constant PathtraceUniforms& uniforms,
                                                  counters,
                                                  earlyExit);
         } else if (spheres) {
+            spheresInBvh = true;
             hitAnything = traverse_bvh(nodes,
                                        spheres,
                                        primitiveIndices,
@@ -1346,8 +1346,12 @@ inline bool trace_scene_software(constant PathtraceUniforms& uniforms,
         }
     }
 
-    if (!hitAnything) {
-        hitAnything = brute_force_hit_spheres(uniforms, spheres, ray, tMin, closest, rec, counters);
+    // Spheres outside a sphere BVH are tested against the closest hit so far, also after a triangle hit: a sphere in
+    // front of a triangle is the closest hit. The rectangle test below then starts from the sphere's distance.
+    if (!spheresInBvh && !(anyHitOnly && hitAnything) &&
+        brute_force_hit_spheres(uniforms, spheres, ray, tMin, closest, rec, counters)) {
+        hitAnything = true;
+        closest = rec.t;
     }
 
     float rectangleClosest = hitAnything ? (closest + kAreaPrimitiveHitSlop) : closest;
@@ -1488,8 +1492,14 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                                kHardwareExcludeMaxAttempts);
         Ray currentRay = ray;
         float currentTMin = tMin;
+        // How far along the ray the origin has moved past rejected hits. The returned t, the reach (tMax) and the
+        // sphere and rect tests that follow stay in the original ray's frame, as Embree keeps them.
+        float tBase = 0.0f;
         for (uint attempt = 0u; attempt < maxAttempts; ++attempt) {
-            raytracing::ray query(currentRay.origin, currentRay.direction, currentTMin, tMax);
+            if (attempt > 0u && !(tMax - tBase > currentTMin)) {
+                break;  // the re-spawn passed the segment's end
+            }
+            raytracing::ray query(currentRay.origin, currentRay.direction, currentTMin, tMax - tBase);
             auto result = intersector.intersect(query, accel);
             if (shadowAudit != nullptr && attempt == 0u) {
                 shadowAudit->rawResultAvailable = true;
@@ -1500,7 +1510,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
             }
             if (result.type != intersection_type::none) {
                 hadCandidateDistance = true;
-                candidateDistance = result.distance;
+                candidateDistance = result.distance + tBase;
                 sawCandidate = true;
                 lastCandidateInstanceId = result.instance_id;
                 lastCandidatePrimitiveId = result.primitive_id;
@@ -1620,7 +1630,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                                               worldV2,
                                               currentRay,
                                               currentTMin,
-                                              closest,
+                                              max(closest - tBase, currentTMin),
                                               resolvedT,
                                               bary);
 
@@ -1726,6 +1736,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                 } else {
                     currentRay.origin = worldPoint + dirStep * kHardwareOcclusionEpsilon;
                     currentTMin = 0.0f;
+                    tBase += resolvedT + kHardwareOcclusionEpsilon * rsqrt(max(dirLenSq, 1.0e-12f));
                 }
                 if (excludeMeshOnly) {
                     excludeMesh = kInvalidIndex;
@@ -1772,7 +1783,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                 interpolatedNormal = worldNormal;
             }
 
-            hardwareRec.t = resolvedT;
+            hardwareRec.t = resolvedT + tBase;
             hardwareRec.point = worldPoint;
             uint materialIndex = info.materialIndex;
             if (uniforms.materialCount > 0u) {
@@ -1796,7 +1807,7 @@ inline bool trace_scene_hardware(constant PathtraceUniforms& uniforms,
                 shadowAudit->resolvedPrimitiveIndex = triIndex;
                 shadowAudit->resolvedPrimitiveType = kPrimitiveTypeTriangle;
                 shadowAudit->resolvedFrontFace = triangleFrontFacing;
-                shadowAudit->resolvedDistance = resolvedT;
+                shadowAudit->resolvedDistance = resolvedT + tBase;
             }
             closest = hardwareRec.t;
             hardwareHit = true;

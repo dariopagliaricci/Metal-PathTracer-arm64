@@ -13,4 +13,12 @@ public:
                 bool captureAuxBuffers,
                 HeadlessRenderOutput& out,
                 std::string& error) override;
+    bool setSampleCheckpointOptions(const HeadlessSampleCheckpointOptions& options, std::string& error) override {
+        (void)error;
+        m_checkpoint = options;
+        return true;
+    }
+
+private:
+    HeadlessSampleCheckpointOptions m_checkpoint;
 };

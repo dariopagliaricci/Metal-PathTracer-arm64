@@ -679,6 +679,14 @@ inline float3 plastic_coat_crossing(const MaterialData material, const float cos
     return exp(-plastic_coat_absorption(material) * (thickness / max(cosTheta, 1.0e-3f)));
 }
 
+// The coat's exact dielectric Fresnel (unpolarized, from air into coatIOR). A coated random-walk subsurface material uses
+// it for its coat lobe and for the walk's crossing of the coat, as Arnold's standard_surface does; other plastics keep
+// Schlick's approximation (plastic_coat_f0).
+inline float plastic_coat_fresnel_exact(const MaterialData material, const float cosTheta) {
+    float cosThetaT;
+    return fresnel_dielectric_exact(clamp(cosTheta, 0.0f, 1.0f), 1.0f, plastic_coat_ior(material), cosThetaT);
+}
+
 inline PlasticLobeProbabilities plastic_lobe_probabilities(const MaterialData material,
                                                            const float3 normal,
                                                            const float3 wo,
@@ -732,20 +740,22 @@ inline ClosureValuePdf plastic_closure_eval(const MaterialData material,
         return res;
     }
     if ((material.materialFlags & kMaterialFlagSubsurfaceExit) != 0u) {
-        // Exit point of a coated subsurface walk: the light-side half of the base term. The coat lobe and the
-        // view-side crossing belong to the entry point (subsurface_vertex_begin).
+        // Exit point of a coated subsurface walk: a white diffuse surface under the coat's tint and its absorption along
+        // the light-side crossing. The coat's Fresnel weights the walk once, at its entry, for the view direction
+        // (subsurface_vertex_begin), as in Arnold's layering; the exit takes no Fresnel and no (1 - Favg).
         res.value = material_base_color(material) * (clamp(diffuseOcclusion, 0.0f, 1.0f) / kPi) *
-                    plastic_coat_tint(material) * plastic_coat_crossing(material, cosThetaI) *
-                    (float3(1.0f) - schlick_fresnel(float3(plastic_coat_f0(material)), cosThetaI)) *
-                    max(1.0f - plastic_coat_fresnel_average(material), 0.0f);
+                    plastic_coat_tint(material) * plastic_coat_crossing(material, cosThetaI);
         res.pdf = lambert_pdf(normal, wi);
         return res;
     }
     float3 f0 = float3(plastic_coat_f0(material));
     float3 wh = safe_normalize(wo + wi);
+    const float3 coatFresnel = (material.materialFlags & kMaterialFlagSubsurfaceCoatLobe) != 0u
+                                   ? float3(plastic_coat_fresnel_exact(material, dot(wi, wh)))
+                                   : schlick_fresnel(f0, dot(wi, wh));
     ClosureValuePdf coat = ggx_reflection_lobe(ggx_vndf_alpha(plastic_coat_roughness(material)),
                                                normal, cosThetaI, wo, wi,
-                                               schlick_fresnel(f0, dot(wi, wh)) * plastic_specular_tint(material),
+                                               coatFresnel * plastic_specular_tint(material),
                                                clampParams);
     float3 diffuse = float3(0.0f);
     if (!specularOnly) {
@@ -1162,6 +1172,7 @@ inline uint sss_random_walk_hardware(constant PathtraceUniforms& uniforms,
 // What an integrator does at a hit on a subsurface material, before it shades the vertex.
 constant uint kSubsurfaceVertexShade = 0u;  // shade `material` as it now is
 constant uint kSubsurfaceVertexWalk = 1u;   // run the walk from the hit, then call subsurface_vertex_exit
+constant uint kSubsurfaceVertexCoat = 2u;   // shade `material` (the coat lobe) as it now is, at the coat normal
 
 inline bool subsurface_has_coat(const MaterialData material) {
     return material.sssParams.z > 0.5f;
@@ -1187,12 +1198,19 @@ inline MaterialData subsurface_dense_limit_material(const MaterialData material)
 //   the material becomes its dense limit.
 // - Random walk without a coat: the walk runs.
 // - Random walk with a coat: one-sample choice between the coat lobe and the walk, with the plastic closure's lobe
-//   probabilities. The coat lobe is shaded here as plastic with a black base. The walk takes the view-side coat
-//   crossing here and the light-side one at its exit point (kMaterialFlagSubsurfaceExit).
+//   probabilities. The coat lobe is shaded here as plastic with a black base and the exact dielectric Fresnel
+//   (kMaterialFlagSubsurfaceCoatLobe). The walk takes the coat's (1 - F) and crossing for the view direction here, and
+//   only the coat's tint and light-side absorption at its exit point (kMaterialFlagSubsurfaceExit). This is Arnold's
+//   layering (backlog #49): the walk under the coat is weighted once, by what the coat does not reflect toward the view.
+// `coatNormal` is the coat's normal: the shading normal, or the material's mapped normal (backlog #47,
+// subsurface_coat_mapped_normal). It sets the lobe probabilities; on kSubsurfaceVertexCoat the caller shades the coat lobe
+// at it. The walk's view-side crossing and Fresnel weight stay on the shading normal, and the walk starts from `rec`. The
+// map changes the walk's value through the lobe choice and through the coat light it sends below the shading normal.
 inline uint subsurface_vertex_begin(constant PathtraceUniforms& uniforms,
                                     thread MaterialData& material,
                                     thread const HitRecord& rec,
                                     const float3 shadingNormal,
+                                    const float3 coatNormal,
                                     const float3 wo,
                                     const bool specularOnly,
                                     thread uint& state,
@@ -1212,25 +1230,53 @@ inline uint subsurface_vertex_begin(constant PathtraceUniforms& uniforms,
         return kSubsurfaceVertexWalk;
     }
     MaterialData plastic = subsurface_dense_limit_material(material);
-    PlasticLobeProbabilities probs = plastic_lobe_probabilities(plastic, shadingNormal, wo, false);
+    PlasticLobeProbabilities probs = plastic_lobe_probabilities(plastic, coatNormal, wo, false);
     if (!(probs.coat + probs.diffuse > 0.0f)) {
         material = plastic;  // the view direction is below the shading normal: the plastic closure returns nothing
         return kSubsurfaceVertexShade;
     }
+    const float cosThetaO = dot(shadingNormal, wo);
     if (rand_uniform(state) < probs.coat) {
+        // A mapped coat normal reflects part of the coat's light below the shading normal, into the surface. As
+        // in Arnold, whose subsurface gains what a normal map takes from its specular, that energy enters the walk:
+        // half the coat picks estimate it with one coat sample and continue as a walk, the other half shade the coat.
+        // Without a map the two normals are equal, nothing is lost, and the coat pick stays as it was.
+        float coatShare = 1.0f;
+        if (any(coatNormal != shadingNormal)) {
+            coatShare = 0.5f;
+            if (rand_uniform(state) < 0.5f) {
+                const float coatRoughness = plastic_coat_roughness(plastic);
+                const float3 wh = sample_ggx_vndf(coatNormal, wo, coatRoughness, state);
+                const float3 wi = safe_normalize(reflect(-wo, wh));
+                if (!(dot(wh, coatNormal) > 0.0f) || !(dot(wi, coatNormal) > 0.0f) ||
+                    !(dot(wi, shadingNormal) <= 0.0f) || !(cosThetaO > 0.0f)) {
+                    // The coat sample stays above the surface: nothing is lost on this pick. It ends at the coat
+                    // vertex, with no walk to run or count.
+                    plastic.baseColorRoughness.xyz = float3(0.0f);
+                    plastic.materialFlags |= kMaterialFlagSubsurfaceCoatLobe;
+                    material = plastic;
+                    throughput = float3(0.0f);
+                    return kSubsurfaceVertexCoat;
+                }
+                const float3 lost = plastic_coat_fresnel_exact(plastic, dot(wo, wh)) * plastic_specular_tint(plastic) *
+                                    ggx_G1(ggx_vndf_alpha(coatRoughness), dot(coatNormal, wi));
+                throughput *= lost * plastic_coat_crossing(plastic, cosThetaO) / (probs.coat * 0.5f);
+                return kSubsurfaceVertexWalk;
+            }
+        }
         plastic.baseColorRoughness.xyz = float3(0.0f);
+        plastic.materialFlags |= kMaterialFlagSubsurfaceCoatLobe;
         material = plastic;
-        throughput /= probs.coat;
-        return kSubsurfaceVertexShade;
+        throughput /= probs.coat * coatShare;
+        return kSubsurfaceVertexCoat;
     }
-    float cosThetaO = dot(shadingNormal, wo);
-    throughput *= (float3(1.0f) - schlick_fresnel(float3(plastic_coat_f0(plastic)), cosThetaO)) *
-                  plastic_coat_crossing(plastic, cosThetaO) / probs.diffuse;
+    throughput *= (1.0f - plastic_coat_fresnel_exact(plastic, cosThetaO)) * plastic_coat_crossing(plastic, cosThetaO) /
+                  probs.diffuse;
     return kSubsurfaceVertexWalk;
 }
 
 // Moves the shading vertex to the point where the walk left the mesh. The hit record becomes the exit point's and the
-// material a white diffuse surface (under the coat's light-side crossing when coated), so direct light, MIS and the
+// material a white diffuse surface (under the coat's tint and light-side absorption when coated), so direct light, MIS and the
 // next ray origin are the ordinary ones. The caller then uses the exit normal as the view direction.
 inline void subsurface_vertex_exit(thread MaterialData& material,
                                    thread HitRecord& rec,

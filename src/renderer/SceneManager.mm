@@ -247,6 +247,10 @@ static bool LoadObjMesh(const fs::path& filePath,
                 }
 
                 SceneResources::MeshVertex vertex{};
+                // OBJ carries no tangents. A zero tangent (w = 0) tells the shaders and Embree to build the normal-map
+                // frame from the triangle's UV derivatives; MeshVertex's default (1, 0, 0, w = 1) would pass as a
+                // vertex tangent along world +x.
+                vertex.tangent = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 vertex.position = simd_make_float3(
                     attrib.vertices[posOffset + 0],
                     attrib.vertices[posOffset + 1],
@@ -375,6 +379,7 @@ static bool LoadPlyMesh(const fs::path& filePath,
             const ValueType y = src[i * 3 + 1];
             const ValueType z = src[i * 3 + 2];
             SceneResources::MeshVertex vertex{};
+            vertex.tangent = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);  // PLY carries no tangents: the UV frame (see the OBJ loader)
             vertex.position = simd_make_float3(static_cast<float>(x),
                                                static_cast<float>(y),
                                                static_cast<float>(z));
@@ -3173,6 +3178,70 @@ bool SceneManager::parseMaterial(const std::unordered_map<std::string, std::stri
         }
     }
 
+    // A tangent-space normal map on a random-walk subsurface material. It shapes only the material's coat lobe and the
+    // coat/walk lobe choice, at the walk's entry (subsurface_coat_mapped_normal, material_access.metal); without a coat, or with another method, it
+    // changes nothing, and the log says so. Linear data with the normal-map mip chain, as a glTF normalTexture (OpenGL
+    // +Y), UV set 0, and the material's uvScale/uvOffset (the same transform as its baseColorTexture). normalScale scales x and y, as glTF.
+    if (auto it = tokens.find("normalTexture"); it != tokens.end()) {
+        if (type != PathTracerShaderTypes::MaterialType::Subsurface) {
+            errorMessage = "material normalTexture is supported on type=sss materials only";
+            return false;
+        }
+        float normalScale = 1.0f;
+        if (auto scaleIt = tokens.find("normalScale"); scaleIt != tokens.end()) {
+            if (!parseFloat(scaleIt->second, normalScale) || !std::isfinite(normalScale) || normalScale < 0.0f) {
+                errorMessage = "material normalScale expects a finite float >= 0 (0 turns the map off)";
+                return false;
+            }
+        }
+        fs::path normalPath(it->second);
+        if (normalPath.is_relative()) {
+            normalPath = fs::path(sceneDirectory) / normalPath;
+        }
+        std::error_code normalEc;
+        fs::path normalCanonical = fs::weakly_canonical(normalPath, normalEc);
+        if (normalEc || !fs::exists(normalCanonical, normalEc)) {
+            errorMessage = "material normalTexture not found: " + normalPath.string();
+            return false;
+        }
+        std::string normalError;
+        PathTracer::TextureLoadStatus normalStatus = PathTracer::TextureLoadStatus::Failed;
+        const uint32_t normalIndex = resources.addMaterialTextureFromFile(normalCanonical.string(),
+                                                                          /*srgb=*/false,
+                                                                          &normalError,
+                                                                          textureSamplerPtr,
+                                                                          PathTracer::MaterialTextureSemantic::Normal,
+                                                                          &normalStatus);
+        if (normalIndex == 0xFFFFFFFFu && normalStatus != PathTracer::TextureLoadStatus::SkippedByPolicy) {
+            errorMessage = normalError.empty() ? "failed to load material normalTexture" : normalError;
+            return false;
+        }
+        if (normalIndex == 0xFFFFFFFFu) {
+            NSLog(@"[Material] normalTexture %s skipped by the texture policy; the material renders without its normal map",
+                  normalCanonical.string().c_str());
+        }
+        if (normalIndex != 0xFFFFFFFFu) {
+            auto withNormal = resources.materialsData()[materialIndex];
+            withNormal.textureIndices0.z = normalIndex;
+            withNormal.textureUvSet0.z = 0u;
+            withNormal.textureTransform4 = simd_make_float4(baseColorUvScale.x, 0.0f, baseColorUvOffset.x, 0.0f);
+            withNormal.textureTransform5 = simd_make_float4(0.0f, baseColorUvScale.y, baseColorUvOffset.y, 0.0f);
+            withNormal.pbrParams.w = normalScale;
+            if (!resources.updateMaterial(materialIndex, withNormal)) {
+                errorMessage = "failed to update the material's normalTexture";
+                return false;
+            }
+            if (withNormal.sssParams.z <= 0.5f || withNormal.sssParams.y < 0.5f) {
+                NSLog(@"[Material] normalTexture %s on a type=sss material without coat=on and method=randomwalk has no "
+                      @"effect: the map shapes only a random-walk material's coat",
+                      normalCanonical.string().c_str());
+            }
+        }
+    } else if (tokens.find("normalScale") != tokens.end()) {
+        errorMessage = "material normalScale needs normalTexture";
+        return false;
+    }
+
     // Independent scalar bindings share the source UV transform but retain their own dimensions.
     auto updated = resources.materialsData()[materialIndex];
     updated.textureTransform0 = simd_make_float4(baseColorUvScale.x, 0.0f, baseColorUvOffset.x, 0.0f);
@@ -3851,6 +3920,9 @@ bool SceneManager::parseMesh(const std::unordered_map<std::string, std::string>&
             }
             if (!parseMeshBoolToken("gltfReferenceDielectricContinuation",
                                     gltfOptions.referenceDielectricContinuation)) {
+                return false;
+            }
+            if (!parseMeshBoolToken("gltfBarcelonaPavilionRules", gltfOptions.barcelonaPavilionRules)) {
                 return false;
             }
             if (auto it = tokens.find("gltfAnimationIndex"); it != tokens.end()) {
