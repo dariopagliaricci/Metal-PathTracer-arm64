@@ -292,7 +292,10 @@ freeze rows) was 18/18 IDENTICAL.
   destination, five times on the development machine (about 266 GB). After
   `touch shaders/common.metal`, the build takes 0.28 s. A real directory from
   an older build is left in place with a warning. A checkout without `assets/`
-  still builds.
+  still builds. The app reads the clone's `assets/` folder through the link, so
+  replacing it with the asset pack needs no rebuild. Keep the clone where it
+  is: if the clone is moved or deleted, or the app is copied to another Mac, it
+  has no scenes.
 - Removed the ACEScg working colour space (#165). No setting selected it, and
   its matrix was transposed. The EXR files and the render metadata still say
   "Linear sRGB". Images are unchanged: the Metal gate is 18/18 IDENTICAL, and
