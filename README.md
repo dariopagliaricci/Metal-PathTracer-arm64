@@ -26,7 +26,7 @@ Implemented/runnable, or Production-complete.
 | --- | --- | --- |
 | Metal megakernel path tracer, hardware ray tracing with a software BVH fallback | Production-complete | The default renderer. Headless output is deterministic. A fallback from hardware to software ray tracing is logged, and `--force-hwrt` / `--force-swrt` make a run fail instead. |
 | Metal wavefront execution (`--executionMode=wavefront`) | Implemented/runnable | Matches the megakernel on the scenes measured. Runs `ris_spatial` as plain RIS and logs it. |
-| Embree CPU reference backend | Implemented/runnable | For parity checks against Metal. Runs Metal's random-walk subsurface and the Bitterli scenes' source closures. Ignores volumes. Refuses by name the features it does not implement. |
+| Embree CPU reference backend | Implemented/runnable | For parity checks against Metal. Runs Metal's random-walk subsurface and the Bitterli scenes' source closures. Since v4.1.0 it also runs Metal's homogeneous media, hero-wavelength spectral mode and plain RIS; the RIS reuse modes render plain RIS and log a warning. Refuses by name the features it does not implement. |
 | glTF 2.0 PBR, KHR transmission (thin-walled, without volume), KTX2 textures | Implemented/runnable | |
 | `PathTracerImport` (Assimp, static scenes) | Implemented/runnable | One texture V-origin rule for every source format. |
 | OIDN denoise | Production-complete | When the vendored native libraries are present; CMake disables it otherwise. |
@@ -41,8 +41,9 @@ Implemented/runnable, or Production-complete.
 | ReSTIR GI, ReSTIR PT | Prototype | |
 | Path guiding | Prototype | |
 | Radiance cache | Prototype | Measured bias at most 0.03% of the frame's mean luminance on three scenes. No error reduction at equal render time. |
-| Path-space caustics, MNEE | Implemented/runnable | |
-| Homogeneous volumes | Prototype | Metal only. Under a medium, `restir_di` and the hybrid render as `baseline_emissive`, and the run logs it. Henyey-Greenstein anisotropy follows pbrt's sign; a forward/backward glow ratio 6-8% above Arnold's is unexplained. |
+| MNEE | Implemented/runnable | |
+| Path-space caustics | Prototype | `--causticTransportMode=path_space` records environment and rect-light NEE connections and returns plain NEE's contribution. It traces no light subpaths and adds no caustic paths; the run logs a `[Caustics]` line. |
+| Homogeneous volumes | Prototype | Metal, and Embree since v4.1.0. Under a medium, `restir_di` and the hybrid render as `baseline_emissive`, and the run logs it. Henyey-Greenstein anisotropy follows pbrt's sign; a forward/backward glow ratio 6-8% above Arnold's is unexplained. |
 | Hero-wavelength spectral transport | Implemented/runnable | Refuses specular NEE, MNEE and volumes; spectral runs need `--enableSpecularNee=0`. See [Hero-Wavelength Spectral Mode](#hero-wavelength-spectral-mode). |
 | Random-walk subsurface scattering (Metal) | Implemented/runnable | On a unit sphere under one emitter: within 0.06% of Arnold's randomwalk at mean free path 0.1 and 0.31% at 0.25. Objects thinner than about two mean free paths differ more (up to 5%), where Arnold departs from a volumetric walk by design. |
 | Tungsten source closures (Bitterli scenes) | Implemented/runnable | Opt-in per scene. |
@@ -119,7 +120,7 @@ names the scene ID, so the image can be reproduced from the asset pack (see
 | --- | --- |
 | ![Damaged Helmet](Images/Gallery/gltf-damaged-helmet_mk_1920x1080_1024spp.jpg)<br>Damaged Helmet: `gltf-damaged-helmet`, megakernel. | ![Bugatti Chiron Top Edition](Images/Gallery/bugatti_chiron_top_edition_matchref_mk_1920x1080_1024spp.jpg)<br>Bugatti Chiron: `bugatti_chiron_top_edition_matchref`, megakernel. |
 | ![Marble and wax busts with random-walk subsurface scattering](Images/Gallery/sss_marble_wax_mk_1920x1080_1024spp.jpg)<br>Random-walk subsurface, marble and wax: `sss_marble_wax`, megakernel. | ![Transparent Machines film camera](Images/Gallery/transparent_machines_film_mk_1920x1080_1024spp.jpg)<br>Transparent Machines, film camera: `transparent_machines_film`, megakernel. |
-| ![Suzanne caustics in hero-wavelength spectral mode](Images/Gallery/suzanne_caustics_hero_spectral_mk_1920x1080_1024spp.jpg)<br>Hero-wavelength spectral transport with path-space caustics: `suzanne_caustics_hero`, megakernel, three wavelengths per path, specular NEE and MNEE off (spectral mode refuses them). | |
+| ![Suzanne caustics in hero-wavelength spectral mode](Images/Gallery/suzanne_caustics_hero_spectral_mk_1920x1080_1024spp.jpg)<br>Hero-wavelength spectral transport: `suzanne_caustics_hero`, megakernel, three wavelengths per path, specular NEE and MNEE off (spectral mode refuses them). | |
 
 ### Formula 1 Cars
 
@@ -157,7 +158,8 @@ Metal's output. These two images are Embree renders at 256 samples per pixel.
 - Environment map importance sampling and MIS.
 - Specular NEE and MNEE caustics.
 - Optional firefly clamp modes.
-- Path-space caustic connection transport.
+- Path-space caustic connection transport (Prototype: it adds no caustic paths
+  yet).
 - Gated homogeneous/global volume transport (Prototype) with isotropic or
   Henyey-Greenstein phase, rect-light volume NEE, debug metadata, and explicit
   fallbacks for non-medium-aware providers. Heterogeneous volumes remain future
@@ -725,7 +727,8 @@ None of these gates reduces error at equal render time while staying within
 0.03% of the frame. Folding the general pipeline would make the cache cheap,
 but with the current gate it would still reduce no error.
 
-Path-space caustics and homogeneous volumes:
+Homogeneous volumes, with the path-space caustics prototype (it adds no caustic
+paths):
 
 ```bash
 build/PathTracerHeadless \
@@ -749,10 +752,11 @@ with a position (mesh emitters, rect lights, point lights) is attenuated by the
 medium's transmittance over the shadow segment in every direct-light mode, on
 the megakernels and the wavefront; suns and the environment are not attenuated,
 as escaped paths are not. The `volume_transmittance_query_count` metric counts
-those queries too. Embree ignores volumes and runs every requested mode without
-them.
+those queries too. Since v4.1.0 Embree runs the same media, with Metal's mode
+demotions.
 
-Hero-wavelength spectral transport with path-space caustics. Spectral mode
+Hero-wavelength spectral transport (the path-space caustics prototype adds no
+caustic paths). Spectral mode
 refuses specular NEE, MNEE and volumes (see
 [Hero-Wavelength Spectral Mode](#hero-wavelength-spectral-mode)), so the scene's
 `enableSpecularNee=1 enableMnee=1` are turned off here:
