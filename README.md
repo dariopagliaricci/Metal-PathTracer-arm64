@@ -1140,6 +1140,16 @@ Gallery assets (from the asset pack):
   names, liveries and car designs are trademarks of their owners. The images
   are renderer tests, not endorsed by any team.
 
+## AI Disclosure
+
+This project is developed with AI coding agents. Anthropic's Claude Code and
+OpenAI's Codex write most of the code, shaders, tests and documentation, and
+review each other's changes. The author sets the goals and the design, makes
+every transport and look decision, and accepts a change only after it is
+measured: golden-image gates, parity with the Embree CPU backend, and
+comparisons with reference renderers such as Arnold. The author judges look
+changes by eye.
+
 ## License
 
 This project is licensed under the MIT License. See `LICENSE`.
