@@ -9,10 +9,11 @@ for parity checks. The renderer has deterministic headless output and a
 static-scene import pipeline. Its research lighting systems are off by default;
 each one is enabled through its own CLI flag.
 
-The current release is `v4.0.0`. Development happens in a private line, and each
+The current release is `v4.1.0`. Development happens in a private line, and each
 release is imported into this repository as a single snapshot commit. What
-changed since `v3.0.0` is in [CHANGELOG.md](CHANGELOG.md) and
-[release_notes/v4.0.0.md](release_notes/v4.0.0.md).
+changed since `v3.0.0` is in [CHANGELOG.md](CHANGELOG.md),
+[release_notes/v4.0.0.md](release_notes/v4.0.0.md) and
+[release_notes/v4.1.0.md](release_notes/v4.1.0.md).
 
 ## Current Status
 
